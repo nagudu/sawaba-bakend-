@@ -1,6 +1,6 @@
 import bcrypt from 'bcryptjs'
-import { Op, fn, col } from 'sequelize'
-import { Barber, BarberAvailability, BarberService, Review, Service, Appointment } from '../models'
+import { prisma } from '../config/database'
+import type { Barber, BarberAvailability, BarberType, CommissionType, Service } from '@prisma/client'
 import { NotFoundError } from '../utils/errors'
 import { getPagination } from '../utils/response'
 import { slugify } from '../utils/slug'
@@ -9,23 +9,14 @@ import { DEFAULT_HOURS, hhmmToMinutes } from './availabilityService'
 import type { CreateBarberInput, UpdateBarberInput } from '../validators/barber'
 import type { Paged } from '../types'
 
-/** Portal passwords are always bcrypt-hashed at rest; raw values never persist. */
 async function hashPortalPassword(plain: string): Promise<string> {
   return bcrypt.hash(plain, 12)
 }
 
-/** Portal base URL — configurable for staging/production; defaults to local dev. */
 function portalUrl(): string {
   return (process.env.PORTAL_URL ?? 'http://localhost:5173/barber').replace(/\/$/, '')
 }
 
-/**
- * Emails portal credentials to a barber when admin enables portal access.
- * The raw password exists only here (in memory) — it is never persisted or
- * logged. Failure to deliver is surfaced to the admin as a warning message
- * (the save itself already succeeded), so a broken mailer can't silently
- * leave a barber without credentials.
- */
 async function sendPortalCredentialsEmail(barber: Barber, rawPassword: string): Promise<string | null> {
   if (!barber.email) {
     return 'No email address on file for this barber — credentials were not sent.'
@@ -57,7 +48,7 @@ async function sendPortalCredentialsEmail(barber: Barber, rawPassword: string): 
         `<p style="font-size:12px;color:#999;">— SAWABA Grooming Studio</p>`,
       ].join('\n'),
     })
-    return null // delivered
+    return null
   } catch (error) {
     if (error instanceof EmailDeliveryError) {
       console.error(`[barber] portal credentials email to ${barber.email} failed: ${error.userMessage}`)
@@ -82,7 +73,6 @@ export interface BarberPublic {
   reviewCount?: number
   reviewAverage?: number
   isActive: boolean
-  /** True when the barber can take bookings today (schedule not passed / not off-duty). Admin views only. */
   availableToday?: boolean
   appointmentCount?: number
   createdAt: Date
@@ -90,33 +80,22 @@ export interface BarberPublic {
   services?: Array<{ id: number; name: string; slug: string; price: number; duration: number }>
 }
 
-/** Admin-only business fields (requirement #16/#23) — never serialized publicly. */
 export interface BarberAdmin extends BarberPublic {
   barberType: 'INTERNAL' | 'EXTERNAL'
   location: string | null
   commissionType: 'PERCENTAGE' | 'FIXED'
   commissionValue: number
-  /** Whether the barber may sign in to the Barber Portal. */
   portalEnabled: boolean
-  /** Whether a portal password exists (true/false — the hash never leaves the server). */
-  hasPortalPassword: boolean
+  hasPortalPassword?: boolean
 }
 
-/**
- * Whether the barber can take bookings today, mirroring the booking engine's
- * schedule semantics: active + on today's schedule (a configured availability
- * row with isAvailable=true, or the studio's default hours when unconfigured)
- * + the day's window hasn't fully passed (a 30-minute slot must still fit
- * before closing time). Booking conflicts are deliberately NOT considered —
- * this badge is about schedule availability, not remaining free minutes.
- */
 export async function isBarberAvailableToday(barber: Barber): Promise<boolean> {
   if (!barber.isActive) return false
   const now = new Date()
   const dayOfWeek = now.getDay()
   const nowMinutes = now.getHours() * 60 + now.getMinutes()
 
-  const rows = await BarberAvailability.findAll({ where: { barberId: barber.id } })
+  const rows = await prisma.barberAvailability.findMany({ where: { barberId: barber.id } })
   let window: { start: number; end: number }
   if (rows.length > 0) {
     const todayRow = rows.find((row) => row.dayOfWeek === dayOfWeek && row.isAvailable)
@@ -130,12 +109,8 @@ export async function isBarberAvailableToday(barber: Barber): Promise<boolean> {
   return window.end >= nowMinutes + 30
 }
 
-/**
- * Public serializer — deliberately OMITS barberType, location, commissionType
- * and commissionValue. Customers see the barber, not the business terms.
- */
 export function serializeBarber(
-  barber: Barber,
+  barber: Barber & { barberServices?: Array<{ service: Service }> },
   includeServices = false,
 ): BarberPublic {
   const base: BarberPublic = {
@@ -154,71 +129,55 @@ export function serializeBarber(
     updatedAt: barber.updatedAt,
   }
 
-  if (includeServices && barber.services) {
-    base.services = barber.services.map((service) => ({
-      id: service.id,
-      name: service.name,
-      slug: service.slug,
-      price: Number(service.price),
-      duration: service.duration,
+  if (includeServices && barber.barberServices) {
+    base.services = barber.barberServices.map((bs) => ({
+      id: bs.service.id,
+      name: bs.service.name,
+      slug: bs.service.slug,
+      price: Number(bs.service.price),
+      duration: bs.service.duration,
     }))
   }
 
   return base
 }
 
-/** Admin serializer — public fields plus the internal business classification. */
 export function serializeBarberForAdmin(
-  barber: Barber,
+  barber: Barber & { barberServices?: Array<{ service: Service }> },
   includeServices = false,
 ): BarberAdmin {
   const base = serializeBarber(barber, includeServices) as BarberAdmin
-  base.barberType = barber.barberType ?? 'INTERNAL'
+  base.barberType = (barber.barberType as 'INTERNAL' | 'EXTERNAL') ?? 'INTERNAL'
   base.location = barber.location ?? null
-  base.commissionType = barber.commissionType ?? 'PERCENTAGE'
+  base.commissionType = (barber.commissionType as 'PERCENTAGE' | 'FIXED') ?? 'PERCENTAGE'
   base.commissionValue = Number(barber.commissionValue ?? 0)
   base.portalEnabled = barber.portalEnabled ?? false
-  // Boolean only — the hash itself NEVER leaves the server.
   base.hasPortalPassword = Boolean(barber.passwordHash)
   return base
 }
 
-const serviceScope = {
-  include: [
-    {
-      model: Service,
-      as: 'services',
-      through: { attributes: [] },
-    },
-  ],
-}
-
-/**
- * Attaches real approved-review counts and averages to serialized barbers.
- * Counts come from the `barberId` column on reviews — never fabricated, so a
- * barber with no linked reviews shows 0 rather than a seeded placeholder.
- */
 async function attachReviewStats(items: BarberPublic[]): Promise<void> {
   if (items.length === 0) return
-  const rows = await Review.findAll({
-    attributes: [
-      'barberId',
-      [fn('COUNT', col('Review.id')), 'count'],
-      [fn('AVG', col('Review.rating')), 'average'],
-    ],
-    where: { status: 'APPROVED', barberId: { [Op.in]: items.map((item) => item.id) } },
-    group: ['barberId'],
-    raw: true,
+  const barberIds = items.map((item) => item.id)
+
+  const reviews = await prisma.review.findMany({
+    where: { status: 'APPROVED', barberId: { in: barberIds } },
+    select: { barberId: true, rating: true },
   })
-  const stats = new Map(
-    (rows as unknown as Array<{ barberId: number; count: string | number; average: string | number }>).map(
-      (row) => [Number(row.barberId), row],
-    ),
-  )
+
+  const stats = new Map<number, { count: number; sum: number }>()
+  for (const r of reviews) {
+    if (!r.barberId) continue
+    const current = stats.get(r.barberId) ?? { count: 0, sum: 0 }
+    current.count += 1
+    current.sum += r.rating
+    stats.set(r.barberId, current)
+  }
+
   for (const item of items) {
-    const row = stats.get(item.id)
-    item.reviewCount = row ? Number(row.count) : 0
-    item.reviewAverage = row ? Math.round(Number(row.average) * 10) / 10 : 0
+    const stat = stats.get(item.id)
+    item.reviewCount = stat ? stat.count : 0
+    item.reviewAverage = stat && stat.count > 0 ? Math.round((stat.sum / stat.count) * 10) / 10 : 0
   }
 }
 
@@ -228,9 +187,9 @@ async function uniqueSlug(name: string, excludeId?: number): Promise<string> {
   let counter = 2
 
   while (true) {
-    const existing = await Barber.findOne({
+    const existing = await prisma.barber.findFirst({
       where: excludeId
-        ? { slug: candidate, id: { [Op.not]: excludeId } }
+        ? { slug: candidate, id: { not: excludeId } }
         : { slug: candidate },
     })
     if (!existing) return candidate
@@ -239,24 +198,42 @@ async function uniqueSlug(name: string, excludeId?: number): Promise<string> {
   }
 }
 
-export async function createBarber(input: CreateBarberInput): Promise<BarberAdmin & { credentialNotice?: string | null }> {
+export async function createBarber(
+  input: CreateBarberInput,
+): Promise<BarberAdmin & { credentialNotice?: string | null }> {
   const { serviceIds, portalPassword, ...data } = input
   const slug = await uniqueSlug(data.name)
-  const barber = await Barber.create({
-    ...data,
-    slug,
-    portalEnabled: data.portalEnabled ?? false,
-    passwordHash: portalPassword ? await hashPortalPassword(portalPassword) : null,
+
+  const passwordHash = portalPassword ? await hashPortalPassword(portalPassword) : null
+
+  const barber = await prisma.barber.create({
+    data: {
+      name: data.name,
+      slug,
+      image: data.image ?? null,
+      phone: data.phone ?? null,
+      email: data.email ?? null,
+      specialty: data.specialty ?? null,
+      biography: data.biography ?? null,
+      experience: data.experience ?? 0,
+      rating: data.rating ?? 0.0,
+      barberType: (data.barberType as BarberType) ?? 'INTERNAL',
+      location: data.location ?? null,
+      commissionType: (data.commissionType as CommissionType) ?? 'PERCENTAGE',
+      commissionValue: data.commissionValue ?? 0.0,
+      isActive: data.isActive ?? true,
+      portalEnabled: data.portalEnabled ?? false,
+      passwordHash,
+      ...(serviceIds && serviceIds.length > 0
+        ? {
+            barberServices: {
+              create: serviceIds.map((serviceId) => ({ serviceId })),
+            },
+          }
+        : {}),
+    },
   })
 
-  if (serviceIds && serviceIds.length > 0) {
-    await barber.setServices(serviceIds)
-  }
-
-  // New barber with portal access → email the credentials automatically.
-  // credentialNotice is only ATTACHED when an email attempt actually happened
-  // (null = delivered, string = failure reason) — absent otherwise — so the
-  // admin UI never claims an email was sent when none was attempted.
   let credentialNotice: string | null | undefined
   if (data.portalEnabled && portalPassword) {
     credentialNotice = await sendPortalCredentialsEmail(barber, portalPassword)
@@ -281,69 +258,78 @@ export async function listBarbers(
 ): Promise<Paged<BarberPublic>> {
   const { page, perPage, offset, limit } = getPagination(query as Record<string, unknown>)
   const includeInactive = query.includeInactive === 'true'
-  // Availability is computed from per-barber schedule rows (not a column), so
-  // an availableToday filter can't run in SQL. When set, we fetch ALL matching
-  // rows, compute availability, filter, then paginate in memory — correct
-  // pagination beats an offset-then-filter bug. Barber tables are small
-  // (tens of rows), so this is cheap.
 
-  const where = {
-    ...(!includeInactive
-      ? { isActive: true }
-      : query.isActive
-        ? { isActive: query.isActive === 'true' }
-        : {}),
-    ...(query.search
-      ? {
-          [Op.or]: [
-            { name: { [Op.like]: `%${query.search}%` } },
-            { slug: { [Op.like]: `%${query.search}%` } },
-            { specialty: { [Op.like]: `%${query.search}%` } },
-            { biography: { [Op.like]: `%${query.search}%` } },
-          ],
-        }
-      : {}),
-    // Admin-only barber-type filter — an unauthenticated request can never
-    // reach this because the controller strips the param before calling.
-    ...(query.barberType ? { barberType: query.barberType as 'INTERNAL' | 'EXTERNAL' } : {}),
-    // Coverage-area filter (#11) — partial match on external barbers' base.
-    ...(query.location ? { location: { [Op.like]: `%${query.location}%` } } : {}),
+  const where: {
+    isActive?: boolean
+    barberType?: BarberType
+    location?: { contains: string }
+    barberServices?: { some: { serviceId: number } }
+    OR?: Array<{
+      name?: { contains: string }
+      slug?: { contains: string }
+      specialty?: { contains: string }
+      biography?: { contains: string }
+    }>
+  } = {}
+
+  if (!includeInactive) {
+    where.isActive = true
+  } else if (query.isActive !== undefined) {
+    where.isActive = query.isActive === 'true'
+  }
+
+  if (query.search) {
+    const search = query.search
+    where.OR = [
+      { name: { contains: search } },
+      { slug: { contains: search } },
+      { specialty: { contains: search } },
+      { biography: { contains: search } },
+    ]
+  }
+
+  if (query.barberType) {
+    where.barberType = query.barberType as BarberType
+  }
+
+  if (query.location) {
+    where.location = { contains: query.location }
+  }
+
+  if (query.serviceId) {
+    where.barberServices = { some: { serviceId: query.serviceId } }
   }
 
   const availabilityFilter = query.availableToday === 'true' || query.availableToday === 'false'
-  const findOptions = {
-    where,
-    include: [
-      {
-        model: Service,
-        as: 'services',
-        through: { attributes: [] },
-        // When filtering by serviceId, use INNER JOIN (required: true) so only
-        // barbers assigned to that service are returned.
-        // Without a serviceId filter, use LEFT JOIN (required: false) so barbers
-        // with no service assignments still appear in the list.
-        ...(query.serviceId
-          ? { where: { id: query.serviceId }, required: true }
-          : { required: false }),
-      },
-    ],
-    distinct: true,
-    order: [['name', 'ASC']] as [string, string][],
-    // With an availability filter we must see ALL matches before filtering.
-    ...(availabilityFilter ? {} : { offset, limit }),
+
+  let rows: Array<Barber & { barberServices: Array<{ service: Service }> }>
+  let count: number
+
+  if (availabilityFilter) {
+    rows = await prisma.barber.findMany({
+      where,
+      include: { barberServices: { include: { service: true } } },
+      orderBy: { name: 'asc' },
+    })
+    count = rows.length
+  } else {
+    ;[rows, count] = await Promise.all([
+      prisma.barber.findMany({
+        where,
+        include: { barberServices: { include: { service: true } } },
+        orderBy: { name: 'asc' },
+        skip: offset,
+        take: limit,
+      }),
+      prisma.barber.count({ where }),
+    ])
   }
 
-  const { rows, count } = await Barber.findAndCountAll(findOptions)
-
-  // Admin callers get business fields (type/commission/location); public callers never do.
   const items = rows.map((barber) =>
     options.adminView ? serializeBarberForAdmin(barber, true) : serializeBarber(barber, true),
   )
   await attachReviewStats(items)
 
-  // Attach the Available-today badge (admin views) and/or apply the filter.
-  // items[i] corresponds to rows[i] (same map order), so we compute directly
-  // against rows — both paths need the value.
   if (options.adminView || availabilityFilter) {
     for (let i = 0; i < items.length; i += 1) {
       ;(items[i] as BarberAdmin).availableToday = await isBarberAvailableToday(rows[i])
@@ -362,14 +348,13 @@ export async function listBarbers(
   }
 
   if (includeInactive) {
-    const countRows = await Appointment.findAll({
-      attributes: ['barberId', [fn('COUNT', col('Appointment.id')), 'count']],
-      group: ['barberId'],
-      raw: true,
+    const countGroups = await prisma.appointment.groupBy({
+      by: ['barberId'],
+      _count: { id: true },
     })
     const countMap = new Map<number, number>()
-    for (const row of countRows as unknown as Array<{ barberId: number; count: string }>) {
-      countMap.set(row.barberId, Number(row.count))
+    for (const g of countGroups) {
+      countMap.set(g.barberId, g._count.id)
     }
     for (const item of items) {
       const total = countMap.get(item.id)
@@ -386,7 +371,10 @@ export async function listBarbers(
 }
 
 export async function getBarberById(id: number): Promise<BarberPublic> {
-  const barber = await Barber.findByPk(id, serviceScope)
+  const barber = await prisma.barber.findUnique({
+    where: { id },
+    include: { barberServices: { include: { service: true } } },
+  })
   if (!barber) {
     throw new NotFoundError('Barber not found.')
   }
@@ -396,7 +384,10 @@ export async function getBarberById(id: number): Promise<BarberPublic> {
 }
 
 export async function getBarberByIdForAdmin(id: number): Promise<BarberAdmin> {
-  const barber = await Barber.findByPk(id, serviceScope)
+  const barber = await prisma.barber.findUnique({
+    where: { id },
+    include: { barberServices: { include: { service: true } } },
+  })
   if (!barber) {
     throw new NotFoundError('Barber not found.')
   }
@@ -405,67 +396,106 @@ export async function getBarberByIdForAdmin(id: number): Promise<BarberAdmin> {
   return serialized
 }
 
-export async function updateBarber(id: number, input: UpdateBarberInput): Promise<BarberAdmin & { credentialNotice?: string | null }> {
-  const barber = await Barber.findByPk(id)
+export async function updateBarber(
+  id: number,
+  input: UpdateBarberInput,
+): Promise<BarberAdmin & { credentialNotice?: string | null }> {
+  const barber = await prisma.barber.findUnique({ where: { id } })
   if (!barber) {
     throw new NotFoundError('Barber not found.')
   }
 
   const { serviceIds, portalPassword, ...data } = input
 
-  if (Object.keys(data).length > 0 || portalPassword !== undefined) {
-    const changes: Record<string, unknown> = { ...data }
-    if (data.name && data.name !== barber.name) {
-      changes.slug = await uniqueSlug(data.name, id)
-    }
-    if (portalPassword !== undefined) {
-      // Empty string/null clears the password (disabling login); a value sets it.
-      changes.passwordHash = portalPassword ? await hashPortalPassword(portalPassword) : null
-    }
-    await barber.update(changes)
-  }
-  if (serviceIds) {
-    await barber.setServices(serviceIds)
+  let passwordHash = barber.passwordHash
+  if (portalPassword !== undefined) {
+    passwordHash = portalPassword ? await hashPortalPassword(portalPassword) : null
   }
 
-  // Email credentials when a NEW password was set (either enabling the portal
-  // for the first time or rotating it). Clearing the password never emails.
-  // Field is absent from the response when no attempt was made (see create).
-  let credentialNotice: string | null | undefined
-  if ((barber.portalEnabled ?? false) && portalPassword) {
-    credentialNotice = await sendPortalCredentialsEmail(barber, portalPassword)
+  let slug = barber.slug
+  if (data.name && data.name !== barber.name) {
+    slug = await uniqueSlug(data.name, id)
   }
+
+  await prisma.$transaction(async (tx) => {
+    await tx.barber.update({
+      where: { id },
+      data: {
+        ...(data.name !== undefined ? { name: data.name, slug } : {}),
+        ...(data.image !== undefined ? { image: data.image } : {}),
+        ...(data.phone !== undefined ? { phone: data.phone } : {}),
+        ...(data.email !== undefined ? { email: data.email } : {}),
+        ...(data.specialty !== undefined ? { specialty: data.specialty } : {}),
+        ...(data.biography !== undefined ? { biography: data.biography } : {}),
+        ...(data.experience !== undefined ? { experience: data.experience } : {}),
+        ...(data.rating !== undefined ? { rating: data.rating } : {}),
+        ...(data.barberType !== undefined ? { barberType: data.barberType as BarberType } : {}),
+        ...(data.location !== undefined ? { location: data.location } : {}),
+        ...(data.commissionType !== undefined ? { commissionType: data.commissionType as CommissionType } : {}),
+        ...(data.commissionValue !== undefined ? { commissionValue: data.commissionValue } : {}),
+        ...(data.isActive !== undefined ? { isActive: data.isActive } : {}),
+        ...(data.portalEnabled !== undefined ? { portalEnabled: data.portalEnabled } : {}),
+        ...(portalPassword !== undefined ? { passwordHash } : {}),
+      },
+    })
+
+    if (serviceIds) {
+      await tx.barberService.deleteMany({ where: { barberId: id } })
+      if (serviceIds.length > 0) {
+        await tx.barberService.createMany({
+          data: serviceIds.map((serviceId) => ({ barberId: id, serviceId })),
+        })
+      }
+    }
+  })
+
+  let credentialNotice: string | null | undefined
+  if ((data.portalEnabled ?? barber.portalEnabled) && portalPassword) {
+    const updated = await prisma.barber.findUnique({ where: { id } })
+    if (updated) {
+      credentialNotice = await sendPortalCredentialsEmail(updated, portalPassword)
+    }
+  }
+
   const fresh = await getBarberByIdForAdmin(id)
   return credentialNotice === undefined ? fresh : { ...fresh, credentialNotice }
 }
 
-/**
- * Permanently removes a barber together with their availability slots and
- * service links. Only safe for barbers with NO appointment history — the
- * controller checks that first and deactivates instead when history exists.
- */
 export async function deleteBarber(id: number): Promise<void> {
-  const barber = await Barber.findByPk(id)
+  const barber = await prisma.barber.findUnique({ where: { id } })
   if (!barber) {
     throw new NotFoundError('Barber not found.')
   }
-  await BarberService.destroy({ where: { barberId: id } })
-  await BarberAvailability.destroy({ where: { barberId: id } })
-  await barber.destroy()
+  await prisma.$transaction([
+    prisma.barberService.deleteMany({ where: { barberId: id } }),
+    prisma.barberAvailability.deleteMany({ where: { barberId: id } }),
+    prisma.barber.delete({ where: { id } }),
+  ])
+}
+
+export async function deactivateBarber(id: number): Promise<void> {
+  const barber = await prisma.barber.findUnique({ where: { id } })
+  if (!barber) {
+    throw new NotFoundError('Barber not found.')
+  }
+  await prisma.barber.update({
+    where: { id },
+    data: { isActive: false },
+  })
 }
 
 export async function countBarberAppointments(id: number): Promise<number> {
-  return Appointment.count({ where: { barberId: id } })
+  return prisma.appointment.count({ where: { barberId: id } })
 }
 
 export async function getBarberAvailability(barberId: number): Promise<BarberAvailability[]> {
-  const barber = await Barber.findByPk(barberId)
+  const barber = await prisma.barber.findUnique({ where: { id: barberId } })
   if (!barber) {
     throw new NotFoundError('Barber not found.')
   }
-  return BarberAvailability.findAll({
+  return prisma.barberAvailability.findMany({
     where: { barberId },
-    order: [['dayOfWeek', 'ASC']],
+    orderBy: { dayOfWeek: 'asc' },
   })
 }
 
@@ -478,22 +508,35 @@ export async function upsertBarberAvailability(
     isAvailable?: boolean
   }>,
 ): Promise<BarberAvailability[]> {
-  const barber = await Barber.findByPk(barberId)
+  const barber = await prisma.barber.findUnique({ where: { id: barberId } })
   if (!barber) {
     throw new NotFoundError('Barber not found.')
   }
 
-  for (const entry of entries) {
-    const [record] = await BarberAvailability.findOrCreate({
-      where: { barberId, dayOfWeek: entry.dayOfWeek },
-      defaults: { ...entry, barberId },
-    })
-    await record.update({
-      startTime: entry.startTime,
-      endTime: entry.endTime,
-      isAvailable: entry.isAvailable ?? true,
-    })
-  }
+  await prisma.$transaction(
+    entries.map((entry) =>
+      prisma.barberAvailability.upsert({
+        where: {
+          barberId_dayOfWeek: {
+            barberId,
+            dayOfWeek: entry.dayOfWeek,
+          },
+        },
+        create: {
+          barberId,
+          dayOfWeek: entry.dayOfWeek,
+          startTime: entry.startTime,
+          endTime: entry.endTime,
+          isAvailable: entry.isAvailable ?? true,
+        },
+        update: {
+          startTime: entry.startTime,
+          endTime: entry.endTime,
+          isAvailable: entry.isAvailable ?? true,
+        },
+      }),
+    ),
+  )
 
   return getBarberAvailability(barberId)
 }

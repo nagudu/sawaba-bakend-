@@ -7,13 +7,13 @@ import {
   updateBarber,
   countBarberAppointments,
   deleteBarber,
+  deactivateBarber,
   getBarberAvailability,
   upsertBarberAvailability,
 } from '../services/barberService'
 import { successRes } from '../utils/response'
-import { Barber } from '../models'
 import { uploadImageToCloudinary, deleteImageByUrl } from '../utils/upload'
-import { AppError, NotFoundError } from '../utils/errors'
+import { AppError } from '../utils/errors'
 import type { CreateBarberInput, UpdateBarberInput } from '../validators/barber'
 
 async function withUploadedImage(req: Request, next: NextFunction, fallback: string | null): Promise<string | null | undefined> {
@@ -110,12 +110,7 @@ export async function deleteBarberHandler(req: Request, res: Response, next: Nex
     const appointmentCount = await countBarberAppointments(id)
 
     if (appointmentCount > 0) {
-      // The barber keeps old appointments/receipts consistent, so they cannot
-      // be physically removed — deactivate them instead and say so honestly.
-      const [updatedCount] = await Barber.update({ isActive: false }, { where: { id } })
-      if (updatedCount === 0) {
-        throw new NotFoundError('Barber not found.')
-      }
+      await deactivateBarber(id)
       successRes(
         res,
         `"${existing.name}" has ${appointmentCount} appointment${appointmentCount === 1 ? '' : 's'} on record, so they were deactivated instead of deleted. Their past bookings and receipts stay intact — remove them from services in Edit if you no longer offer those combinations.`,

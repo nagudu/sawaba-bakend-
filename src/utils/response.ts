@@ -1,7 +1,10 @@
 import type { Response } from 'express'
+import { serializePrisma } from './prismaSerialize'
 
 export function successRes<T>(res: Response, message: string, data: T, status = 200): void {
-  res.status(status).json({ success: true, message, data })
+  // Normalises Prisma values (Decimal, @db.Date) into the exact shapes Sequelize
+  // produced, so the frontend sees an unchanged API contract during the migration.
+  res.status(status).json({ success: true, message, data: serializePrisma(data) })
 }
 
 export function errorRes(res: Response, message: string, status = 400): void {

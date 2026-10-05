@@ -1,9 +1,5 @@
-import { Op } from 'sequelize'
-import {
-  Appointment,
-  BarberEarning,
-  BarberNotification,
-} from '../models'
+import { prisma } from '../config/database'
+import type { BarberNotification, AppointmentStatus, EarningStatus } from '@prisma/client'
 import { NotFoundError, UnprocessableError } from '../utils/errors'
 import { getPagination } from '../utils/response'
 import { serializeAppointment } from './appointmentService'
@@ -13,12 +9,6 @@ import {
   upsertBarberAvailability,
 } from './barberService'
 import type { BarberAvailabilityInput, BarberPortalQuery } from '../validators/barberPortal'
-
-/**
- * Barber Portal — barber's OWN data. Every query is pinned to `barberId` from
- * the JWT (never client-supplied), and the return shapes reuse the existing
- * admin serializers so nothing new can leak another barber's data.
- */
 
 export async function getBarberPortalOverview(barberId: number) {
   const today = new Date()
@@ -30,28 +20,35 @@ export async function getBarberPortalOverview(barberId: number) {
 
   const [todayAppointments, upcoming, completed, pendingCount, earnings, barber, notifications, unreadCount] =
     await Promise.all([
-      Appointment.findAll({
-        where: { barberId, appointmentDate: todayKey, status: { [Op.not]: 'CANCELLED' } },
-      }),
-      Appointment.findAll({
-        where: {
-          barberId,
-          appointmentDate: { [Op.gt]: todayKey },
-          status: { [Op.not]: 'CANCELLED' },
+      prisma.appointment.findMany({
+        where: { barberId, appointmentDate: todayKey, status: { not: 'CANCELLED' } },
+        include: {
+          service: { select: { id: true, name: true, price: true, duration: true } },
+          barber: { select: { id: true, name: true, image: true } },
         },
       }),
-      Appointment.count({ where: { barberId, status: 'COMPLETED' } }),
-      Appointment.count({
-        where: { barberId, status: { [Op.in]: ['PAYMENT_VERIFIED', 'READY_FOR_SERVICE'] } },
+      prisma.appointment.findMany({
+        where: {
+          barberId,
+          appointmentDate: { gt: todayKey },
+          status: { not: 'CANCELLED' },
+        },
       }),
-      BarberEarning.findAll({ where: { barberId } }),
-      (await import('../models')).Barber.findByPk(barberId, { attributes: ['commissionType', 'commissionValue'] }),
-      BarberNotification.findAll({
+      prisma.appointment.count({ where: { barberId, status: 'COMPLETED' } }),
+      prisma.appointment.count({
+        where: { barberId, status: { in: ['PAYMENT_VERIFIED', 'READY_FOR_SERVICE'] } },
+      }),
+      prisma.barberEarning.findMany({ where: { barberId } }),
+      prisma.barber.findUnique({
+        where: { id: barberId },
+        select: { commissionType: true, commissionValue: true },
+      }),
+      prisma.barberNotification.findMany({
         where: { barberId },
-        order: [['createdAt', 'DESC']],
-        limit: 5,
+        orderBy: { createdAt: 'desc' },
+        take: 5,
       }),
-      BarberNotification.count({ where: { barberId, readAt: null } }),
+      prisma.barberNotification.count({ where: { barberId, readAt: null } }),
     ])
 
   const sum = (rows: typeof earnings) => rows.reduce((total, e) => total + Number(e.commissionAmount), 0)
@@ -63,7 +60,7 @@ export async function getBarberPortalOverview(barberId: number) {
     .filter((a) => a.status === 'READY_FOR_SERVICE' || a.status === 'PAYMENT_VERIFIED')
     .sort((a, b) => a.appointmentTime.localeCompare(b.appointmentTime))
     .slice(0, 6)
-    .map((a) => serializeAppointment(a))
+    .map((a) => serializeAppointment(a as never))
 
   return {
     todayCount: todayAppointments.filter((a) => a.status !== 'IN_PROGRESS').length,
@@ -88,34 +85,38 @@ export async function listBarberPortalAppointments(
   query: BarberPortalQuery,
 ) {
   const { offset, limit, page, perPage } = getPagination(query as Record<string, unknown>)
-  // A barber works an appointment when they are the booked barber OR the
-  // admin-assigned barber — assignments are the operative field for the
-  // customer → admin → barber flow.
-  const where: Record<string, unknown> = {
-    [Op.or]: [{ barberId }, { assignedBarberId: barberId }],
+
+  const where: {
+    OR?: Array<{ barberId: number } | { assignedBarberId: number }>
+    status?: AppointmentStatus
+    appointmentDate?: { gte?: string; lte?: string }
+  } = {
+    OR: [{ barberId }, { assignedBarberId: barberId }],
   }
 
-  if (query.status) where.status = query.status
+  if (query.status) where.status = query.status as AppointmentStatus
   if (query.from || query.to) {
     where.appointmentDate = {
-      ...(query.from ? { [Op.gte]: query.from } : {}),
-      ...(query.to ? { [Op.lte]: query.to } : {}),
+      ...(query.from ? { gte: query.from } : {}),
+      ...(query.to ? { lte: query.to } : {}),
     }
   }
 
-  const { rows, count } = await Appointment.findAndCountAll({
-    where,
-    include: [
-      {
-        model: (await import('../models')).Service,
-        as: 'service',
-        attributes: ['id', 'name', 'price', 'duration'],
+  const [rows, count] = await Promise.all([
+    prisma.appointment.findMany({
+      where,
+      include: {
+        service: { select: { id: true, name: true, price: true, duration: true } },
+        barber: { select: { id: true, name: true, image: true } },
+        assignedBarber: { select: { id: true, name: true, image: true } },
+        payment: true,
       },
-    ],
-    order: [['appointmentDate', 'DESC'], ['appointmentTime', 'DESC']],
-    offset,
-    limit,
-  })
+      orderBy: [{ appointmentDate: 'desc' }, { appointmentTime: 'desc' }],
+      skip: offset,
+      take: limit,
+    }),
+    prisma.appointment.count({ where }),
+  ])
 
   return {
     items: rows.map((a) => serializeAppointment(a)),
@@ -126,10 +127,16 @@ export async function listBarberPortalAppointments(
 }
 
 export async function getBarberPortalAppointment(barberId: number, appointmentId: number) {
-  const appointment = await Appointment.findOne({
+  const appointment = await prisma.appointment.findFirst({
     where: {
       id: appointmentId,
-      [Op.or]: [{ barberId }, { assignedBarberId: barberId }],
+      OR: [{ barberId }, { assignedBarberId: barberId }],
+    },
+    include: {
+      service: { select: { id: true, name: true, price: true, duration: true } },
+      barber: { select: { id: true, name: true, image: true } },
+      assignedBarber: { select: { id: true, name: true, image: true } },
+      payment: true,
     },
   })
   if (!appointment) {
@@ -138,59 +145,80 @@ export async function getBarberPortalAppointment(barberId: number, appointmentId
   return serializeAppointment(appointment)
 }
 
-/** Barber marks their own appointment IN_PROGRESS → COMPLETED (their session). */
 export async function updateBarberPortalAppointmentStatus(
   barberId: number,
   appointmentId: number,
   to: 'IN_PROGRESS' | 'COMPLETED',
 ) {
-  const appointment = await Appointment.findOne({
+  const appointment = await prisma.appointment.findFirst({
     where: {
       id: appointmentId,
-      [Op.or]: [{ barberId }, { assignedBarberId: barberId }],
+      OR: [{ barberId }, { assignedBarberId: barberId }],
     },
   })
   if (!appointment) {
     throw new NotFoundError('Appointment not found for this barber.')
   }
 
+  let updated
   if (to === 'IN_PROGRESS') {
     if (appointment.status !== 'READY_FOR_SERVICE') {
       throw new UnprocessableError('Only READY_FOR_SERVICE appointments can be started.')
     }
-    await appointment.update({ status: 'IN_PROGRESS' })
+    updated = await prisma.appointment.update({
+      where: { id: appointmentId },
+      data: { status: 'IN_PROGRESS', serviceStartedAt: new Date() },
+      include: {
+        service: { select: { id: true, name: true, price: true, duration: true } },
+        barber: { select: { id: true, name: true, image: true } },
+        payment: true,
+      },
+    })
   } else {
     if (appointment.status !== 'IN_PROGRESS') {
       throw new UnprocessableError('Only IN_PROGRESS appointments can be completed.')
     }
-    await appointment.update({ status: 'COMPLETED', completedAt: new Date() })
+    updated = await prisma.appointment.update({
+      where: { id: appointmentId },
+      data: { status: 'COMPLETED', completedAt: new Date() },
+      include: {
+        service: { select: { id: true, name: true, price: true, duration: true } },
+        barber: { select: { id: true, name: true, image: true } },
+        payment: true,
+      },
+    })
   }
 
-  // Re-sync the earning ledger: a completed appointment with a PAID payment
-  // becomes EARNED in the barber's ledger.
   await syncEarningForAppointment(appointment.id)
-
-  return serializeAppointment(appointment)
+  return serializeAppointment(updated as never)
 }
 
 export async function listBarberPortalEarnings(barberId: number, query: BarberPortalQuery) {
   const { offset, limit, page, perPage } = getPagination(query as Record<string, unknown>)
-  const where: Record<string, unknown> = { barberId }
-  if (query.status) where.status = query.status
-  if (query.earningStatus) where.status = query.earningStatus
+  const where: { barberId: number; status?: EarningStatus } = { barberId }
+  if (query.status) where.status = query.status as EarningStatus
+  if (query.earningStatus) where.status = query.earningStatus as EarningStatus
 
-  const { rows, count } = await BarberEarning.findAndCountAll({
-    where,
-    include: [
-      { model: Appointment, as: 'appointment', attributes: ['id', 'referenceCode', 'serviceId', 'totalAmount', 'appointmentDate'] },
-    ],
-    order: [['createdAt', 'DESC']],
-    offset,
-    limit,
-  })
+  const [rows, count] = await Promise.all([
+    prisma.barberEarning.findMany({
+      where,
+      include: {
+        appointment: {
+          include: {
+            payment: { select: { status: true } },
+          },
+        },
+        barber: { select: { id: true, name: true, location: true } },
+      },
+      orderBy: { createdAt: 'desc' },
+      skip: offset,
+      take: limit,
+    }),
+    prisma.barberEarning.count({ where }),
+  ])
 
   return {
-    items: rows.map((e) => serializeEarning(e)),
+    items: rows.map((e) => serializeEarning(e as never)),
     total: count,
     page,
     perPage,
@@ -199,15 +227,18 @@ export async function listBarberPortalEarnings(barberId: number, query: BarberPo
 
 export async function listBarberPortalNotifications(barberId: number, query: BarberPortalQuery) {
   const { offset, limit, page, perPage } = getPagination(query as Record<string, unknown>)
-  const { rows, count } = await BarberNotification.findAndCountAll({
-    where: { barberId },
-    order: [['createdAt', 'DESC']],
-    offset,
-    limit,
-  })
+  const [rows, count] = await Promise.all([
+    prisma.barberNotification.findMany({
+      where: { barberId },
+      orderBy: { createdAt: 'desc' },
+      skip: offset,
+      take: limit,
+    }),
+    prisma.barberNotification.count({ where: { barberId } }),
+  ])
   return {
     items: rows.map((n) => serializeNotification(n)),
-    unreadCount: await BarberNotification.count({ where: { barberId, readAt: null } }),
+    unreadCount: await prisma.barberNotification.count({ where: { barberId, readAt: null } }),
     total: count,
     page,
     perPage,
@@ -218,20 +249,22 @@ export async function markBarberPortalNotificationRead(
   barberId: number,
   notificationId?: number,
 ): Promise<void> {
-  const where: Record<string, unknown> = { barberId }
-  if (notificationId) where.id = notificationId
-
-  const target = notificationId
-    ? await BarberNotification.findOne({ where })
-    : null
-  if (notificationId && !target) {
-    throw new NotFoundError('Notification not found.')
-  }
-
   if (notificationId) {
-    await target!.update({ readAt: new Date() })
+    const target = await prisma.barberNotification.findFirst({
+      where: { id: notificationId, barberId },
+    })
+    if (!target) {
+      throw new NotFoundError('Notification not found.')
+    }
+    await prisma.barberNotification.update({
+      where: { id: notificationId },
+      data: { readAt: new Date() },
+    })
   } else {
-    await BarberNotification.update({ readAt: new Date() }, { where: { barberId, readAt: null } })
+    await prisma.barberNotification.updateMany({
+      where: { barberId, readAt: null },
+      data: { readAt: new Date() },
+    })
   }
 }
 
@@ -258,7 +291,6 @@ function serializeNotification(notification: BarberNotification) {
   }
 }
 
-/** Converts a bare "HH:mm" clock into minutes past midnight for slot math. */
 function toMinutes(time: string): number {
   const [h, m] = time.split(':').map(Number)
   return h * 60 + m

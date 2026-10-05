@@ -1,29 +1,25 @@
-import { Op } from 'sequelize'
-import { Appointment, Customer, Payment } from '../models'
+import { prisma } from '../config/database'
+import type { Customer } from '@prisma/client'
 import { NotFoundError, UnprocessableError } from '../utils/errors'
 import { serializeAppointment } from './appointmentService'
 import { getCustomerStats } from './customerService'
 import { sendEmail } from './mailer'
-import type { Customer as CustomerModel } from '../models/Customer'
 
-/** Full customer bundle for the admin Customers page. */
 export async function getCustomerDetail(id: number): Promise<Record<string, unknown>> {
-  const customer = await Customer.findByPk(id)
+  const customer = await prisma.customer.findUnique({ where: { id } })
   if (!customer) throw new NotFoundError('Customer not found.')
 
   const [appointments, stats] = await Promise.all([
-    Appointment.findAll({
+    prisma.appointment.findMany({
       where: { customerId: id },
-      include: [
-        { model: (await import('../models')).Service, as: 'service', attributes: ['id', 'name', 'price', 'duration'] },
-        { model: (await import('../models')).Barber, as: 'barber', attributes: ['id', 'name', 'image'] },
-        { model: Payment, as: 'payment', attributes: ['id', 'status', 'amount', 'paymentMethod', 'accessToken'] },
-      ],
-      order: [
-        ['appointmentDate', 'DESC'],
-        ['appointmentTime', 'DESC'],
-      ],
-      limit: 200,
+      include: {
+        service: { select: { id: true, name: true, price: true, duration: true } },
+        barber: { select: { id: true, name: true, image: true } },
+        assignedBarber: { select: { id: true, name: true, image: true, barberType: true, location: true } },
+        payment: { select: { id: true, status: true, amount: true, paymentMethod: true, accessToken: true } },
+      },
+      orderBy: [{ appointmentDate: 'desc' }, { appointmentTime: 'desc' }],
+      take: 200,
     }),
     getCustomerStats(id),
   ])
@@ -70,20 +66,25 @@ export async function getCustomerDetail(id: number): Promise<Record<string, unkn
   }
 }
 
-/** Admin edits — never phone (identity anchor) or spend data. */
 export async function adminUpdateCustomer(
   id: number,
   patch: { fullName?: string; email?: string | null; isActive?: boolean; reminderOptIn?: boolean },
-): Promise<CustomerModel> {
-  const customer = await Customer.findByPk(id)
+): Promise<Customer> {
+  const customer = await prisma.customer.findUnique({ where: { id } })
   if (!customer) throw new NotFoundError('Customer not found.')
 
-  const fields: Record<string, unknown> = {}
+  const fields: {
+    fullName?: string
+    email?: string | null
+    isActive?: boolean
+    reminderOptIn?: boolean
+  } = {}
+
   if (patch.fullName !== undefined && patch.fullName.trim()) fields.fullName = patch.fullName.trim()
   if (patch.email !== undefined) {
     const email = patch.email ? patch.email.trim().toLowerCase() : null
     if (email && email !== customer.email) {
-      const taken = await Customer.findOne({ where: { email } })
+      const taken = await prisma.customer.findFirst({ where: { email } })
       if (taken) throw new UnprocessableError('This email belongs to another customer.')
     }
     fields.email = email
@@ -91,34 +92,31 @@ export async function adminUpdateCustomer(
   if (patch.isActive !== undefined) fields.isActive = patch.isActive
   if (patch.reminderOptIn !== undefined) fields.reminderOptIn = patch.reminderOptIn
 
-  await customer.update(fields)
-  return customer
+  return prisma.customer.update({
+    where: { id },
+    data: fields,
+  })
 }
 
-/**
- * Sends the "book your usual" nudge to customers whose average visit gap has
- * elapsed since their last appointment. Never auto-books; opt-out respected.
- */
 export async function sendDueReminders(options: {
   dryRun?: boolean
 } = {}): Promise<{ sent: number; skipped: number; results: Array<{ customer: string; phone: string; email: string | null }> }> {
-  const customers = await Customer.findAll({ where: { isActive: true, reminderOptIn: true } })
+  const customers = await prisma.customer.findMany({ where: { isActive: true, reminderOptIn: true } })
   const today = new Date()
   const results: Array<{ customer: string; phone: string; email: string | null }> = []
   let skipped = 0
 
   for (const customer of customers) {
-    const appointments = await Appointment.findAll({
-      where: { customerId: customer.id, status: { [Op.ne]: 'CANCELLED' } },
-      attributes: ['appointmentDate', 'serviceId'],
-      order: [['appointmentDate', 'ASC']],
+    const appointments = await prisma.appointment.findMany({
+      where: { customerId: customer.id, status: { not: 'CANCELLED' } },
+      select: { appointmentDate: true, serviceId: true },
+      orderBy: { appointmentDate: 'asc' },
     })
     if (appointments.length < 2) {
       skipped += 1
       continue
     }
 
-    // Average gap in days between consecutive visits.
     const dates = appointments
       .map((a) => new Date(`${a.appointmentDate}T12:00:00`).getTime())
       .sort((a, b) => a - b)
@@ -130,15 +128,15 @@ export async function sendDueReminders(options: {
     const lastVisit = dates[dates.length - 1]
     const daysSince = (today.getTime() - lastVisit) / 86_400_000
 
-    // Due when the customer is within 2 days of their average rebooking rhythm.
     if (daysSince < avgGap - 2 || !customer.email) {
       skipped += 1
       continue
     }
 
     const last = appointments[appointments.length - 1]
-    const service = await (await import('../models')).Service.findByPk(last.serviceId, {
-      attributes: ['name'],
+    const service = await prisma.service.findUnique({
+      where: { id: last.serviceId },
+      select: { name: true },
     })
     const firstName = customer.fullName.split(' ')[0]
 

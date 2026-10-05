@@ -1,5 +1,5 @@
-import { Op, type WhereOptions } from 'sequelize'
-import { ContactMessage, ContactReply } from '../models'
+import { prisma } from '../config/database'
+import type { ContactMessage, ContactReply, ContactMessageStatus } from '@prisma/client'
 import { NotFoundError, UnprocessableError } from '../utils/errors'
 import { getPagination } from '../utils/response'
 import type { CreateContactInput } from '../validators/contact'
@@ -73,7 +73,7 @@ function serializeMessage(message: ContactMessage, replies: ContactReply[] = [])
     subject: message.subject,
     message: message.message,
     isRead: message.isRead,
-    status: message.status,
+    status: message.status as ContactStatus,
     repliedAt: message.repliedAt,
     archivedAt: message.archivedAt,
     createdAt: message.createdAt,
@@ -84,14 +84,16 @@ function serializeMessage(message: ContactMessage, replies: ContactReply[] = [])
 }
 
 export async function createContactMessage(input: CreateContactInput): Promise<ContactPublic> {
-  const message = await ContactMessage.create({
-    name: input.name,
-    phone: input.phone ?? null,
-    email: input.email,
-    subject: input.subject ?? null,
-    message: input.message,
-    isRead: false,
-    status: 'NEW',
+  const message = await prisma.contactMessage.create({
+    data: {
+      name: input.name,
+      phone: input.phone ?? null,
+      email: input.email,
+      subject: input.subject ?? null,
+      message: input.message,
+      isRead: false,
+      status: 'NEW',
+    },
   })
   return serializeMessage(message)
 }
@@ -104,15 +106,22 @@ export interface ListContactQuery {
   perPage?: number
 }
 
-const SEARCH_FIELDS = ['name', 'email', 'subject', 'message'] as const
-
 export async function listContactMessages(query: ListContactQuery): Promise<Paged<ContactPublic>> {
   const { page, perPage, offset, limit } = getPagination(query as unknown as Record<string, unknown>)
 
-  const where: WhereOptions<ContactMessage> = {}
+  const where: {
+    status?: ContactMessageStatus
+    isRead?: boolean
+    OR?: Array<{
+      name?: { contains: string }
+      email?: { contains: string }
+      subject?: { contains: string }
+      message?: { contains: string }
+    }>
+  } = {}
 
   if (query.status && query.status !== 'all') {
-    where.status = query.status
+    where.status = query.status as ContactMessageStatus
   } else if (query.read === 'true') {
     where.isRead = true
   } else if (query.read === 'false') {
@@ -121,27 +130,27 @@ export async function listContactMessages(query: ListContactQuery): Promise<Page
 
   const search = query.search?.trim()
   if (search) {
-    Object.assign(where, {
-      [Op.or]: SEARCH_FIELDS.map((field) => ({
-        [field]: { [Op.like]: `%${search}%` },
-      })),
-    })
+    where.OR = [
+      { name: { contains: search } },
+      { email: { contains: search } },
+      { subject: { contains: search } },
+      { message: { contains: search } },
+    ]
   }
 
-  const { rows, count } = await ContactMessage.findAndCountAll({
-    where,
-    distinct: true,
-    order: [
-      ['isRead', 'ASC'],
-      ['createdAt', 'DESC'],
-    ],
-    include: [{ model: ContactReply, as: 'replies' }],
-    offset,
-    limit,
-  })
+  const [rows, count] = await Promise.all([
+    prisma.contactMessage.findMany({
+      where,
+      include: { replies: true },
+      orderBy: [{ isRead: 'asc' }, { createdAt: 'desc' }],
+      skip: offset,
+      take: limit,
+    }),
+    prisma.contactMessage.count({ where }),
+  ])
 
   return {
-    items: rows.map((row) => serializeMessage(row, (row as unknown as { replies?: ContactReply[] }).replies ?? [])),
+    items: rows.map((row) => serializeMessage(row, row.replies ?? [])),
     total: count,
     page,
     perPage,
@@ -149,20 +158,21 @@ export async function listContactMessages(query: ListContactQuery): Promise<Page
 }
 
 export async function getContactThread(id: number): Promise<ContactThreadPublic> {
-  const message = await ContactMessage.findByPk(id, {
-    include: [{ model: ContactReply, as: 'replies' }],
+  const message = await prisma.contactMessage.findUnique({
+    where: { id },
+    include: { replies: true },
   })
   if (!message) {
     throw new NotFoundError('Contact message not found.')
   }
   return {
-    ...serializeMessage(message, (message as unknown as { replies?: ContactReply[] }).replies ?? []),
+    ...serializeMessage(message, message.replies ?? []),
     emailConfigured: isEmailConfigured(),
   }
 }
 
 async function requireMessage(id: number): Promise<ContactMessage> {
-  const message = await ContactMessage.findByPk(id)
+  const message = await prisma.contactMessage.findUnique({ where: { id } })
   if (!message) {
     throw new NotFoundError('Contact message not found.')
   }
@@ -171,31 +181,43 @@ async function requireMessage(id: number): Promise<ContactMessage> {
 
 export async function markContactRead(id: number, isRead: boolean): Promise<ContactPublic> {
   const message = await requireMessage(id)
+  let updated: ContactMessage
   if (message.status === 'REPLIED' && isRead) {
-    return serializeMessage(message, await getReplies(id))
-  }
-  if (message.status !== 'REPLIED' && message.status !== 'ARCHIVED') {
-    await message.update({ isRead, status: isRead ? 'READ' : 'NEW' })
+    updated = message
+  } else if (message.status !== 'REPLIED' && message.status !== 'ARCHIVED') {
+    updated = await prisma.contactMessage.update({
+      where: { id },
+      data: { isRead, status: isRead ? 'READ' : 'NEW' },
+    })
   } else {
-    await message.update({ isRead })
+    updated = await prisma.contactMessage.update({
+      where: { id },
+      data: { isRead },
+    })
   }
-  return serializeMessage(message, await getReplies(id))
+  return serializeMessage(updated, await getReplies(id))
 }
 
 export async function updateContactStatus(id: number, status: ContactStatus): Promise<ContactPublic> {
   const message = await requireMessage(id)
-  const updates: Partial<{ status: ContactStatus; isRead: boolean; archivedAt: Date | null }> = { status }
+  const updates: { status: ContactMessageStatus; isRead?: boolean; archivedAt?: Date | null } = {
+    status: status as ContactMessageStatus,
+  }
   if (status === 'READ') updates.isRead = true
   if (status === 'NEW') updates.isRead = false
   if (status === 'ARCHIVED') updates.archivedAt = new Date()
   if (message.status === 'ARCHIVED' && status !== 'ARCHIVED') updates.archivedAt = null
-  await message.update(updates)
-  return serializeMessage(message, await getReplies(id))
+
+  const updated = await prisma.contactMessage.update({
+    where: { id },
+    data: updates,
+  })
+  return serializeMessage(updated, await getReplies(id))
 }
 
 export async function deleteContactMessage(id: number): Promise<void> {
-  const message = await requireMessage(id)
-  await message.destroy()
+  await requireMessage(id)
+  await prisma.contactMessage.delete({ where: { id } })
 }
 
 export interface SendContactReplyInput {
@@ -247,9 +269,6 @@ export async function sendContactReply(input: SendContactReplyInput): Promise<{
     throw new UnprocessableError('Invalid customer email address.')
   }
 
-  // Send FIRST, and only persist a SENT record / flip the message to REPLIED once the
-  // email provider has actually accepted the message. Failures are recorded as FAILED
-  // attempts (visible in the thread) and the message keeps its previous status.
   let receipt: EmailSendReceipt
   try {
     receipt = await sendEmail({
@@ -259,15 +278,17 @@ export async function sendContactReply(input: SendContactReplyInput): Promise<{
       html,
     })
   } catch (error) {
-    await ContactReply.create({
-      contactMessageId: contact.id,
-      adminId: input.adminId,
-      adminName: input.adminName,
-      recipientEmail: contact.email,
-      subject,
-      message: trimmed,
-      status: 'FAILED',
-      sentAt: null,
+    await prisma.contactReply.create({
+      data: {
+        contactMessageId: contact.id,
+        adminId: input.adminId,
+        adminName: input.adminName,
+        recipientEmail: contact.email,
+        subject,
+        message: trimmed,
+        status: 'FAILED',
+        sentAt: null,
+      },
     })
     if (error instanceof EmailDeliveryError) {
       throw new UnprocessableError(error.userMessage)
@@ -275,23 +296,28 @@ export async function sendContactReply(input: SendContactReplyInput): Promise<{
     throw error
   }
 
-  const reply = await ContactReply.create({
-    contactMessageId: contact.id,
-    adminId: input.adminId,
-    adminName: input.adminName,
-    recipientEmail: contact.email,
-    subject,
-    message: trimmed,
-    status: 'SENT',
-    providerMessageId: receipt.messageId ? `${receipt.provider}:${receipt.messageId}` : null,
-    sentAt: new Date(),
+  const reply = await prisma.contactReply.create({
+    data: {
+      contactMessageId: contact.id,
+      adminId: input.adminId,
+      adminName: input.adminName,
+      recipientEmail: contact.email,
+      subject,
+      message: trimmed,
+      status: 'SENT',
+      providerMessageId: receipt.messageId ? `${receipt.provider}:${receipt.messageId}` : null,
+      sentAt: new Date(),
+    },
   })
 
-  await contact.update({ status: 'REPLIED', isRead: true, repliedAt: new Date() })
+  const updatedContact = await prisma.contactMessage.update({
+    where: { id: contact.id },
+    data: { status: 'REPLIED', isRead: true, repliedAt: new Date() },
+  })
 
   return {
     reply: serializeReply(reply),
-    contact: serializeMessage(contact, await getReplies(contact.id)),
+    contact: serializeMessage(updatedContact, await getReplies(contact.id)),
     email: {
       messageId: receipt.messageId ?? null,
       accepted: receipt.accepted,
@@ -302,9 +328,9 @@ export async function sendContactReply(input: SendContactReplyInput): Promise<{
 }
 
 async function getReplies(contactMessageId: number): Promise<ContactReply[]> {
-  return ContactReply.findAll({
+  return prisma.contactReply.findMany({
     where: { contactMessageId },
-    order: [['createdAt', 'ASC']],
+    orderBy: { createdAt: 'asc' },
   })
 }
 

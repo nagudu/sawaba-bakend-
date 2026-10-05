@@ -1,0 +1,20 @@
+"use strict";
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.barberPortalRouter = void 0;
+const express_1 = require("express");
+const barberAuth_1 = require("../middleware/barberAuth");
+const validate_1 = require("../middleware/validate");
+const barberPortal_1 = require("../validators/barberPortal");
+const barberPortalController_1 = require("../controllers/barberPortalController");
+exports.barberPortalRouter = (0, express_1.Router)();
+exports.barberPortalRouter.use(barberAuth_1.requireBarber);
+exports.barberPortalRouter.get('/overview', barberPortalController_1.getBarberPortalOverviewHandler);
+exports.barberPortalRouter.get('/appointments', (0, validate_1.validate)(barberPortal_1.barberPortalQuerySchema, 'query'), barberPortalController_1.listBarberPortalAppointmentsHandler);
+exports.barberPortalRouter.get('/appointments/:appointmentId', (0, validate_1.validate)(barberPortal_1.barberAppointmentTimeParamsSchema, 'params'), barberPortalController_1.getBarberPortalAppointmentHandler);
+exports.barberPortalRouter.put('/appointments/:appointmentId/status', (0, validate_1.validate)(barberPortal_1.barberAppointmentTimeParamsSchema, 'params'), barberPortalController_1.updateBarberPortalAppointmentStatusHandler);
+exports.barberPortalRouter.get('/earnings', (0, validate_1.validate)(barberPortal_1.barberPortalQuerySchema, 'query'), barberPortalController_1.listBarberPortalEarningsHandler);
+exports.barberPortalRouter.get('/notifications', (0, validate_1.validate)(barberPortal_1.barberPortalQuerySchema, 'query'), barberPortalController_1.listBarberPortalNotificationsHandler);
+exports.barberPortalRouter.put('/notifications/read', (0, validate_1.validate)(barberPortal_1.barberMarkNotificationReadSchema, 'body'), barberPortalController_1.markBarberNotificationsReadHandler);
+exports.barberPortalRouter.get('/availability', barberPortalController_1.getBarberPortalAvailabilityHandler);
+exports.barberPortalRouter.put('/availability', (0, validate_1.validate)(barberPortal_1.barberAvailabilityBodySchema, 'body'), barberPortalController_1.upsertBarberPortalAvailabilityHandler);
+//# sourceMappingURL=barberPortal.js.map

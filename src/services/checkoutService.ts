@@ -1,15 +1,6 @@
 import crypto from 'node:crypto'
-import { Op, Transaction } from 'sequelize'
-import { sequelize } from '../config/database'
-import {
-  Appointment,
-  Barber,
-  BarberAvailability,
-  BarberService,
-  CheckoutSession,
-  Payment,
-  Service,
-} from '../models'
+import { prisma } from '../config/database'
+import type { Prisma, PaymentMethod } from '@prisma/client'
 import { ConflictError, NotFoundError, UnprocessableError } from '../utils/errors'
 import { hhmmToMinutes } from './availabilityService'
 import { findOrCreateCustomer } from './customerService'
@@ -17,27 +8,6 @@ import { createEarningSnapshot } from './commissionService'
 import { uploadImageToCloudinary } from '../utils/upload'
 import { getPaymentSettingsRecord } from './paymentSettingsService'
 import { AppointmentStatusValue } from '../config/appointmentStatuses'
-import type { CheckoutSession as CheckoutSessionModel } from '../models/CheckoutSession'
-import type { PaymentMethod } from '../types'
-
-/**
- * Temporary booking checkout sessions.
- *
- * STRICT RULE: no Appointment and no Payment rows exist until the selected
- * payment method's required condition is satisfied. The session alone carries
- * the booking details; abandoning it (Back to Home / closed tab / never
- * finishing payment) leaves ZERO permanent records.
- *
- *   CASH                    → finalizeCheckout() creates Appointment(PENDING* + UNPAID)
- *   BANK_TRANSFER / OPAY    → session stores the receipt, finalizeCheckout() creates
- *                             Appointment + Payment(PENDING_VERIFICATION) atomically
- *   ONLINE                  → Paystack transaction on the SESSION; Appointment +
- *                             Payment are created only after the backend re-verifies
- *                             the charge directly with Paystack (callback/webhook)
- *
- * *Status naming: the existing schema calls the unpaid-awaiting-confirmation
- * state PAYMENT_REQUIRED; the customer-facing flow treats it as "PENDING".
- */
 
 function generateSessionToken(): string {
   return crypto.randomBytes(24).toString('hex')
@@ -47,12 +17,15 @@ function dateKey(date: string): string {
   return date.replace(/-/g, '')
 }
 
-async function generateReferenceCode(appointmentDate: string, t?: Transaction): Promise<string> {
+async function generateReferenceCode(
+  appointmentDate: string,
+  tx: Prisma.TransactionClient | typeof prisma = prisma,
+): Promise<string> {
   const key = dateKey(appointmentDate)
   for (let attempt = 0; attempt < 5; attempt += 1) {
-    const dayCount = await Appointment.count({ where: { appointmentDate }, transaction: t })
+    const dayCount = await tx.appointment.count({ where: { appointmentDate } })
     const candidate = `APT-${key}-${String(dayCount + 1 + attempt).padStart(3, '0')}`
-    const taken = await Appointment.findOne({ where: { referenceCode: candidate }, transaction: t })
+    const taken = await tx.appointment.findUnique({ where: { referenceCode: candidate } })
     if (!taken) return candidate
   }
   const salt = crypto.randomBytes(2).toString('hex').toUpperCase()
@@ -67,29 +40,28 @@ async function assertSessionBookable(
   time: string,
   excludeAppointmentId?: number,
   excludeSessionId?: number,
+  tx: Prisma.TransactionClient | typeof prisma = prisma,
 ): Promise<{ servicePrice: number; serviceDuration: number } | null> {
-  const barber = await Barber.findByPk(barberId)
+  const barber = await tx.barber.findUnique({ where: { id: barberId } })
   if (!barber || !barber.isActive) {
     throw new UnprocessableError('The selected barber is not available.')
   }
 
-  const service = await Service.findByPk(serviceId)
+  const service = await tx.service.findUnique({ where: { id: serviceId } })
   if (!service || !service.isActive) {
     throw new UnprocessableError('The selected service is not available.')
   }
 
-  const providerLink = await BarberService.findOne({ where: { barberId, serviceId } })
-  const hasAnyServices = await BarberService.findOne({ where: { barberId } })
-  // If the barber has at least one service assignment and this service is not
-  // among them, reject. No assignments yet → single-salon fallback, allow all.
+  const providerLink = await tx.barberService.findFirst({ where: { barberId, serviceId } })
+  const hasAnyServices = await tx.barberService.findFirst({ where: { barberId } })
   if (hasAnyServices && !providerLink) {
     throw new UnprocessableError('This barber does not provide the selected service.')
   }
 
   const dayOfWeek = new Date(`${date}T00:00:00`).getDay()
-  const hasAnyAvailability = await BarberAvailability.findOne({ where: { barberId } })
+  const hasAnyAvailability = await tx.barberAvailability.findFirst({ where: { barberId } })
   if (hasAnyAvailability) {
-    const availability = await BarberAvailability.findOne({
+    const availability = await tx.barberAvailability.findFirst({
       where: { barberId, dayOfWeek, isAvailable: true },
     })
     if (!availability) {
@@ -108,31 +80,25 @@ async function assertSessionBookable(
   const start = hhmmToMinutes(time)
   const end = start + service.duration
 
-  const existingQuery = {
-    barberId,
-    appointmentDate: date,
-    status: { [Op.ne]: AppointmentStatusValue.CANCELLED },
-  }
-  const existing = excludeAppointmentId
-    ? await Appointment.findAll({
-        where: { ...existingQuery, id: { [Op.ne]: excludeAppointmentId } },
-      })
-    : await Appointment.findAll({ where: existingQuery })
+  const existing = await tx.appointment.findMany({
+    where: {
+      barberId,
+      appointmentDate: date,
+      status: { not: AppointmentStatusValue.CANCELLED },
+      ...(excludeAppointmentId ? { id: { not: excludeAppointmentId } } : {}),
+    },
+  })
 
-  // Only a payment genuinely in flight (AWAITING_PAYMENT) holds the slot.
-  // Merely-staged (OPEN) sessions hold NOTHING — availability shown to the
-  // customer always reflects reality, and the transaction-protected finalize
-  // is the single arbiter if two customers race for the same slot. The
-  // caller's own session is excluded so it can never conflict with itself.
-  const openSessions = await CheckoutSession.findAll({
+  const openSessions = await tx.checkoutSession.findMany({
     where: {
       barberId,
       appointmentDate: date,
       status: 'AWAITING_PAYMENT',
-      ...(excludeAppointmentId ? { id: { [Op.ne]: excludeAppointmentId } } : {}),
-      ...(excludeSessionId ? { id: { [Op.ne]: excludeSessionId } } : {}),
+      ...(excludeAppointmentId ? { id: { not: excludeAppointmentId } } : {}),
+      ...(excludeSessionId ? { id: { not: excludeSessionId } } : {}),
     },
   })
+
   for (const session of openSessions) {
     const sessionStart = hhmmToMinutes(session.appointmentTime)
     const sessionEnd = sessionStart + service.duration
@@ -142,7 +108,7 @@ async function assertSessionBookable(
   }
 
   const serviceIds = [...new Set(existing.map((a) => a.serviceId))]
-  const services = await Service.findAll({ where: { id: serviceIds } })
+  const services = await tx.service.findMany({ where: { id: { in: serviceIds } } })
   const serviceMap = new Map(services.map((s) => [s.id, s.duration]))
 
   for (const appointment of existing) {
@@ -183,7 +149,16 @@ export interface CheckoutSessionPublic {
   paystackReference: string | null
 }
 
-function serializeSession(session: CheckoutSessionModel): CheckoutSessionPublic {
+const sessionInclude = {
+  service: { select: { id: true, name: true } },
+  barber: { select: { id: true, name: true } },
+} as const
+
+type CheckoutSessionWithRelations = Prisma.CheckoutSessionGetPayload<{
+  include: typeof sessionInclude
+}>
+
+function serializeSession(session: CheckoutSessionWithRelations): CheckoutSessionPublic {
   return {
     sessionToken: session.sessionToken,
     totalAmount: Number(session.totalAmount),
@@ -196,13 +171,10 @@ function serializeSession(session: CheckoutSessionModel): CheckoutSessionPublic 
   }
 }
 
-async function loadSessionWithRelations(sessionToken: string): Promise<CheckoutSessionModel> {
-  const session = await CheckoutSession.findOne({
+async function loadSessionWithRelations(sessionToken: string): Promise<CheckoutSessionWithRelations> {
+  const session = await prisma.checkoutSession.findUnique({
     where: { sessionToken },
-    include: [
-      { model: Service, as: 'service', attributes: ['id', 'name'] },
-      { model: Barber, as: 'barber', attributes: ['id', 'name'] },
-    ],
+    include: sessionInclude,
   })
   if (!session) {
     throw new NotFoundError('Booking session not found. Please start your booking again.')
@@ -229,7 +201,6 @@ export async function createCheckoutSession(
     throw new UnprocessableError('This payment method is not currently accepted. Please choose another method.')
   }
 
-  // TRANSFER methods must already carry the receipt at session creation.
   const isCash = input.paymentMethod === 'CASH'
   if (!isCash && input.paymentMethod !== 'ONLINE' && !input.receiptBuffer) {
     throw new UnprocessableError('Payment receipt is required before you can submit your appointment.')
@@ -245,8 +216,6 @@ export async function createCheckoutSession(
     throw new ConflictError('This time slot is no longer available. Please choose another time.')
   }
 
-  // Upload the receipt only after slot checks pass — failed sessions never
-  // leave orphan files.
   let receiptUrl: string | null = null
   let receiptPublicId: string | null = null
   if (input.receiptBuffer) {
@@ -259,43 +228,33 @@ export async function createCheckoutSession(
     receiptPublicId = uploaded.publicId
   }
 
-  // Supersede the customer's own stale in-flight sessions for this exact slot:
-  //  - after Paystack's transaction window an abandoned online checkout can no
-  //    longer be completed, so it must not keep holding the slot;
-  //  - when the customer switches AWAY from online payment (picks cash or a
-  //    transfer method instead), their abandoned Paystack checkout is dead by
-  //    definition — the slot releases immediately.
-  await CheckoutSession.update(
-    { status: 'EXPIRED' },
-    {
-      where: {
-        customerPhone: input.customerPhone,
-        barberId: input.barberId,
-        appointmentDate: input.appointmentDate,
-        appointmentTime: input.appointmentTime,
-        status: 'AWAITING_PAYMENT',
-        updatedAt: { [Op.lt]: new Date(Date.now() - 30 * 60 * 1000) },
-      },
+  // Supersede stale in-flight sessions
+  await prisma.checkoutSession.updateMany({
+    where: {
+      customerPhone: input.customerPhone,
+      barberId: input.barberId,
+      appointmentDate: input.appointmentDate,
+      appointmentTime: input.appointmentTime,
+      status: 'AWAITING_PAYMENT',
+      updatedAt: { lt: new Date(Date.now() - 30 * 60 * 1000) },
     },
-  )
+    data: { status: 'EXPIRED' },
+  })
+
   if (input.paymentMethod !== 'ONLINE') {
-    await CheckoutSession.update(
-      { status: 'EXPIRED' },
-      {
-        where: {
-          customerPhone: input.customerPhone,
-          barberId: input.barberId,
-          appointmentDate: input.appointmentDate,
-          appointmentTime: input.appointmentTime,
-          status: 'AWAITING_PAYMENT',
-          paymentMethod: 'ONLINE',
-        },
+    await prisma.checkoutSession.updateMany({
+      where: {
+        customerPhone: input.customerPhone,
+        barberId: input.barberId,
+        appointmentDate: input.appointmentDate,
+        appointmentTime: input.appointmentTime,
+        status: 'AWAITING_PAYMENT',
+        paymentMethod: 'ONLINE',
       },
-    )
+      data: { status: 'EXPIRED' },
+    })
   } else {
-    // Retrying ONLINE for the same slot RESUMES the customer's own in-flight
-    // session instead of being blocked by it (or piling up a duplicate).
-    const own = await CheckoutSession.findOne({
+    const own = await prisma.checkoutSession.findFirst({
       where: {
         customerPhone: input.customerPhone,
         barberId: input.barberId,
@@ -303,23 +262,24 @@ export async function createCheckoutSession(
         appointmentTime: input.appointmentTime,
         status: 'AWAITING_PAYMENT',
       },
-      order: [['updatedAt', 'DESC']],
+      orderBy: { updatedAt: 'desc' },
     })
     if (own) {
-      await own.update({
-        customerName: input.customerName,
-        customerEmail: input.customerEmail,
-        customerLocation: input.customerLocation,
-        serviceId: input.serviceId,
-        notes: input.notes,
+      await prisma.checkoutSession.update({
+        where: { id: own.id },
+        data: {
+          customerName: input.customerName,
+          customerEmail: input.customerEmail,
+          customerLocation: input.customerLocation,
+          serviceId: input.serviceId,
+          notes: input.notes,
+        },
       })
       return serializeSession(await loadSessionWithRelations(own.sessionToken))
     }
   }
 
-  // One session per (name, phone, slot, method): re-entering the payment step
-  // refreshes the existing session instead of piling up duplicates.
-  const [session] = await CheckoutSession.findOrCreate({
+  const existingOpen = await prisma.checkoutSession.findFirst({
     where: {
       customerPhone: input.customerPhone,
       appointmentDate: input.appointmentDate,
@@ -327,40 +287,50 @@ export async function createCheckoutSession(
       barberId: input.barberId,
       status: 'OPEN',
     },
-    defaults: {
-      sessionToken: generateSessionToken(),
-      customerName: input.customerName,
-      customerPhone: input.customerPhone,
-      customerEmail: input.customerEmail,
-      customerLocation: input.customerLocation,
-      serviceId: input.serviceId,
-      barberId: input.barberId,
-      appointmentDate: input.appointmentDate,
-      appointmentTime: input.appointmentTime,
-      notes: input.notes,
-      totalAmount: slot.servicePrice,
-      paymentMethod: input.paymentMethod,
-      transactionReference: input.transactionReference,
-      status: 'OPEN',
-      receiptUrl,
-      receiptPublicId,
-    },
   })
 
-  // Refresh mutable fields if the session already existed (name/email/notes/service/receipt/method).
-  await session.update({
-    customerName: input.customerName,
-    customerEmail: input.customerEmail,
-    customerLocation: input.customerLocation,
-    serviceId: input.serviceId,
-    notes: input.notes,
-    totalAmount: slot.servicePrice,
-    paymentMethod: input.paymentMethod,
-    transactionReference: input.transactionReference,
-    ...(receiptUrl ? { receiptUrl, receiptPublicId } : {}),
-  })
+  let sessionToken: string
+  if (existingOpen) {
+    sessionToken = existingOpen.sessionToken
+    await prisma.checkoutSession.update({
+      where: { id: existingOpen.id },
+      data: {
+        customerName: input.customerName,
+        customerEmail: input.customerEmail,
+        customerLocation: input.customerLocation,
+        serviceId: input.serviceId,
+        notes: input.notes,
+        totalAmount: slot.servicePrice,
+        paymentMethod: input.paymentMethod,
+        transactionReference: input.transactionReference,
+        ...(receiptUrl ? { receiptUrl, receiptPublicId } : {}),
+      },
+    })
+  } else {
+    sessionToken = generateSessionToken()
+    await prisma.checkoutSession.create({
+      data: {
+        sessionToken,
+        customerName: input.customerName,
+        customerPhone: input.customerPhone,
+        customerEmail: input.customerEmail,
+        customerLocation: input.customerLocation,
+        serviceId: input.serviceId,
+        barberId: input.barberId,
+        appointmentDate: input.appointmentDate,
+        appointmentTime: input.appointmentTime,
+        notes: input.notes,
+        totalAmount: slot.servicePrice,
+        paymentMethod: input.paymentMethod,
+        transactionReference: input.transactionReference,
+        status: 'OPEN',
+        receiptUrl,
+        receiptPublicId,
+      },
+    })
+  }
 
-  return serializeSession(await loadSessionWithRelations(session.sessionToken))
+  return serializeSession(await loadSessionWithRelations(sessionToken))
 }
 
 export interface FinalizeResult {
@@ -376,23 +346,16 @@ export interface FinalizeResult {
   sessionToken: string
 }
 
-/**
- * Converts an OPEN/refreshed session into a real Appointment + Payment pair,
- * ATOMICALLY. Cash → Payment UNPAID (pay at studio); transfer methods →
- * Payment PENDING_VERIFICATION with the stored receipt. Re-checks the slot
- * inside the transaction so a session whose slot was lost fails cleanly.
- */
 export async function finalizeCheckout(sessionToken: string): Promise<FinalizeResult> {
   const session = await loadSessionWithRelations(sessionToken)
 
   if (session.status === 'CONVERTED') {
-    // Idempotent double-click protection — return the existing booking.
     if (session.convertedAppointmentId) {
-      const existing = await Appointment.findByPk(session.convertedAppointmentId, {
-        include: ['service', 'barber', { model: Payment, as: 'payment' }],
+      const existing = await prisma.appointment.findUnique({
+        where: { id: session.convertedAppointmentId },
+        include: { payment: true },
       })
       if (existing) {
-        const payment = (existing as unknown as { payment?: Payment }).payment
         return {
           appointment: {
             id: existing.id,
@@ -401,12 +364,12 @@ export async function finalizeCheckout(sessionToken: string): Promise<FinalizeRe
             customerName: existing.customerName,
             appointmentDate: existing.appointmentDate,
             appointmentTime: existing.appointmentTime,
-            },
+          },
           payment: {
-            id: payment?.id ?? 0,
-            accessToken: payment?.accessToken ?? '',
-            amount: Number(payment?.amount ?? existing.totalAmount),
-            status: payment?.status ?? 'UNPAID',
+            id: existing.payment?.id ?? 0,
+            accessToken: existing.payment?.accessToken ?? '',
+            amount: Number(existing.payment?.amount ?? existing.totalAmount),
+            status: existing.payment?.status ?? 'UNPAID',
           },
           sessionToken,
         }
@@ -431,10 +394,7 @@ export async function finalizeCheckout(sessionToken: string): Promise<FinalizeRe
 
   const isCash = method === 'CASH'
 
-  const result = await sequelize.transaction(async (t) => {
-    // Re-verify the slot INSIDE the transaction. The session itself is
-    // excluded — it must never conflict with its own slot — so only REAL
-    // appointments and other customers' in-flight payments can block it.
+  const result = await prisma.$transaction(async (tx) => {
     const slot = await assertSessionBookable(
       session.barberId,
       session.serviceId,
@@ -442,6 +402,7 @@ export async function finalizeCheckout(sessionToken: string): Promise<FinalizeRe
       session.appointmentTime,
       session.convertedAppointmentId ?? undefined,
       session.id,
+      tx,
     )
     if (!slot) {
       throw new ConflictError(
@@ -455,11 +416,13 @@ export async function finalizeCheckout(sessionToken: string): Promise<FinalizeRe
         phone: session.customerPhone,
         email: session.customerEmail,
       },
-      t,
+      tx,
     )
 
-    const appointment = await Appointment.create(
-      {
+    const referenceCode = await generateReferenceCode(session.appointmentDate, tx)
+
+    const appointment = await tx.appointment.create({
+      data: {
         customerName: session.customerName,
         customerPhone: session.customerPhone,
         customerEmail: session.customerEmail,
@@ -471,19 +434,15 @@ export async function finalizeCheckout(sessionToken: string): Promise<FinalizeRe
         appointmentTime: session.appointmentTime,
         totalAmount: Number(session.totalAmount),
         notes: session.notes,
-        status: AppointmentStatusValue.PAYMENT_REQUIRED, // customer-facing: PENDING
-        referenceCode: await generateReferenceCode(session.appointmentDate, t),
+        status: !isCash ? AppointmentStatusValue.PAYMENT_SUBMITTED : AppointmentStatusValue.PAYMENT_REQUIRED,
+        referenceCode,
       },
-      { transaction: t },
-    )
+    })
 
-    // Commission snapshot (requirement #9): freeze the barber's CURRENT
-    // commission terms onto this booking — later config changes never
-    // rewrite this row.
-    await createEarningSnapshot(appointment.id, session.barberId, Number(session.totalAmount), t)
+    await createEarningSnapshot(appointment.id, session.barberId, Number(session.totalAmount), tx)
 
-    const payment = await Payment.create(
-      {
+    const payment = await tx.payment.create({
+      data: {
         appointmentId: appointment.id,
         customerId: customer.id,
         amount: Number(session.totalAmount),
@@ -496,21 +455,12 @@ export async function finalizeCheckout(sessionToken: string): Promise<FinalizeRe
         status: isCash ? 'UNPAID' : 'PENDING_VERIFICATION',
         accessToken: crypto.randomBytes(24).toString('hex'),
       },
-      { transaction: t },
-    )
+    })
 
-    if (!isCash) {
-      // Receipt-backed bookings land in the admin verification queue.
-      await appointment.update(
-        { status: AppointmentStatusValue.PAYMENT_SUBMITTED },
-        { transaction: t },
-      )
-    }
-
-    await session.update(
-      { status: 'CONVERTED', convertedAppointmentId: appointment.id },
-      { transaction: t },
-    )
+    await tx.checkoutSession.update({
+      where: { id: session.id },
+      data: { status: 'CONVERTED', convertedAppointmentId: appointment.id },
+    })
 
     return { appointment, payment }
   })
@@ -534,17 +484,18 @@ export async function finalizeCheckout(sessionToken: string): Promise<FinalizeRe
   }
 }
 
-/** Marks a session EXPIRED (customer abandoned the checkout). Booking data is dropped — nothing was ever saved as an appointment. */
+/** Marks a session EXPIRED (customer abandoned the checkout). */
 export async function abandonCheckout(sessionToken: string): Promise<{ abandoned: boolean }> {
-  const session = await CheckoutSession.findOne({ where: { sessionToken } })
+  const session = await prisma.checkoutSession.findUnique({ where: { sessionToken } })
   if (!session || session.status === 'CONVERTED') {
     return { abandoned: false }
   }
-  await session.update({ status: 'EXPIRED' })
+  await prisma.checkoutSession.update({
+    where: { id: session.id },
+    data: { status: 'EXPIRED' },
+  })
   return { abandoned: true }
 }
-
-// ─── Online (Paystack) checkout on the SESSION ────────────────────────────────
 
 const PAYSTACK_BASE = 'https://api.paystack.co'
 
@@ -588,7 +539,6 @@ export async function initializeCheckoutPaystack(sessionToken: string): Promise<
     throw new ConflictError('This booking session has expired. Please start your booking again.')
   }
 
-  // Idempotent: a session already awaiting payment resumes the SAME transaction.
   if (session.status === 'AWAITING_PAYMENT' && session.paystackReference) {
     const existing = await paystackRequest<{ authorization_url: string; access_code: string; reference: string }>(
       'POST',
@@ -599,7 +549,6 @@ export async function initializeCheckoutPaystack(sessionToken: string): Promise<
         reference: session.paystackReference,
       },
     ).catch(async () => {
-      // Reference already used → start a fresh one.
       return null
     })
     if (existing) {
@@ -619,7 +568,10 @@ export async function initializeCheckoutPaystack(sessionToken: string): Promise<
     },
   )
 
-  await session.update({ status: 'AWAITING_PAYMENT', paystackReference: init.reference })
+  await prisma.checkoutSession.update({
+    where: { id: session.id },
+    data: { status: 'AWAITING_PAYMENT', paystackReference: init.reference },
+  })
 
   return {
     authorizationUrl: init.authorization_url,
@@ -629,15 +581,12 @@ export async function initializeCheckoutPaystack(sessionToken: string): Promise<
 }
 
 /**
- * Re-verifies the charge directly with Paystack and — only on confirmed
- * success — atomically creates the Appointment + Payment. This is the ONLY
- * path that turns an ONLINE checkout session into a real booking.
+ * Re-verifies the charge directly with Paystack and creates Appointment + Payment.
  */
 export async function verifyCheckoutPaystack(sessionToken: string, reference: string): Promise<FinalizeResult> {
   const session = await loadSessionWithRelations(sessionToken)
 
   if (session.status === 'CONVERTED') {
-    // Already finalized (webhook beat the callback) → return current state.
     const result = await finalizeResultForConverted(session)
     if (result) return result
     throw new ConflictError('This booking has already been completed.')
@@ -665,23 +614,21 @@ export async function verifyCheckoutPaystack(sessionToken: string, reference: st
     )
   }
 
-  // Provider confirmed the money — NOW create the appointment + payment.
   const result = await finalizeCheckout(sessionToken)
-  // Stamp the provider reference on the payment for audit.
-  await Payment.update(
-    { providerRef: String(txn.id), paymentMethod: 'ONLINE' },
-    { where: { id: result.payment.id } },
-  )
+  await prisma.payment.update({
+    where: { id: result.payment.id },
+    data: { providerRef: String(txn.id), paymentMethod: 'ONLINE' },
+  })
   return result
 }
 
-async function finalizeResultForConverted(session: CheckoutSessionModel): Promise<FinalizeResult | null> {
+async function finalizeResultForConverted(session: CheckoutSessionWithRelations): Promise<FinalizeResult | null> {
   if (!session.convertedAppointmentId) return null
-  const existing = await Appointment.findByPk(session.convertedAppointmentId, {
-    include: ['service', 'barber', { model: Payment, as: 'payment' }],
+  const existing = await prisma.appointment.findUnique({
+    where: { id: session.convertedAppointmentId },
+    include: { payment: true },
   })
   if (!existing) return null
-  const payment = (existing as unknown as { payment?: Payment }).payment
   return {
     appointment: {
       id: existing.id,
@@ -692,10 +639,10 @@ async function finalizeResultForConverted(session: CheckoutSessionModel): Promis
       appointmentTime: existing.appointmentTime,
     },
     payment: {
-      id: payment?.id ?? 0,
-      accessToken: payment?.accessToken ?? '',
-      amount: Number(payment?.amount ?? existing.totalAmount),
-      status: payment?.status ?? 'UNPAID',
+      id: existing.payment?.id ?? 0,
+      accessToken: existing.payment?.accessToken ?? '',
+      amount: Number(existing.payment?.amount ?? existing.totalAmount),
+      status: existing.payment?.status ?? 'UNPAID',
     },
     sessionToken: session.sessionToken,
   }
@@ -715,10 +662,9 @@ export async function handleCheckoutWebhook(payload: {
   const sessionToken = payload.data?.metadata?.sessionToken
   if (!sessionToken) return false
 
-  const session = await CheckoutSession.findOne({ where: { sessionToken } })
+  const session = await prisma.checkoutSession.findUnique({ where: { sessionToken } })
   if (!session || session.status !== 'AWAITING_PAYMENT' || !session.paystackReference) return false
 
-  // Signature already validated by the controller; verify the charge server-side.
   await verifyCheckoutPaystack(sessionToken, session.paystackReference)
   return true
 }

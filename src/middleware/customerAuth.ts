@@ -1,7 +1,8 @@
 import type { NextFunction, Request, Response } from 'express'
 import jwt from 'jsonwebtoken'
 import { env } from '../config/env'
-import { Customer } from '../models'
+import { prisma } from '../config/database'
+import type { Customer } from '@prisma/client'
 import { ForbiddenError, UnauthorizedError } from '../utils/errors'
 
 export interface CustomerAuthPayload {
@@ -19,11 +20,6 @@ declare module 'express-serve-static-core' {
   }
 }
 
-/**
- * Customer JWT guard. The backend ALWAYS resolves the customer from the
- * signed token — customerId values in the request body/query are ignored for
- * authorization, so one customer can never read or change another's data.
- */
 export async function requireCustomer(req: Request, _res: Response, next: NextFunction): Promise<void> {
   try {
     const authHeader = req.headers.authorization
@@ -42,7 +38,7 @@ export async function requireCustomer(req: Request, _res: Response, next: NextFu
       throw new UnauthorizedError('This area requires a customer account.')
     }
 
-    const customer = await Customer.findByPk(payload.sub)
+    const customer = await prisma.customer.findUnique({ where: { id: payload.sub } })
     if (!customer || !customer.isActive) {
       throw new UnauthorizedError('Account no longer exists or has been deactivated.')
     }
@@ -54,7 +50,6 @@ export async function requireCustomer(req: Request, _res: Response, next: NextFu
   }
 }
 
-/** Optional variant: attaches the customer when a valid token exists, else continues. */
 export async function attachCustomerIfPresent(
   req: Request,
   _res: Response,
@@ -65,7 +60,7 @@ export async function attachCustomerIfPresent(
     if (authHeader?.startsWith('Bearer ')) {
       const payload = jwt.verify(authHeader.slice(7), env.jwtSecret) as unknown as CustomerAuthPayload
       if (payload.role === 'CUSTOMER') {
-        const customer = await Customer.findByPk(payload.sub)
+        const customer = await prisma.customer.findUnique({ where: { id: payload.sub } })
         if (customer?.isActive) req.customer = customer
       }
     }

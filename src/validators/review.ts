@@ -1,6 +1,7 @@
 import { z } from 'zod'
+import { REVIEW_STATUSES } from '../types'
 
-export const REVIEW_STATUSES = ['PENDING', 'APPROVED', 'REJECTED'] as const
+export { REVIEW_STATUSES }
 
 export const createReviewSchema = z.object({
   customerName: z.string().trim().min(2, 'Name must be at least 2 characters.').max(150),

@@ -1,14 +1,6 @@
 import crypto from 'node:crypto'
-import { Op } from 'sequelize'
-import {
-  Appointment,
-  Barber,
-  BarberAvailability,
-  BarberEarning,
-  BarberService,
-  Payment,
-  Service,
-} from '../models'
+import { prisma } from '../config/database'
+import type { Prisma, AppointmentStatus, PaymentMethod, PaymentStatus } from '@prisma/client'
 import { ConflictError, NotFoundError, UnprocessableError } from '../utils/errors'
 import { getPagination } from '../utils/response'
 import { hhmmToMinutes } from './availabilityService'
@@ -26,7 +18,7 @@ import {
   getValidNextStatuses,
 } from '../config/appointmentStatuses'
 import type { CreateAppointmentInput, UpdateAppointmentInput } from '../validators/appointment'
-import type { AppointmentStatus, Paged, PaymentMethod, PaymentStatus } from '../types'
+import type { Paged } from '../types'
 
 function generatePaymentToken(): string {
   return crypto.randomBytes(24).toString('hex')
@@ -37,14 +29,13 @@ function dateKey(date: string): string {
 }
 
 async function generateReferenceCode(appointmentDate: string): Promise<string> {
+  const key = dateKey(appointmentDate)
   for (let attempt = 0; attempt < 5; attempt += 1) {
-    const key = dateKey(appointmentDate)
-    const dayCount = await Appointment.count({ where: { appointmentDate } })
+    const dayCount = await prisma.appointment.count({ where: { appointmentDate } })
     const candidate = `APT-${key}-${String(dayCount + 1 + attempt).padStart(3, '0')}`
-    const taken = await Appointment.findOne({ where: { referenceCode: candidate } })
+    const taken = await prisma.appointment.findUnique({ where: { referenceCode: candidate } })
     if (!taken) return candidate
   }
-  const key = dateKey(appointmentDate)
   const salt = crypto.randomBytes(2).toString('hex').toUpperCase()
   return `APT-${key}-${salt}`
 }
@@ -99,25 +90,30 @@ export interface BookingConfirmation {
   payment: { id: number; accessToken: string; amount: number; status: PaymentStatus }
 }
 
-const includeRelations = [
-  {
-    model: Service,
-    as: 'service',
-    attributes: ['id', 'name', 'price', 'duration'],
-  },
-  {
-    model: Barber,
-    as: 'barber',
-    attributes: ['id', 'name', 'image'],
-  },
-  {
-    model: Payment,
-    as: 'payment',
-    attributes: ['id', 'status', 'amount', 'paymentMethod', 'accessToken'],
-  },
-]
+const customerAppointmentInclude = {
+  service: { select: { id: true, name: true, price: true, duration: true } },
+  barber: { select: { id: true, name: true, image: true } },
+  assignedBarber: { select: { id: true, name: true, image: true } },
+  payment: { select: { id: true, status: true, amount: true, paymentMethod: true, accessToken: true } },
+} as const
 
-export function serializeAppointment(appointment: Appointment): AppointmentPublic {
+type AppointmentWithCustomerRelations = Prisma.AppointmentGetPayload<{
+  include: typeof customerAppointmentInclude
+}>
+
+export const adminAppointmentInclude = {
+  service: { select: { id: true, name: true, price: true, duration: true } },
+  barber: { select: { id: true, name: true, image: true, barberType: true, location: true } },
+  assignedBarber: { select: { id: true, name: true, image: true, barberType: true, location: true } },
+  payment: { select: { id: true, status: true, amount: true, paymentMethod: true, accessToken: true } },
+  earning: true,
+} as const
+
+type AppointmentWithAdminRelations = Prisma.AppointmentGetPayload<{
+  include: typeof adminAppointmentInclude
+}>
+
+export function serializeAppointment(appointment: AppointmentWithCustomerRelations | AppointmentWithAdminRelations): AppointmentPublic {
   const base: AppointmentPublic = {
     id: appointment.id,
     referenceCode: appointment.referenceCode,
@@ -141,15 +137,13 @@ export function serializeAppointment(appointment: Appointment): AppointmentPubli
     updatedAt: appointment.updatedAt,
   }
 
-  // Customer-safe assigned-barber info (#15): name/image only — the type,
-  // location and commission fields stay admin-exclusive.
-  const customerAssignedBarber = (appointment as { assignedBarber?: Barber | null }).assignedBarber
-  if (customerAssignedBarber) {
-    base.assignedBarberId = customerAssignedBarber.id
+  // Customer-safe assigned-barber info (#15): name/image only
+  if (appointment.assignedBarber) {
+    base.assignedBarberId = appointment.assignedBarber.id
     base.assignedBarber = {
-      id: customerAssignedBarber.id,
-      name: customerAssignedBarber.name,
-      image: customerAssignedBarber.image,
+      id: appointment.assignedBarber.id,
+      name: appointment.assignedBarber.name,
+      image: appointment.assignedBarber.image,
     }
   }
 
@@ -174,8 +168,6 @@ export function serializeAppointment(appointment: Appointment): AppointmentPubli
       status: appointment.payment.status,
       amount: Number(appointment.payment.amount),
       paymentMethod: appointment.payment.paymentMethod,
-      // Capability token for the customer's own payment/receipt pages — the
-      // dashboard needs it to build Pay Now / receipt links.
       accessToken: appointment.payment.accessToken,
     }
   }
@@ -183,54 +175,37 @@ export function serializeAppointment(appointment: Appointment): AppointmentPubli
   return base
 }
 
-/**
- * Admin view — adds customer location, assignment data and the commission
- * breakdown (requirement #13). NEVER used for customer-facing responses.
- */
-export function serializeAppointmentForAdmin(
-  appointment: Appointment & {
-    assignedBarber?: Barber | null
-    earning?: { commissionType: string; commissionRateSnapshot: number | string; serviceAmount: number | string; commissionAmount: number | string; studioAmount: number | string; status: string } | null
-  },
-): AppointmentPublic {
+/** Admin view — adds customer location, assignment data and the commission breakdown */
+export function serializeAppointmentForAdmin(appointment: AppointmentWithAdminRelations): AppointmentPublic {
   const base = serializeAppointment(appointment)
 
   base.customerLocation = appointment.customerLocation ?? null
   base.assignedBarberId = appointment.assignedBarberId ?? null
   base.assignedAt = appointment.assignedAt ?? null
 
-  if ((appointment as { assignedBarber?: Barber | null }).assignedBarber) {
-    const assigned = (appointment as { assignedBarber: Barber }).assignedBarber
+  if (appointment.assignedBarber) {
     base.assignedBarber = {
-      id: assigned.id,
-      name: assigned.name,
-      image: assigned.image,
-      barberType: assigned.barberType ?? 'INTERNAL',
-      location: assigned.location ?? null,
+      id: appointment.assignedBarber.id,
+      name: appointment.assignedBarber.name,
+      image: appointment.assignedBarber.image,
+      barberType: appointment.assignedBarber.barberType ?? 'INTERNAL',
+      location: appointment.assignedBarber.location ?? null,
     }
   }
 
-  const earning = (appointment as { earning?: { commissionType: string; commissionRateSnapshot: number | string; serviceAmount: number | string; commissionAmount: number | string; studioAmount: number | string; status: string } | null }).earning
-  if (earning) {
+  if (appointment.earning) {
     base.earning = {
-      commissionType: earning.commissionType,
-      commissionRateSnapshot: Number(earning.commissionRateSnapshot),
-      serviceAmount: Number(earning.serviceAmount),
-      commissionAmount: Number(earning.commissionAmount),
-      studioAmount: Number(earning.studioAmount),
-      status: earning.status,
+      commissionType: appointment.earning.commissionType,
+      commissionRateSnapshot: Number(appointment.earning.commissionRateSnapshot),
+      serviceAmount: Number(appointment.earning.serviceAmount),
+      commissionAmount: Number(appointment.earning.commissionAmount),
+      studioAmount: Number(appointment.earning.studioAmount),
+      status: appointment.earning.status,
     }
   }
 
   return base
 }
-
-/** Relation scope for the admin serializer (assignment + commission). */
-export const adminAppointmentInclude = [
-  ...includeRelations,
-  { model: Barber, as: 'assignedBarber', attributes: ['id', 'name', 'image', 'barberType', 'location'] },
-  { model: BarberEarning, as: 'earning' },
-] as const
 
 interface SlotCheckResult {
   serviceDuration: number
@@ -244,7 +219,7 @@ async function assertBookableSlot(
   time: string,
   excludeAppointmentId?: number,
 ): Promise<SlotCheckResult> {
-  const barber = await Barber.findByPk(barberId)
+  const barber = await prisma.barber.findUnique({ where: { id: barberId } })
   if (!barber || !barber.isActive) {
     throw new UnprocessableError('The selected barber is not available.')
   }
@@ -252,18 +227,15 @@ async function assertBookableSlot(
   let serviceDuration = 0
   let servicePrice = 0
   if (serviceId !== null) {
-    const service = await Service.findByPk(serviceId)
+    const service = await prisma.service.findUnique({ where: { id: serviceId } })
     if (!service || !service.isActive) {
       throw new UnprocessableError('The selected service is not available.')
     }
     serviceDuration = service.duration
     servicePrice = Number(service.price)
 
-    const providerLink = await BarberService.findOne({ where: { barberId, serviceId } })
-    const hasAnyServices = await BarberService.findOne({ where: { barberId } })
-    // If the barber has at least one service assignment and this service is not
-    // among them, reject. If the barber has NO assignments yet (admin hasn't
-    // configured them), allow all services (single-salon fallback).
+    const providerLink = await prisma.barberService.findFirst({ where: { barberId, serviceId } })
+    const hasAnyServices = await prisma.barberService.findFirst({ where: { barberId } })
     if (hasAnyServices && !providerLink) {
       throw new UnprocessableError('This barber does not provide the selected service.')
     }
@@ -271,12 +243,10 @@ async function assertBookableSlot(
 
   const dayOfWeek = new Date(`${date}T00:00:00`).getDay()
 
-  // Check if ANY availability rows exist for this barber at all.
-  const hasAnyAvailability = await BarberAvailability.findOne({ where: { barberId } })
+  const hasAnyAvailability = await prisma.barberAvailability.findFirst({ where: { barberId } })
 
   if (hasAnyAvailability) {
-    // Availability has been configured — enforce it strictly.
-    const availability = await BarberAvailability.findOne({
+    const availability = await prisma.barberAvailability.findFirst({
       where: { barberId, dayOfWeek, isAvailable: true },
     })
     if (!availability) {
@@ -286,15 +256,7 @@ async function assertBookableSlot(
       throw new UnprocessableError('The requested time is outside the barber working hours.')
     }
   }
-  // If no availability rows exist yet (admin hasn't configured the schedule),
-  // skip the availability check entirely. The barber is treated as available
-  // every day during the salon's operating hours shown on the booking page.
-  // Once the admin sets up a schedule, it will be enforced automatically.
 
-  // Use date-only comparison for the "in the past" guard so that timezone
-  // differences between client and server never reject a valid same-day slot.
-  // Anything strictly before today's date is rejected; same-day slots are
-  // always allowed (the customer can see them on the booking page).
   const todayISO = new Date().toISOString().slice(0, 10)
   if (date < todayISO) {
     throw new UnprocessableError('Appointments cannot be booked in the past.')
@@ -302,17 +264,17 @@ async function assertBookableSlot(
 
   const start = hhmmToMinutes(time)
 
-  const existingQuery = {
-    barberId,
-    appointmentDate: date,
-    status: { [Op.ne]: AppointmentStatusValue.CANCELLED },
-  }
-  const existing = excludeAppointmentId
-    ? await Appointment.findAll({ where: { ...existingQuery, id: { [Op.ne]: excludeAppointmentId } } })
-    : await Appointment.findAll({ where: existingQuery })
+  const existing = await prisma.appointment.findMany({
+    where: {
+      barberId,
+      appointmentDate: date,
+      status: { not: AppointmentStatusValue.CANCELLED },
+      ...(excludeAppointmentId ? { id: { not: excludeAppointmentId } } : {}),
+    },
+  })
 
   const serviceIds = [...new Set(existing.map((a) => a.serviceId))]
-  const services = await Service.findAll({ where: { id: serviceIds } })
+  const services = await prisma.service.findMany({ where: { id: { in: serviceIds } } })
   const serviceMap = new Map(services.map((s) => [s.id, s.duration]))
 
   const end = start + serviceDuration
@@ -338,10 +300,6 @@ export async function createAppointment(
   receiptBuffer: Buffer | null = null,
   receiptMimetype: string | null = null,
 ): Promise<BookingConfirmation> {
-  // ── Payment rule enforcement (server-side authority) ────────────────────────
-  // A malicious client cannot create a non-cash appointment without its payment
-  // evidence: transfers must carry a receipt; online bookings are never created
-  // up front (payment first, then the appointment via verified callback).
   const paymentMethod = input.paymentMethod
 
   const settings = await getPaymentSettingsRecord()
@@ -351,21 +309,15 @@ export async function createAppointment(
   const isOnline = paymentMethod === 'ONLINE'
 
   if (isOnline) {
-    // Online bookings are created un-finalized (PAYMENT_REQUIRED + UNPAID) and
-    // the customer is sent straight to Paystack checkout. The appointment only
-    // becomes confirmed/ready after the backend verifies the transaction, so a
-    // cancelled or failed payment never finalizes a booking.
     if (!process.env.PAYSTACK_SECRET_KEY) {
       throw new UnprocessableError(
         'Online payment is not available right now. Please choose another payment method.',
       )
     }
-  } else if (enabled.length > 0 && !enabled.includes(paymentMethod)) {
+  } else if (enabled.length > 0 && !enabled.includes(paymentMethod as PaymentMethod)) {
     throw new UnprocessableError('This payment method is not currently accepted. Please choose another method.')
   }
 
-  // Cash never needs a receipt; transfers/OPay MUST carry one — the customer
-  // cannot create an unverifiable unpaid non-cash booking.
   if (!isCash && !isOnline && !receiptBuffer) {
     throw new UnprocessableError(
       'Payment receipt is required before you can submit your appointment. Please upload your transfer receipt.',
@@ -379,8 +331,6 @@ export async function createAppointment(
     input.appointmentTime,
   )
 
-  // Upload the receipt only after the slot checks pass so failed bookings never
-  // leave orphan files on disk.
   let receiptUrl: string | null = null
   let receiptPublicId: string | null = null
   if (receiptBuffer) {
@@ -399,50 +349,50 @@ export async function createAppointment(
     email: input.customerEmail ?? null,
   })
 
-  const appointment = await Appointment.create({
-    customerName: input.customerName,
-    customerPhone: input.customerPhone,
-    customerEmail: input.customerEmail ?? null,
-    customerLocation: input.customerLocation ?? null,
-    customerId: customer.id,
-    serviceId: input.serviceId,
-    barberId: input.barberId,
-    appointmentDate: input.appointmentDate,
-    appointmentTime: input.appointmentTime,
-    totalAmount: servicePrice,
-    notes: input.notes ?? null,
-    status: AppointmentStatusValue.PAYMENT_REQUIRED,
-    referenceCode: await generateReferenceCode(input.appointmentDate),
+  const referenceCode = await generateReferenceCode(input.appointmentDate)
+
+  const appointment = await prisma.appointment.create({
+    data: {
+      customerName: input.customerName,
+      customerPhone: input.customerPhone,
+      customerEmail: input.customerEmail ?? null,
+      customerLocation: input.customerLocation ?? null,
+      customerId: customer.id,
+      serviceId: input.serviceId,
+      barberId: input.barberId,
+      appointmentDate: input.appointmentDate,
+      appointmentTime: input.appointmentTime,
+      totalAmount: servicePrice,
+      notes: input.notes ?? null,
+      status: !isCash && !isOnline ? AppointmentStatusValue.PAYMENT_SUBMITTED : AppointmentStatusValue.PAYMENT_REQUIRED,
+      referenceCode,
+    },
   })
 
-  const payment = await Payment.create({
-    appointmentId: appointment.id,
-    customerId: customer.id,
-    amount: servicePrice,
-    // CASH → recorded immediately (admin later confirms receipt of money).
-    // BANK_TRANSFER/OPAY/OTHER → receipt held, status PENDING_VERIFICATION so
-    // it lands in the admin Payments queue for review.
-    // ONLINE → UNPAID until Paystack's server-verified callback confirms it.
-    paymentMethod,
-    transactionReference: input.transactionReference || null,
-    paymentDate: isCash || isOnline ? null : new Date().toISOString().slice(0, 10),
-    receiptUrl,
-    receiptPublicId,
-    note: null,
-    status: isCash || isOnline ? 'UNPAID' : 'PENDING_VERIFICATION',
-    accessToken: generatePaymentToken(),
+  const payment = await prisma.payment.create({
+    data: {
+      appointmentId: appointment.id,
+      customerId: customer.id,
+      amount: servicePrice,
+      paymentMethod: paymentMethod as PaymentMethod,
+      transactionReference: input.transactionReference || null,
+      paymentDate: isCash || isOnline ? null : new Date().toISOString().slice(0, 10),
+      receiptUrl,
+      receiptPublicId,
+      note: null,
+      status: isCash || isOnline ? 'UNPAID' : 'PENDING_VERIFICATION',
+      accessToken: generatePaymentToken(),
+    },
   })
-
-  // Receipt-backed bookings behave exactly like a payment submitted from the
-  // payment page: appointment moves to PAYMENT_SUBMITTED awaiting admin review.
-  if (!isCash && !isOnline) {
-    await appointment.update({ status: AppointmentStatusValue.PAYMENT_SUBMITTED })
-  }
 
   // Commission snapshot (requirement #9) — frozen at booking time.
   await createEarningSnapshot(appointment.id, input.barberId, servicePrice)
 
-  const fresh = await Appointment.findByPk(appointment.id, { include: includeRelations })
+  const fresh = await prisma.appointment.findUnique({
+    where: { id: appointment.id },
+    include: customerAppointmentInclude,
+  })
+
   return {
     appointment: serializeAppointment(fresh!),
     payment: {
@@ -467,66 +417,69 @@ export async function listAppointments(query: {
 }): Promise<Paged<AppointmentPublic>> {
   const { page, perPage, offset, limit } = getPagination(query as Record<string, unknown>)
 
-  const where = {
+  const where: Prisma.AppointmentWhereInput = {
     ...(query.status ? { status: query.status } : {}),
     ...(query.barberId ? { barberId: query.barberId } : {}),
     ...(query.serviceId ? { serviceId: query.serviceId } : {}),
-    ...(query.customerLocation
-      ? { customerLocation: { [Op.like]: `%${query.customerLocation}%` } }
-      : {}),
+    ...(query.customerLocation ? { customerLocation: { contains: query.customerLocation } } : {}),
     ...(query.from || query.to
       ? {
           appointmentDate: {
-            ...(query.from ? { [Op.gte]: query.from } : {}),
-            ...(query.to ? { [Op.lte]: query.to } : {}),
+            ...(query.from ? { gte: query.from } : {}),
+            ...(query.to ? { lte: query.to } : {}),
           },
-        }
-      : {}),
-    ...(query.search
-      ? {
-          [Op.or]: [
-            { referenceCode: { [Op.like]: `%${query.search}%` } },
-            { customerName: { [Op.like]: `%${query.search}%` } },
-            { customerPhone: { [Op.like]: `%${query.search}%` } },
-            { customerEmail: { [Op.like]: `%${query.search}%` } },
-          ],
         }
       : {}),
   }
 
-  const { rows, count } = await Appointment.findAndCountAll({
-    where,
-    include: adminAppointmentInclude as never,
-    order: [
-      ['appointmentDate', 'DESC'],
-      ['appointmentTime', 'DESC'],
-    ],
-    offset,
-    limit,
-    distinct: true,
-  })
+  if (query.search?.trim()) {
+    const search = query.search.trim()
+    where.OR = [
+      { referenceCode: { contains: search } },
+      { customerName: { contains: search } },
+      { customerPhone: { contains: search } },
+      { customerEmail: { contains: search } },
+    ]
+  }
+
+  const [rows, total] = await Promise.all([
+    prisma.appointment.findMany({
+      where,
+      include: adminAppointmentInclude,
+      orderBy: [
+        { appointmentDate: 'desc' },
+        { appointmentTime: 'desc' },
+      ],
+      skip: offset,
+      take: limit,
+    }),
+    prisma.appointment.count({ where }),
+  ])
 
   return {
-    items: rows.map((row) => serializeAppointmentForAdmin(row as never)),
-    total: count,
+    items: rows.map(serializeAppointmentForAdmin),
+    total,
     page,
     perPage,
   }
 }
 
 export async function getAppointmentById(id: number): Promise<AppointmentPublic> {
-  const appointment = await Appointment.findByPk(id, { include: adminAppointmentInclude as never })
+  const appointment = await prisma.appointment.findUnique({
+    where: { id },
+    include: adminAppointmentInclude,
+  })
   if (!appointment) {
     throw new NotFoundError('Appointment not found.')
   }
-  return serializeAppointmentForAdmin(appointment as never)
+  return serializeAppointmentForAdmin(appointment)
 }
 
 export async function updateAppointment(
   id: number,
   input: UpdateAppointmentInput,
 ): Promise<AppointmentPublic> {
-  const appointment = await Appointment.findByPk(id)
+  const appointment = await prisma.appointment.findUnique({ where: { id } })
   if (!appointment) {
     throw new NotFoundError('Appointment not found.')
   }
@@ -539,50 +492,63 @@ export async function updateAppointment(
     await assertBookableSlot(nextBarberId, nextServiceId, nextDate, nextTime, id)
   }
 
-  await appointment.update(input)
+  await prisma.appointment.update({
+    where: { id },
+    data: input,
+  })
+
   return getAppointmentById(id)
 }
 
 const VALID_STATUSES: AppointmentStatus[] = APPOINTMENT_STATUSES
 
-/** Keeps the payment record aligned when an admin moves an appointment through the payment lifecycle. */
 async function syncPaymentForStatus(
   appointmentId: number,
   status: AppointmentStatus,
   adminId?: number | null,
 ): Promise<void> {
-  const payment = await Payment.findOne({ where: { appointmentId } })
+  const payment = await prisma.payment.findUnique({ where: { appointmentId } })
   if (!payment) return
 
   if (status === AppointmentStatusValue.PAYMENT_VERIFIED && payment.status !== 'PAID') {
-    await payment.update({
-      status: 'PAID',
-      verifiedAt: new Date(),
-      verifiedBy: adminId ?? null,
-      rejectionReason: null,
+    await prisma.payment.update({
+      where: { id: payment.id },
+      data: {
+        status: 'PAID',
+        verifiedAt: new Date(),
+        verifiedBy: adminId ?? null,
+        rejectionReason: null,
+      },
     })
   } else if (
     status === AppointmentStatusValue.PAYMENT_REJECTED &&
     (payment.status === 'PENDING_VERIFICATION' || payment.status === 'UNPAID')
   ) {
-    await payment.update({ status: 'REJECTED', verifiedAt: null })
+    await prisma.payment.update({
+      where: { id: payment.id },
+      data: { status: 'REJECTED', verifiedAt: null },
+    })
   } else if (
     status === AppointmentStatusValue.PAYMENT_SUBMITTED &&
     payment.status !== 'PENDING_VERIFICATION' &&
     payment.status !== 'PAID'
   ) {
-    await payment.update({ status: 'PENDING_VERIFICATION', rejectionReason: null })
+    await prisma.payment.update({
+      where: { id: payment.id },
+      data: { status: 'PENDING_VERIFICATION', rejectionReason: null },
+    })
   } else if (
     PAID_GATED_STATUSES.includes(status) &&
     payment.status === 'UNPAID'
   ) {
-    // Legacy rows: the appointment was already marked PAYMENT_VERIFIED while its payment
-    // record stayed UNPAID. Entering a service state attests the verification — repair it.
-    await payment.update({
-      status: 'PAID',
-      verifiedAt: new Date(),
-      verifiedBy: adminId ?? null,
-      rejectionReason: null,
+    await prisma.payment.update({
+      where: { id: payment.id },
+      data: {
+        status: 'PAID',
+        verifiedAt: new Date(),
+        verifiedBy: adminId ?? null,
+        rejectionReason: null,
+      },
     })
   }
 }
@@ -610,12 +576,12 @@ export async function updateAppointmentStatus(
     updatedByAdminId?: number | null
   } = {},
 ): Promise<AppointmentPublic> {
-  const appointment = await Appointment.findByPk(id)
+  const appointment = await prisma.appointment.findUnique({ where: { id } })
   if (!appointment) {
     throw new NotFoundError('Appointment not found.')
   }
 
-  const current = appointment.status as string
+  const current = appointment.status
   if (!VALID_STATUSES.includes(current as AppointmentStatus)) {
     throw new UnprocessableError(
       `This appointment has an invalid status "${current}". Please contact support.`,
@@ -645,17 +611,15 @@ export async function updateAppointmentStatus(
   }
 
   if (PAID_GATED_STATUSES.includes(status)) {
-    const payment = await Payment.findOne({ where: { appointmentId: id } })
+    const payment = await prisma.payment.findUnique({ where: { appointmentId: id } })
     if (payment && (payment.status === 'REJECTED' || payment.status === 'CANCELLED')) {
       throw new UnprocessableError(
         `This payment was ${payment.status.toLowerCase()}, not verified. Verify the payment first (Payments page) or have the customer resubmit it before marking the appointment Ready for Service.`,
       )
     }
-    // No payment record, UNPAID or PAID all pass: the appointment's own PAYMENT_VERIFIED
-    // status is the authority, and legacy UNPAID drift is repaired after the update.
   }
 
-  const fields: Record<string, unknown> = {
+  const fields: Prisma.AppointmentUpdateInput = {
     status,
     ...statusFieldsFor(status),
   }
@@ -664,16 +628,16 @@ export async function updateAppointmentStatus(
     fields.cancelledBy = options.cancelledBy ?? null
   }
 
-  await appointment.update(fields)
+  await prisma.appointment.update({
+    where: { id },
+    data: fields,
+  })
 
   if (status === AppointmentStatusValue.CANCELLED) {
     await markPaymentCancelled(id)
-    // Commission must NEVER become earned on a cancelled booking (#19).
     await syncEarningForAppointment(id)
   } else {
     await syncPaymentForStatus(id, status, options.updatedByAdminId)
-    // EARNED requires payment PAID + appointment COMPLETED (#19) — evaluate
-    // after the payment row has been synced.
     await syncEarningForAppointment(id)
   }
 
@@ -681,7 +645,7 @@ export async function updateAppointmentStatus(
 }
 
 export async function reactivateAppointment(id: number): Promise<AppointmentPublic> {
-  const appointment = await Appointment.findByPk(id)
+  const appointment = await prisma.appointment.findUnique({ where: { id } })
   if (!appointment) {
     throw new NotFoundError('Appointment not found.')
   }
@@ -689,29 +653,35 @@ export async function reactivateAppointment(id: number): Promise<AppointmentPubl
     return getAppointmentById(id)
   }
 
-  const payment = await Payment.findOne({ where: { appointmentId: id } })
+  const payment = await prisma.payment.findUnique({ where: { appointmentId: id } })
   const nextStatus: AppointmentStatus =
     payment?.status === 'PAID'
       ? AppointmentStatusValue.READY_FOR_SERVICE
       : AppointmentStatusValue.PAYMENT_REQUIRED
 
-  await appointment.update({
-    status: nextStatus,
-    cancelledAt: null,
-    cancellationReason: null,
-    cancelledBy: null,
+  await prisma.appointment.update({
+    where: { id },
+    data: {
+      status: nextStatus,
+      cancelledAt: null,
+      cancellationReason: null,
+      cancelledBy: null,
+    },
   })
   if (payment && payment.status === 'CANCELLED') {
-    await payment.update({ status: 'UNPAID' })
+    await prisma.payment.update({
+      where: { id: payment.id },
+      data: { status: 'UNPAID' },
+    })
   }
 
   return getAppointmentById(id)
 }
 
 export async function deleteAppointment(id: number): Promise<void> {
-  const appointment = await Appointment.findByPk(id)
+  const appointment = await prisma.appointment.findUnique({ where: { id } })
   if (!appointment) {
     throw new NotFoundError('Appointment not found.')
   }
-  await appointment.destroy()
+  await prisma.appointment.delete({ where: { id } })
 }

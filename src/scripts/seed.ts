@@ -1,7 +1,6 @@
 import bcrypt from 'bcryptjs'
-import { sequelize } from '../config/database'
+import { prisma, connectDatabase, closeDatabase } from '../config/database'
 import { env } from '../config/env'
-import { Admin, Barber, BarberAvailability, Customer, Gallery, Review, Service } from '../models'
 import type { GalleryCategory } from '../types'
 import { getPaymentSettingsRecord } from '../services/paymentSettingsService'
 import { copySeedAsset } from '../utils/seedAssets'
@@ -265,30 +264,37 @@ const reviewSeeds: { customerName: string; rating: number; comment: string; serv
 /**
  * One-time data migration: existing records whose images still point at
  * external hosts (Unsplash, Cloudinary, ...) are switched to the local
- * uploads copies created from the committed seed assets. Admin-uploaded
- * images (/uploads/...) are never touched. Idempotent — a second run is a
- * no-op because the records now start with /uploads/.
+ * uploads copies created from the committed seed assets.
  */
 async function migrateLegacyImageUrls(): Promise<void> {
   const isLegacy = (url: string | null | undefined): boolean =>
     Boolean(url) && !String(url).startsWith('/uploads/')
 
   for (const seed of serviceSeeds) {
-    const service = await Service.findOne({ where: { slug: seed.slug } })
+    const service = await prisma.service.findUnique({ where: { slug: seed.slug } })
     if (service && isLegacy(service.image)) {
-      await service.update({ image: copySeedAsset(`${seed.slug}.jpg`) })
+      await prisma.service.update({
+        where: { id: service.id },
+        data: { image: copySeedAsset(`${seed.slug}.jpg`) },
+      })
     }
   }
   for (const seed of barberSeeds) {
-    const barber = await Barber.findOne({ where: { slug: seed.slug } })
+    const barber = await prisma.barber.findUnique({ where: { slug: seed.slug } })
     if (barber && isLegacy(barber.image)) {
-      await barber.update({ image: copySeedAsset(`barber-${seed.slug.split('-')[0]}.jpg`) })
+      await prisma.barber.update({
+        where: { id: barber.id },
+        data: { image: copySeedAsset(`barber-${seed.slug.split('-')[0]}.jpg`) },
+      })
     }
   }
   for (const item of gallerySeeds) {
-    const gallery = await Gallery.findOne({ where: { title: item.title } })
+    const gallery = await prisma.gallery.findFirst({ where: { title: item.title } })
     if (gallery && isLegacy(gallery.image)) {
-      await gallery.update({ image: copySeedAsset(item.file) })
+      await prisma.gallery.update({
+        where: { id: gallery.id },
+        data: { image: copySeedAsset(item.file) },
+      })
     }
   }
 }
@@ -298,43 +304,59 @@ async function migrateLegacyImageUrls(): Promise<void> {
  * gallery, approved demo reviews, payment settings and the client-demo
  * customer account. Safe to run on every boot — existing records untouched.
  */
-export async function seedDatabase(): Promise<{ services: number; barbers: number; gallery: number; reviews: number; demoCustomer: boolean }> {
-  await sequelize.authenticate()
+export async function seedDatabase(): Promise<{
+  services: number
+  barbers: number
+  gallery: number
+  reviews: number
+  demoCustomer: boolean
+}> {
+  await connectDatabase()
   console.log('[db:seed] database connection established')
 
   await migrateLegacyImageUrls()
 
-  // --- Seed admin (same source as db:sync — keeps parity with local dev) ---
-  const [seedAdmin, adminCreated] = await Admin.findOrCreate({
+  // --- Seed admin ---
+  const existingAdmin = await prisma.admin.findUnique({
     where: { email: env.adminSeed.email.toLowerCase() },
-    defaults: {
-      name: env.adminSeed.name,
-      email: env.adminSeed.email.toLowerCase(),
-      password: await bcrypt.hash(env.adminSeed.password, 12),
-      role: 'ADMIN' as const,
-    },
   })
+  let adminCreated = false
+  if (!existingAdmin) {
+    await prisma.admin.create({
+      data: {
+        name: env.adminSeed.name,
+        email: env.adminSeed.email.toLowerCase(),
+        password: await bcrypt.hash(env.adminSeed.password, 12),
+        role: 'ADMIN',
+      },
+    })
+    adminCreated = true
+  }
   console.log(
     adminCreated
-      ? `[db:seed] seed admin created: ${seedAdmin.email}`
-      : `[db:seed] seed admin already exists: ${seedAdmin.email}`,
+      ? `[db:seed] seed admin created: ${env.adminSeed.email.toLowerCase()}`
+      : `[db:seed] seed admin already exists: ${env.adminSeed.email.toLowerCase()}`,
   )
 
   const serviceBySlug: Record<string, number> = {}
   for (const seed of serviceSeeds) {
-    const [service, created] = await Service.findOrCreate({
-      where: { slug: seed.slug },
-      defaults: {
-        name: seed.name,
-        slug: seed.slug,
-        category: seed.category,
-        description: seed.description,
-        price: seed.price,
-        duration: seed.duration,
-        image: seed.image,
-        isActive: true,
-      },
-    })
+    let service = await prisma.service.findUnique({ where: { slug: seed.slug } })
+    let created = false
+    if (!service) {
+      service = await prisma.service.create({
+        data: {
+          name: seed.name,
+          slug: seed.slug,
+          category: seed.category,
+          description: seed.description,
+          price: seed.price,
+          duration: seed.duration,
+          image: seed.image,
+          isActive: true,
+        },
+      })
+      created = true
+    }
     serviceBySlug[seed.slug] = service.id
     console.log(
       created
@@ -344,26 +366,37 @@ export async function seedDatabase(): Promise<{ services: number; barbers: numbe
   }
 
   for (const seed of barberSeeds) {
-    const [barber, created] = await Barber.findOrCreate({
-      where: { slug: seed.slug },
-      defaults: {
-        name: seed.name,
-        slug: seed.slug,
-        specialty: seed.specialty,
-        biography: seed.biography,
-        experience: seed.experience,
-        rating: seed.rating,
-        image: seed.image,
-        isActive: true,
-      },
-    })
+    let barber = await prisma.barber.findUnique({ where: { slug: seed.slug } })
+    let created = false
+    if (!barber) {
+      barber = await prisma.barber.create({
+        data: {
+          name: seed.name,
+          slug: seed.slug,
+          specialty: seed.specialty,
+          biography: seed.biography,
+          experience: seed.experience,
+          rating: seed.rating,
+          image: seed.image,
+          isActive: true,
+        },
+      })
+      created = true
+    }
 
-    // Only the services this barber actually performs — the booking flow
-    // filters barbers by the selected service, so this mapping matters.
     const serviceIds = (seed.serviceSlugs ?? [])
       .map((slug) => serviceBySlug[slug])
       .filter((id): id is number => Boolean(id))
-    await barber.setServices(serviceIds)
+
+    // Reconcile barber services
+    await prisma.barberService.deleteMany({ where: { barberId: barber.id } })
+    if (serviceIds.length > 0) {
+      await prisma.barberService.createMany({
+        data: serviceIds.map((serviceId) => ({ barberId: barber.id, serviceId })),
+        skipDuplicates: true,
+      })
+    }
+
     console.log(
       created
         ? `[db:seed] created barber: ${barber.name} (${serviceIds.length} services)`
@@ -371,12 +404,21 @@ export async function seedDatabase(): Promise<{ services: number; barbers: numbe
     )
 
     for (const [day, [startTime, endTime]] of Object.entries(weeklySchedule)) {
-      await BarberAvailability.upsert({
-        barberId: barber.id,
-        dayOfWeek: Number(day),
-        startTime,
-        endTime,
-        isAvailable: true,
+      await prisma.barberAvailability.upsert({
+        where: {
+          barberId_dayOfWeek: {
+            barberId: barber.id,
+            dayOfWeek: Number(day),
+          },
+        },
+        update: { startTime, endTime, isAvailable: true },
+        create: {
+          barberId: barber.id,
+          dayOfWeek: Number(day),
+          startTime,
+          endTime,
+          isAvailable: true,
+        },
       })
     }
   }
@@ -388,18 +430,24 @@ export async function seedDatabase(): Promise<{ services: number; barbers: numbe
   // --- Gallery (idempotent by title) ---
   let galleryCount = 0
   for (const item of gallerySeeds) {
-    const [, created] = await Gallery.findOrCreate({
-      where: { title: item.title },
-      defaults: { title: item.title, image: copySeedAsset(item.file), category: item.category },
-    })
-    if (created) galleryCount += 1
+    const existing = await prisma.gallery.findFirst({ where: { title: item.title } })
+    if (!existing) {
+      await prisma.gallery.create({
+        data: {
+          title: item.title,
+          image: copySeedAsset(item.file),
+          category: item.category,
+        },
+      })
+      galleryCount += 1
+    }
   }
   console.log(`[db:seed] gallery ensured (${galleryCount} new)`)
 
-  // --- Approved demo reviews (idempotent by customer name + service) ---
+  // --- Approved demo reviews ---
   const barberBySlug: Record<string, number> = {}
   for (const barberSeed of barberSeeds) {
-    const found = await Barber.findOne({ where: { slug: barberSeed.slug } })
+    const found = await prisma.barber.findUnique({ where: { slug: barberSeed.slug } })
     if (found) barberBySlug[barberSeed.slug] = found.id
   }
 
@@ -407,37 +455,45 @@ export async function seedDatabase(): Promise<{ services: number; barbers: numbe
   for (const seed of reviewSeeds) {
     const service = serviceBySlug[seed.serviceSlug]
     const barberId = seed.barberSlug ? barberBySlug[seed.barberSlug] : undefined
-    const [, created] = await Review.findOrCreate({
+    const existing = await prisma.review.findFirst({
       where: { customerName: seed.customerName, serviceId: service ?? null },
-      defaults: {
-        customerName: seed.customerName,
-        serviceId: service ?? null,
-        serviceName: serviceSeeds.find((s) => s.slug === seed.serviceSlug)?.name ?? null,
-        barberId: barberId ?? null,
-        rating: seed.rating,
-        comment: seed.comment,
-        status: 'APPROVED',
-        isApproved: true,
-      },
     })
-    if (created) reviewCount += 1
+    if (!existing) {
+      await prisma.review.create({
+        data: {
+          customerName: seed.customerName,
+          serviceId: service ?? null,
+          serviceName: serviceSeeds.find((s) => s.slug === seed.serviceSlug)?.name ?? null,
+          barberId: barberId ?? null,
+          rating: seed.rating,
+          comment: seed.comment,
+          status: 'APPROVED',
+          isApproved: true,
+        },
+      })
+      reviewCount += 1
+    }
   }
   console.log(`[db:seed] demo reviews ensured (${reviewCount} new)`)
 
-  // --- Client-demo customer account (idempotent by phone) ---
-  const [demoCustomer, customerCreated] = await Customer.findOrCreate({
+  // --- Client-demo customer account ---
+  let customerCreated = false
+  const existingCustomer = await prisma.customer.findFirst({
     where: { phone: '08000000001' },
-    defaults: {
-      fullName: 'Demo Customer',
-      phone: '08000000001',
-      email: 'customer@sawabagrooming.test',
-      passwordHash: await bcrypt.hash('TestCustomer123!', 10),
-    },
   })
-  if (customerCreated) {
+  if (!existingCustomer) {
+    await prisma.customer.create({
+      data: {
+        fullName: 'Demo Customer',
+        phone: '08000000001',
+        email: 'customer@sawabagrooming.test',
+        passwordHash: await bcrypt.hash('TestCustomer123!', 10),
+      },
+    })
+    customerCreated = true
     console.log('[db:seed] demo customer account created: customer@sawabagrooming.test')
   } else {
-    console.log(`[db:seed] demo customer already exists: ${demoCustomer.email ?? demoCustomer.phone}`)
+    console.log(`[db:seed] demo customer already exists: ${existingCustomer.email ?? existingCustomer.phone}`)
   }
 
   return {
@@ -460,7 +516,7 @@ async function run(): Promise<void> {
     console.error('[db:seed] failed:', error)
     process.exitCode = 1
   } finally {
-    await sequelize.close()
+    await closeDatabase()
   }
 }
 

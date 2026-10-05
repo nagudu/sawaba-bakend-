@@ -78,3 +78,7 @@ export const GALLERY_CATEGORIES: GalleryCategory[] = [
   'KIDS',
   'SALON',
 ]
+
+/** Reviews are stored in a VARCHAR(10) column, not a DB enum, so this is the only guard. */
+export const REVIEW_STATUSES = ['PENDING', 'APPROVED', 'REJECTED'] as const
+export type ReviewStatus = (typeof REVIEW_STATUSES)[number]

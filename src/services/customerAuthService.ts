@@ -1,9 +1,9 @@
 import crypto from 'node:crypto'
 import bcrypt from 'bcryptjs'
 import jwt from 'jsonwebtoken'
-import { Op } from 'sequelize'
 import { env } from '../config/env'
-import { Customer, CustomerOtp } from '../models'
+import { prisma } from '../config/database'
+import type { Customer } from '@prisma/client'
 import { normalizeNigerianPhone, isPlausiblePhone } from '../utils/phone'
 import {
   ConflictError,
@@ -37,7 +37,6 @@ export function signCustomerToken(customer: Customer): string {
   })
 }
 
-/** 6-digit cryptographically random code (never sequential, never guessable). */
 function generateOtp(): string {
   return String(crypto.randomInt(0, 1_000_000)).padStart(6, '0')
 }
@@ -46,12 +45,6 @@ function hashOtp(code: string, phone: string): string {
   return crypto.createHmac('sha256', env.jwtSecret).update(`${phone}:${code}`).digest('hex')
 }
 
-/**
- * Delivers the OTP to the customer. Email is the transport that works today
- * (Resend); SMS gateways can be added later behind the same interface. The
- * code is also returned so the response can include it in NON-production
- * environments only, letting users test without a real inbox.
- */
 async function deliverOtp(
   customer: { fullName: string; email: string | null },
   phone: string,
@@ -59,12 +52,14 @@ async function deliverOtp(
 ): Promise<{ devCode: string | null }> {
   const expires = new Date(Date.now() + OTP_TTL_MINUTES * 60_000)
 
-  await CustomerOtp.destroy({ where: { phone, purpose: 'LOGIN' } })
-  await CustomerOtp.create({
-    phone,
-    purpose: 'LOGIN',
-    codeHash: hashOtp(code, phone),
-    expiresAt: expires,
+  await prisma.customerOtp.deleteMany({ where: { phone, purpose: 'LOGIN' } })
+  await prisma.customerOtp.create({
+    data: {
+      phone,
+      purpose: 'LOGIN',
+      codeHash: hashOtp(code, phone),
+      expiresAt: expires,
+    },
   })
 
   if (customer.email) {
@@ -76,8 +71,6 @@ async function deliverOtp(
         html: `<p>Hello ${customer.fullName},</p><p>Your SAWABA verification code is <strong style="font-size:22px;letter-spacing:4px;">${code}</strong>. It expires in ${OTP_TTL_MINUTES} minutes.</p><p style="color:#888;font-size:12px;">If you did not request this, you can safely ignore this email.</p>`,
       })
     } catch (error) {
-      // OTP delivery failure must not crash login — the devCode fallback and
-      // the retry button cover it. The cause stays in the logs.
       console.error('[customer-auth] otp email failed:', (error as Error).message)
     }
   }
@@ -87,7 +80,6 @@ async function deliverOtp(
   }
 }
 
-/** Step 1 of phone login: find the account and send an OTP. */
 export async function requestLoginOtp(rawPhone: string): Promise<{
   found: boolean
   message: string
@@ -98,10 +90,8 @@ export async function requestLoginOtp(rawPhone: string): Promise<{
     throw new UnprocessableError('Provide a valid phone number.')
   }
 
-  const customer = await Customer.findOne({ where: { phone, isActive: true } })
+  const customer = await prisma.customer.findFirst({ where: { phone, isActive: true } })
   if (!customer) {
-    // Do NOT reveal whether the number is registered (enumeration safety) —
-    // but also do not burn an OTP. Return a guidance message instead.
     return {
       found: false,
       message: 'No account found for this number. Please create one first.',
@@ -111,44 +101,56 @@ export async function requestLoginOtp(rawPhone: string): Promise<{
 
   const code = generateOtp()
   const { devCode } = await deliverOtp(customer, phone, code)
-  return { found: true, message: `We sent a 6-digit code to ${customer.email ?? 'your contact'}. It expires in ${OTP_TTL_MINUTES} minutes.`, devCode }
+  return {
+    found: true,
+    message: `We sent a 6-digit code to ${customer.email ?? 'your contact'}. It expires in ${OTP_TTL_MINUTES} minutes.`,
+    devCode,
+  }
 }
 
-/** Step 2 of phone login: verify the OTP and issue a session token. */
 export async function verifyLoginOtp(
   rawPhone: string,
   code: string,
 ): Promise<{ token: string; customer: Customer }> {
   const phone = normalizeNigerianPhone(rawPhone)
-  const record = await CustomerOtp.findOne({
-    where: { phone, purpose: 'LOGIN', consumedAt: null, expiresAt: { [Op.gt]: new Date() } },
-    order: [['createdAt', 'DESC']],
+  const record = await prisma.customerOtp.findFirst({
+    where: { phone, purpose: 'LOGIN', consumedAt: null, expiresAt: { gt: new Date() } },
+    orderBy: { createdAt: 'desc' },
   })
 
   if (!record) {
     throw new UnauthorizedError('This code has expired. Please request a new one.')
   }
   if (record.attempts >= MAX_ATTEMPTS) {
-    await record.destroy()
+    await prisma.customerOtp.delete({ where: { id: record.id } })
     throw new UnauthorizedError('Too many incorrect attempts. Please request a new code.')
   }
   if (record.codeHash !== hashOtp(code.trim(), phone)) {
-    await record.increment('attempts')
+    await prisma.customerOtp.update({
+      where: { id: record.id },
+      data: { attempts: { increment: 1 } },
+    })
     throw new UnauthorizedError('Incorrect code. Please try again.')
   }
 
-  await record.update({ consumedAt: new Date() })
-  const customer = await Customer.findOne({ where: { phone, isActive: true } })
+  await prisma.customerOtp.update({
+    where: { id: record.id },
+    data: { consumedAt: new Date() },
+  })
+
+  const customer = await prisma.customer.findFirst({ where: { phone, isActive: true } })
   if (!customer) {
     throw new UnauthorizedError('Account no longer exists or has been deactivated.')
   }
   await ensureCustomerCode(customer)
-  await customer.update({ lastLoginAt: new Date() })
+  const updatedCustomer = await prisma.customer.update({
+    where: { id: customer.id },
+    data: { lastLoginAt: new Date() },
+  })
 
-  return { token: signCustomerToken(customer), customer }
+  return { token: signCustomerToken(updatedCustomer), customer: updatedCustomer }
 }
 
-/** Registration: creates the one account per phone and logs the customer in. */
 export async function registerCustomer(input: {
   fullName: string
   phone: string
@@ -160,48 +162,54 @@ export async function registerCustomer(input: {
     throw new UnprocessableError('Provide a valid phone number.')
   }
   if (input.email) {
-    const emailTaken = await Customer.findOne({ where: { email: input.email.trim().toLowerCase() } })
+    const emailTaken = await prisma.customer.findFirst({
+      where: { email: input.email.trim().toLowerCase() },
+    })
     if (emailTaken) {
       throw new ConflictError('This email is already registered to another account.')
     }
   }
 
-  const existing = await Customer.findOne({ where: { phone } })
+  const existing = await prisma.customer.findFirst({ where: { phone } })
   if (existing) {
-    // Never create duplicates: if the caller is who we think, upgrade the
-    // legacy guest record instead (verified below via OTP or password).
     if (existing.passwordHash || existing.email) {
       throw new ConflictError(
         'We found an existing account for this number. Please login with OTP instead.',
       )
     }
-    // Legacy guest-only record with no credentials: attach the new details.
-    if (input.email) existing.email = input.email.trim().toLowerCase()
-    if (input.password) existing.passwordHash = await bcrypt.hash(input.password, 10)
-    await existing.save()
-    await ensureCustomerCode(existing)
-    await existing.update({ lastLoginAt: new Date() })
-    return { token: signCustomerToken(existing), customer: existing }
+    const data: { email?: string; passwordHash?: string; lastLoginAt: Date } = {
+      lastLoginAt: new Date(),
+    }
+    if (input.email) data.email = input.email.trim().toLowerCase()
+    if (input.password) data.passwordHash = await bcrypt.hash(input.password, 10)
+
+    const updated = await prisma.customer.update({
+      where: { id: existing.id },
+      data,
+    })
+    await ensureCustomerCode(updated)
+    return { token: signCustomerToken(updated), customer: updated }
   }
 
-  const customer = await Customer.create({
-    fullName: input.fullName.trim(),
-    phone,
-    email: input.email?.trim().toLowerCase() ?? null,
-    passwordHash: input.password ? await bcrypt.hash(input.password, 10) : null,
+  const customer = await prisma.customer.create({
+    data: {
+      fullName: input.fullName.trim(),
+      phone,
+      email: input.email?.trim().toLowerCase() ?? null,
+      passwordHash: input.password ? await bcrypt.hash(input.password, 10) : null,
+      lastLoginAt: new Date(),
+    },
   })
   await ensureCustomerCode(customer)
-  await customer.update({ lastLoginAt: new Date() })
   return { token: signCustomerToken(customer), customer }
 }
 
-/** Password login for customers who chose a password at registration. */
 export async function loginWithPassword(
   rawPhone: string,
   password: string,
 ): Promise<{ token: string; customer: Customer }> {
   const phone = normalizeNigerianPhone(rawPhone)
-  const customer = await Customer.findOne({ where: { phone, isActive: true } })
+  const customer = await prisma.customer.findFirst({ where: { phone, isActive: true } })
   if (!customer?.passwordHash) {
     throw new UnauthorizedError('No password login for this number. Use phone code instead.')
   }
@@ -210,17 +218,19 @@ export async function loginWithPassword(
     throw new UnauthorizedError('Incorrect phone number or password.')
   }
   await ensureCustomerCode(customer)
-  await customer.update({ lastLoginAt: new Date() })
-  return { token: signCustomerToken(customer), customer }
+  const updated = await prisma.customer.update({
+    where: { id: customer.id },
+    data: { lastLoginAt: new Date() },
+  })
+  return { token: signCustomerToken(updated), customer: updated }
 }
 
-/** Change password while logged in (current password required when one exists). */
 export async function changeCustomerPassword(
   customerId: number,
   currentPassword: string | null,
   newPassword: string,
 ): Promise<void> {
-  const customer = await Customer.findByPk(customerId)
+  const customer = await prisma.customer.findUnique({ where: { id: customerId } })
   if (!customer) throw new NotFoundError('Account not found.')
   if (customer.passwordHash) {
     if (!currentPassword) {
@@ -229,10 +239,13 @@ export async function changeCustomerPassword(
     const ok = await bcrypt.compare(currentPassword, customer.passwordHash)
     if (!ok) throw new UnauthorizedError('Current password is incorrect.')
   }
-  await customer.update({ passwordHash: await bcrypt.hash(newPassword, 10) })
+  const newHash = await bcrypt.hash(newPassword, 10)
+  await prisma.customer.update({
+    where: { id: customerId },
+    data: { passwordHash: newHash },
+  })
 }
 
-/** Profile updates. Email changes require OTP re-verification when set. */
 export async function updateCustomerProfile(
   customerId: number,
   patch: {
@@ -245,11 +258,21 @@ export async function updateCustomerProfile(
     reminderOptIn?: boolean
   },
 ): Promise<Customer> {
-  const customer = await Customer.findByPk(customerId)
+  const customer = await prisma.customer.findUnique({ where: { id: customerId } })
   if (!customer) throw new NotFoundError('Account not found.')
   if (!customer.isActive) throw new ForbiddenError('This account has been deactivated.')
 
-  const fields: Record<string, unknown> = {}
+  const fields: {
+    fullName?: string
+    phone?: string
+    phoneVerified?: boolean
+    email?: string | null
+    avatarUrl?: string | null
+    preferredBarberId?: number | null
+    favoriteServiceId?: number | null
+    reminderOptIn?: boolean
+  } = {}
+
   if (patch.fullName !== undefined && patch.fullName.trim()) {
     fields.fullName = patch.fullName.trim()
   }
@@ -258,19 +281,17 @@ export async function updateCustomerProfile(
     if (!isPlausiblePhone(phone)) {
       throw new UnprocessableError('Provide a valid phone number.')
     }
-    // One account per phone number — the same rule the register path enforces.
-    const taken = await Customer.findOne({ where: { phone } })
+    const taken = await prisma.customer.findFirst({ where: { phone } })
     if (taken && taken.id !== customer.id) {
       throw new ConflictError('This phone number is already in use by another account.')
     }
     fields.phone = phone
-    // Supplying a real number clears the Google placeholder state.
     fields.phoneVerified = true
   }
   if (patch.email !== undefined) {
     const email = patch.email ? patch.email.trim().toLowerCase() : null
     if (email && email !== customer.email) {
-      const taken = await Customer.findOne({ where: { email } })
+      const taken = await prisma.customer.findFirst({ where: { email } })
       if (taken) throw new ConflictError('This email is already in use by another account.')
     }
     fields.email = email
@@ -280,11 +301,12 @@ export async function updateCustomerProfile(
   if (patch.favoriteServiceId !== undefined) fields.favoriteServiceId = patch.favoriteServiceId
   if (patch.reminderOptIn !== undefined) fields.reminderOptIn = patch.reminderOptIn
 
-  await customer.update(fields)
-  return customer
+  return prisma.customer.update({
+    where: { id: customerId },
+    data: fields,
+  })
 }
 
-/** Safe public shape for API responses — never leaks the password hash. */
 export function serializeCustomer(customer: Customer): Record<string, unknown> {
   return {
     id: customer.id,
@@ -297,9 +319,7 @@ export function serializeCustomer(customer: Customer): Record<string, unknown> {
     favoriteServiceId: customer.favoriteServiceId,
     reminderOptIn: customer.reminderOptIn,
     isActive: customer.isActive,
-    // False for accounts created via Google, which still need a real number.
     phoneVerified: customer.phoneVerified,
-    // Whether a Google account is linked. The `sub` itself is never exposed.
     hasGoogleAccount: Boolean(customer.googleSub),
     createdAt: customer.createdAt,
     lastLoginAt: customer.lastLoginAt,

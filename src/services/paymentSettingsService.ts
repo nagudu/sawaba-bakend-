@@ -1,4 +1,5 @@
-import { PaymentSetting } from '../models'
+import { prisma } from '../config/database'
+import type { PaymentSetting } from '@prisma/client'
 import type { UpdatePaymentSettingsInput } from '../validators/paymentSettings'
 import type { PaymentMethod } from '../types'
 
@@ -67,17 +68,20 @@ export function serializePaymentSetting(setting: PaymentSetting): PaymentSetting
     minAmount: Number(setting.minAmount),
     fullPaymentRequired: setting.fullPaymentRequired,
     receiptRequired: setting.receiptRequired,
-    // Online payments exist only when the gateway secret key is configured server-side.
     onlinePaymentEnabled: Boolean(process.env.PAYSTACK_SECRET_KEY),
   }
 }
 
 export async function getPaymentSettingsRecord(): Promise<PaymentSetting> {
-  const [settings] = await PaymentSetting.findOrCreate({
-    where: { id: 1 },
-    defaults: { id: 1, ...DEFAULT_SETTINGS },
+  const existing = await prisma.paymentSetting.findUnique({ where: { id: 1 } })
+  if (existing) return existing
+
+  return prisma.paymentSetting.create({
+    data: {
+      id: 1,
+      ...DEFAULT_SETTINGS,
+    },
   })
-  return settings
 }
 
 export async function getPublicPaymentSettings(): Promise<PaymentSettingsPublic> {
@@ -88,7 +92,25 @@ export async function getPublicPaymentSettings(): Promise<PaymentSettingsPublic>
 export async function updatePaymentSettings(
   input: UpdatePaymentSettingsInput,
 ): Promise<PaymentSettingsPublic> {
-  const settings = await getPaymentSettingsRecord()
-  await settings.update(input)
-  return serializePaymentSetting(settings)
+  await getPaymentSettingsRecord() // ensures record exists
+  const updated = await prisma.paymentSetting.update({
+    where: { id: 1 },
+    data: {
+      ...(input.shopName !== undefined ? { shopName: input.shopName } : {}),
+      ...(input.shopAddress !== undefined ? { shopAddress: input.shopAddress } : {}),
+      ...(input.shopPhone !== undefined ? { shopPhone: input.shopPhone } : {}),
+      ...(input.shopLogo !== undefined ? { shopLogo: input.shopLogo } : {}),
+      ...(input.bankName !== undefined ? { bankName: input.bankName } : {}),
+      ...(input.accountName !== undefined ? { accountName: input.accountName } : {}),
+      ...(input.accountNumber !== undefined ? { accountNumber: input.accountNumber } : {}),
+      ...(input.opayAccountName !== undefined ? { opayAccountName: input.opayAccountName } : {}),
+      ...(input.opayAccountNumber !== undefined ? { opayAccountNumber: input.opayAccountNumber } : {}),
+      ...(input.paymentInstructions !== undefined ? { paymentInstructions: input.paymentInstructions } : {}),
+      ...(input.enabledPaymentMethods !== undefined ? { enabledPaymentMethods: input.enabledPaymentMethods } : {}),
+      ...(input.minAmount !== undefined ? { minAmount: input.minAmount } : {}),
+      ...(input.fullPaymentRequired !== undefined ? { fullPaymentRequired: input.fullPaymentRequired } : {}),
+      ...(input.receiptRequired !== undefined ? { receiptRequired: input.receiptRequired } : {}),
+    },
+  })
+  return serializePaymentSetting(updated)
 }

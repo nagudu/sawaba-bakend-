@@ -1,25 +1,26 @@
-import { Op } from 'sequelize'
-import { Appointment, Barber, Payment, Service } from '../models'
+import { prisma } from '../config/database'
+import type { Prisma, PaymentMethod, PaymentStatus, AppointmentStatus } from '@prisma/client'
 import { ConflictError, NotFoundError, UnprocessableError } from '../utils/errors'
 import { getPagination } from '../utils/response'
 import { uploadImageToCloudinary, deleteImageByUrl } from '../utils/upload'
-import type { PaymentSetting } from '../models/PaymentSetting'
 import { getPaymentSettingsRecord, serializePaymentSetting } from './paymentSettingsService'
 import { syncEarningForAppointment } from './commissionService'
 import { AppointmentStatusValue, canTransition } from '../config/appointmentStatuses'
-import type { AppointmentStatus, Paged, PaymentMethod, PaymentStatus } from '../types'
+import type { Paged } from '../types'
 import type { SubmitPaymentInput, TrackPaymentInput } from '../validators/payment'
 
-const appointmentInclude = [
-  {
-    model: Appointment,
-    as: 'appointment',
-    include: [
-      { model: Service, as: 'service' },
-      { model: Barber, as: 'barber' },
-    ],
+const paymentInclude = {
+  appointment: {
+    include: {
+      service: true,
+      barber: true,
+    },
   },
-]
+} as const
+
+type PaymentWithAppointment = Prisma.PaymentGetPayload<{
+  include: typeof paymentInclude
+}>
 
 export interface PaymentAppointment {
   id: number
@@ -63,25 +64,31 @@ export async function applyProviderVerification(
   appointmentId: number,
   info: { provider: string; providerRef: string | null; adminId: number | null } | null,
 ): Promise<PublicPaymentBundle> {
-  const payment = await Payment.findOne({ where: { appointmentId } })
+  const payment = await prisma.payment.findUnique({ where: { appointmentId } })
   if (!payment) {
     throw new NotFoundError('Payment record not found for this appointment.')
   }
 
   if (payment.status !== 'PAID') {
-    await payment.update({
-      status: 'PAID',
-      verifiedBy: info?.adminId ?? null,
-      verifiedAt: new Date(),
-      rejectionReason: null,
-      ...(info?.providerRef ? { providerRef: info.providerRef } : {}),
+    await prisma.payment.update({
+      where: { id: payment.id },
+      data: {
+        status: 'PAID',
+        verifiedBy: info?.adminId ?? null,
+        verifiedAt: new Date(),
+        rejectionReason: null,
+        ...(info?.providerRef ? { providerRef: info.providerRef } : {}),
+      },
     })
   }
 
-  const appointment = await Appointment.findByPk(appointmentId)
+  const appointment = await prisma.appointment.findUnique({ where: { id: appointmentId } })
   if (appointment && appointment.status !== AppointmentStatusValue.CANCELLED) {
     if (appointment.status !== AppointmentStatusValue.PAYMENT_VERIFIED) {
-      await appointment.update({ status: AppointmentStatusValue.PAYMENT_VERIFIED })
+      await prisma.appointment.update({
+        where: { id: appointmentId },
+        data: { status: AppointmentStatusValue.PAYMENT_VERIFIED },
+      })
     }
     // Auto-advance into service when valid; provider-confirmed payments may jump
     // straight from PAYMENT_REQUIRED because Paystack attested the money arrived.
@@ -94,13 +101,14 @@ export async function applyProviderVerification(
       appointment.status !== AppointmentStatusValue.IN_PROGRESS &&
       appointment.status !== AppointmentStatusValue.COMPLETED
     ) {
-      await appointment.update({ status: AppointmentStatusValue.READY_FOR_SERVICE })
+      await prisma.appointment.update({
+        where: { id: appointmentId },
+        data: { status: AppointmentStatusValue.READY_FOR_SERVICE },
+      })
     }
   }
 
-  // Money is now confirmed — re-evaluate the commission ledger (#19). If the
-  // appointment is already COMPLETED the earning flips to EARNED here; if the
-  // appointment completes later, the status transition re-syncs it.
+  // Money is now confirmed — re-evaluate the commission ledger (#19).
   await syncEarningForAppointment(appointmentId)
 
   return getPublicPaymentByAppointmentId(appointmentId)
@@ -113,15 +121,18 @@ async function getPublicPaymentByAppointmentId(appointmentId: number): Promise<P
 }
 
 /** Finds a payment by its public access token (the /pay/:token URL). */
-export async function getPaymentByAccessToken(token: string): Promise<Payment> {
-  const payment = await Payment.findOne({ where: { accessToken: token }, include: appointmentInclude })
+export async function getPaymentByAccessToken(token: string): Promise<PaymentWithAppointment> {
+  const payment = await prisma.payment.findUnique({
+    where: { accessToken: token },
+    include: paymentInclude,
+  })
   if (!payment) {
     throw new NotFoundError('Payment not found. Check the link and try again.')
   }
   return payment
 }
 
-function serializePayment(payment: Payment): PaymentPublic {
+function serializePayment(payment: PaymentWithAppointment): PaymentPublic {
   const base: PaymentPublic = {
     id: payment.id,
     appointmentId: payment.appointmentId,
@@ -139,18 +150,7 @@ function serializePayment(payment: Payment): PaymentPublic {
     accessToken: payment.accessToken,
   }
 
-  const appointment = payment.appointment as
-    | (Payment['appointment'] & {
-        service?: {
-          id: number
-          name: string
-          price: number
-          duration: number
-        }
-        barber?: { id: number; name: string; image: string | null }
-      })
-    | undefined
-
+  const appointment = payment.appointment
   if (appointment) {
     base.appointment = {
       id: appointment.id,
@@ -179,10 +179,10 @@ function serializePayment(payment: Payment): PaymentPublic {
   return base
 }
 
-async function getPaymentByAppointmentId(appointmentId: number): Promise<Payment> {
-  const payment = await Payment.findOne({
+async function getPaymentByAppointmentId(appointmentId: number): Promise<PaymentWithAppointment> {
+  const payment = await prisma.payment.findUnique({
     where: { appointmentId },
-    include: appointmentInclude,
+    include: paymentInclude,
   })
   if (!payment) {
     throw new NotFoundError('Payment record not found for this appointment.')
@@ -191,7 +191,10 @@ async function getPaymentByAppointmentId(appointmentId: number): Promise<Payment
 }
 
 export async function getPublicPayment(token: string): Promise<PublicPaymentBundle> {
-  const payment = await Payment.findOne({ where: { accessToken: token }, include: appointmentInclude })
+  const payment = await prisma.payment.findUnique({
+    where: { accessToken: token },
+    include: paymentInclude,
+  })
   if (!payment) {
     throw new NotFoundError('Payment not found. Check the link and try again.')
   }
@@ -204,7 +207,10 @@ export async function submitPayment(
   input: SubmitPaymentInput,
   receiptBuffer: Buffer | null,
 ): Promise<PublicPaymentBundle> {
-  const payment = await Payment.findOne({ where: { accessToken: token }, include: appointmentInclude })
+  const payment = await prisma.payment.findUnique({
+    where: { accessToken: token },
+    include: paymentInclude,
+  })
   if (!payment) {
     throw new NotFoundError('Payment not found. Check the link and try again.')
   }
@@ -222,15 +228,13 @@ export async function submitPayment(
     )
   }
 
-  const settings: PaymentSetting = await getPaymentSettingsRecord()
+  const settings = await getPaymentSettingsRecord()
 
   const enabled = (settings.enabledPaymentMethods ?? []) as PaymentMethod[]
-  if (enabled.length > 0 && !enabled.includes(input.paymentMethod)) {
+  if (enabled.length > 0 && !enabled.includes(input.paymentMethod as PaymentMethod)) {
     throw new UnprocessableError('This payment method is not currently accepted. Please choose another method.')
   }
 
-  // Cash never produces a paper/electronic receipt — the admin verifies it
-  // in person. Every other method honours the settings toggle.
   const requiresReceipt = settings.receiptRequired && input.paymentMethod !== 'CASH'
   if (requiresReceipt && !receiptBuffer) {
     throw new UnprocessableError('Please upload a payment receipt image.')
@@ -265,32 +269,38 @@ export async function submitPayment(
     }
   }
 
-  await payment.update({
-    paymentMethod: input.paymentMethod,
-    amount: input.amountPaid,
-    transactionReference: input.transactionReference || null,
-    paymentDate: input.paymentDate,
-    note: input.note ?? null,
-    receiptUrl,
-    receiptPublicId,
-    status: 'PENDING_VERIFICATION',
-    rejectionReason: null,
+  await prisma.payment.update({
+    where: { id: payment.id },
+    data: {
+      paymentMethod: input.paymentMethod as PaymentMethod,
+      amount: input.amountPaid,
+      transactionReference: input.transactionReference || null,
+      paymentDate: input.paymentDate,
+      note: input.note ?? null,
+      receiptUrl,
+      receiptPublicId,
+      status: 'PENDING_VERIFICATION',
+      rejectionReason: null,
+    },
   })
 
-  await appointment.update({ status: AppointmentStatusValue.PAYMENT_SUBMITTED })
+  await prisma.appointment.update({
+    where: { id: appointment.id },
+    data: { status: AppointmentStatusValue.PAYMENT_SUBMITTED },
+  })
 
   const fresh = await getPaymentByAppointmentId(appointment.id)
   return { payment: serializePayment(fresh), settings: serializePaymentSetting(settings) }
 }
 
 /**
- * Cash flow (customer side): the customer declares they will pay cash at the
- * salon. This only RECORDS the chosen method — the payment stays UNPAID until
- * an admin confirms the money was physically received. No receipt, no
- * provider, no appointment confirmation.
+ * Cash flow (customer side): the customer declares they will pay cash at the salon.
  */
 export async function declareCashPayment(token: string): Promise<PublicPaymentBundle> {
-  const payment = await Payment.findOne({ where: { accessToken: token }, include: appointmentInclude })
+  const payment = await prisma.payment.findUnique({
+    where: { accessToken: token },
+    include: paymentInclude,
+  })
   if (!payment) {
     throw new NotFoundError('Payment not found. Check the link and try again.')
   }
@@ -305,17 +315,20 @@ export async function declareCashPayment(token: string): Promise<PublicPaymentBu
     throw new ConflictError('A payment is already under review for this appointment.')
   }
 
-  const settings: PaymentSetting = await getPaymentSettingsRecord()
+  const settings = await getPaymentSettingsRecord()
   const enabled = (settings.enabledPaymentMethods ?? []) as PaymentMethod[]
   if (enabled.length > 0 && !enabled.includes('CASH')) {
     throw new UnprocessableError('Cash payment is not currently accepted. Please choose another method.')
   }
 
-  await payment.update({
-    paymentMethod: 'CASH',
-    amount: Number(appointment.totalAmount),
-    status: 'UNPAID',
-    rejectionReason: null,
+  await prisma.payment.update({
+    where: { id: payment.id },
+    data: {
+      paymentMethod: 'CASH',
+      amount: Number(appointment.totalAmount),
+      status: 'UNPAID',
+      rejectionReason: null,
+    },
   })
 
   const fresh = await getPaymentByAppointmentId(appointment.id)
@@ -326,9 +339,14 @@ export async function trackPayment(input: TrackPaymentInput): Promise<PublicPaym
   const normalize = (phone: string): string => phone.replace(/\D/g, '').slice(-10)
 
   const identifier = input.appointmentId.trim().toUpperCase()
-  const appointment = /^\d+$/.test(identifier)
-    ? await Appointment.findByPk(Number(identifier))
-    : await Appointment.findOne({ where: { referenceCode: identifier } })
+  let appointment = null
+
+  if (/^\d+$/.test(identifier)) {
+    appointment = await prisma.appointment.findUnique({ where: { id: Number(identifier) } })
+  }
+  if (!appointment) {
+    appointment = await prisma.appointment.findUnique({ where: { referenceCode: identifier } })
+  }
 
   if (!appointment || normalize(appointment.customerPhone) !== normalize(input.phone)) {
     throw new NotFoundError('No appointment matches those details. Please check and try again.')
@@ -352,60 +370,53 @@ export interface ListPaymentsQuery {
 export async function listPayments(query: ListPaymentsQuery): Promise<Paged<PaymentPublic>> {
   const { page, perPage, offset, limit } = getPagination(query as Record<string, unknown>)
 
-  const where: Record<string, unknown> = {}
+  const where: Prisma.PaymentWhereInput = {}
   if (query.status) where.status = query.status
   if (query.method) where.paymentMethod = query.method
   if (query.from || query.to) {
     where.paymentDate = {
-      ...(query.from ? { [Op.gte]: query.from } : {}),
-      ...(query.to ? { [Op.lte]: query.to } : {}),
+      ...(query.from ? { gte: query.from } : {}),
+      ...(query.to ? { lte: query.to } : {}),
     }
   }
 
   const search = query.search?.trim()
-  let appointmentWhere: Record<string, unknown> | undefined
   if (search) {
-    const orClauses: Array<Record<string, unknown>> = [
-      { referenceCode: { [Op.like]: `%${search}%` } },
-      { customerName: { [Op.like]: `%${search}%` } },
-      { customerPhone: { [Op.like]: `%${search}%` } },
-    ]
-    if (/^\d+$/.test(search)) {
-      orClauses.push({ id: Number(search) })
+    const isNum = /^\d+$/.test(search)
+    where.appointment = {
+      OR: [
+        { referenceCode: { contains: search } },
+        { customerName: { contains: search } },
+        { customerPhone: { contains: search } },
+        ...(isNum ? [{ id: Number(search) }] : []),
+      ],
     }
-    appointmentWhere = { [Op.or]: orClauses }
   }
 
-  const { rows, count } = await Payment.findAndCountAll({
-    where,
-    include: [
-      {
-        model: Appointment,
-        as: 'appointment',
-        where: appointmentWhere,
-        required: Boolean(appointmentWhere),
-        include: [
-          { model: Service, as: 'service' },
-          { model: Barber, as: 'barber' },
-        ],
-      },
-    ],
-    distinct: true,
-    order: [['createdAt', 'DESC']],
-    offset,
-    limit,
-  })
+  const [rows, total] = await Promise.all([
+    prisma.payment.findMany({
+      where,
+      include: paymentInclude,
+      orderBy: { createdAt: 'desc' },
+      skip: offset,
+      take: limit,
+    }),
+    prisma.payment.count({ where }),
+  ])
 
   return {
     items: rows.map(serializePayment),
-    total: count,
+    total,
     page,
     perPage,
   }
 }
 
 export async function getPaymentById(id: number): Promise<PaymentPublic> {
-  const payment = await Payment.findByPk(id, { include: appointmentInclude })
+  const payment = await prisma.payment.findUnique({
+    where: { id },
+    include: paymentInclude,
+  })
   if (!payment) {
     throw new NotFoundError('Payment not found.')
   }
@@ -413,7 +424,10 @@ export async function getPaymentById(id: number): Promise<PaymentPublic> {
 }
 
 export async function verifyPayment(id: number, adminId: number): Promise<PaymentPublic> {
-  const payment = await Payment.findByPk(id, { include: appointmentInclude })
+  const payment = await prisma.payment.findUnique({
+    where: { id },
+    include: paymentInclude,
+  })
   if (!payment) {
     throw new NotFoundError('Payment not found.')
   }
@@ -424,8 +438,6 @@ export async function verifyPayment(id: number, adminId: number): Promise<Paymen
     throw new UnprocessableError('Only submitted payments can be verified.')
   }
   if (!payment.receiptUrl && payment.paymentMethod !== 'CASH') {
-    // Receipt rule applies ONLY to receipt-based methods (transfer/OPay).
-    // Cash is confirmed in person with "Mark Cash as Paid" — never here.
     const settings = await getPaymentSettingsRecord()
     if (settings.receiptRequired) {
       throw new UnprocessableError(
@@ -434,13 +446,15 @@ export async function verifyPayment(id: number, adminId: number): Promise<Paymen
     }
   }
 
-  await payment.update({
-    status: 'PAID',
-    verifiedBy: adminId,
-    verifiedAt: new Date(),
+  await prisma.payment.update({
+    where: { id },
+    data: {
+      status: 'PAID',
+      verifiedBy: adminId,
+      verifiedAt: new Date(),
+    },
   })
 
-  // Delegate to the shared verification path (same logic as online/webhook verification).
   await applyProviderVerification(payment.appointmentId, {
     provider: 'manual',
     providerRef: null,
@@ -449,17 +463,16 @@ export async function verifyPayment(id: number, adminId: number): Promise<Paymen
   return getPaymentById(id)
 }
 
-/**
- * Cash flow: the customer pays physically at the salon. No receipt exists —
- * the admin confirms receipt of the money in person and the backend records
- * the audit trail (paid at, verified by, note).
- */
+/** Cash flow: the customer pays physically at the salon. */
 export async function confirmCashPayment(
   id: number,
   adminId: number,
   note: string | null,
 ): Promise<PaymentPublic> {
-  const payment = await Payment.findByPk(id, { include: appointmentInclude })
+  const payment = await prisma.payment.findUnique({
+    where: { id },
+    include: paymentInclude,
+  })
   if (!payment) {
     throw new NotFoundError('Payment not found.')
   }
@@ -478,13 +491,16 @@ export async function confirmCashPayment(
     throw new UnprocessableError('The appointment for this payment has been cancelled.')
   }
 
-  await payment.update({
-    status: 'PAID',
-    paymentDate: new Date().toISOString().slice(0, 10),
-    verifiedBy: adminId,
-    verifiedAt: new Date(),
-    note: note ?? payment.note ?? 'Cash received at salon.',
-    rejectionReason: null,
+  await prisma.payment.update({
+    where: { id },
+    data: {
+      status: 'PAID',
+      paymentDate: new Date().toISOString().slice(0, 10),
+      verifiedBy: adminId,
+      verifiedAt: new Date(),
+      note: note ?? payment.note ?? 'Cash received at salon.',
+      rejectionReason: null,
+    },
   })
 
   await applyProviderVerification(payment.appointmentId, {
@@ -500,7 +516,10 @@ export async function rejectPayment(
   reason: string,
   adminId: number,
 ): Promise<PaymentPublic> {
-  const payment = await Payment.findByPk(id, { include: appointmentInclude })
+  const payment = await prisma.payment.findUnique({
+    where: { id },
+    include: paymentInclude,
+  })
   if (!payment) {
     throw new NotFoundError('Payment not found.')
   }
@@ -508,24 +527,33 @@ export async function rejectPayment(
     throw new ConflictError('This payment is already verified and cannot be rejected.')
   }
 
-  await payment.update({
-    status: 'REJECTED',
-    rejectionReason: reason,
-    verifiedBy: adminId,
-    verifiedAt: null,
+  await prisma.payment.update({
+    where: { id },
+    data: {
+      status: 'REJECTED',
+      rejectionReason: reason,
+      verifiedBy: adminId,
+      verifiedAt: null,
+    },
   })
 
   const appointment = payment.appointment
   if (appointment && appointment.status !== AppointmentStatusValue.CANCELLED) {
-    await appointment.update({ status: AppointmentStatusValue.PAYMENT_REJECTED })
+    await prisma.appointment.update({
+      where: { id: appointment.id },
+      data: { status: AppointmentStatusValue.PAYMENT_REJECTED },
+    })
   }
 
   return getPaymentById(id)
 }
 
 export async function markPaymentCancelled(appointmentId: number): Promise<void> {
-  const payment = await Payment.findOne({ where: { appointmentId } })
+  const payment = await prisma.payment.findUnique({ where: { appointmentId } })
   if (payment && payment.status !== 'PAID') {
-    await payment.update({ status: 'CANCELLED' })
+    await prisma.payment.update({
+      where: { id: payment.id },
+      data: { status: 'CANCELLED' },
+    })
   }
 }

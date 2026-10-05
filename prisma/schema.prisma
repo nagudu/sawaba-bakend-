@@ -1,0 +1,576 @@
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "mysql"
+}
+
+model Admin {
+  id                        Int                         @id @default(autoincrement()) @db.UnsignedInt
+  name                      String                      @db.VarChar(100)
+  email                     String                      @unique(map: "email") @db.VarChar(255)
+  password                  String                      @db.VarChar(255)
+  role                      String                      @default("ADMIN") @db.VarChar(20)
+  isActive                 Boolean@default(true) @map("is_active")
+  createdAt                DateTime?@db.DateTime(0) @map("created_at")
+  updatedAt                DateTime?@db.DateTime(0) @map("updated_at")
+  barber_assignment_history BarberAssignmentHistory[]
+  commission_rate_history   CommissionRateHistory[]
+  contact_replies           ContactReply[]
+
+  @@index([email], map: "admins_email")
+
+  @@map("admins")
+}
+
+/// This model or at least one of its fields has comments in the database, and requires an additional setup for migrations: Read more: https://pris.ly/d/database-comments
+model Appointment {
+  id                        Int                         @id @default(autoincrement()) @db.UnsignedInt
+  customerName             String@db.VarChar(150) @map("customer_name")
+  customerPhone            String@db.VarChar(30) @map("customer_phone")
+  customerEmail            String?@db.VarChar(255) @map("customer_email")
+  serviceId                Int@db.UnsignedInt @map("service_id")
+  barberId                 Int@db.UnsignedInt @map("barber_id")
+  appointmentDate          DateTime@db.Date @map("appointment_date")
+  appointmentTime          String@db.VarChar(8) @map("appointment_time")
+  notes                     String?                     @db.Text
+  status                    AppointmentStatus         @default(PAYMENT_REQUIRED)
+  createdAt                DateTime?@db.DateTime(0) @map("created_at")
+  updatedAt                DateTime?@db.DateTime(0) @map("updated_at")
+  customerId               Int?@db.UnsignedInt @map("customer_id")
+  totalAmount              Decimal@default(0.00) @db.Decimal(10, 2) @map("total_amount")
+  referenceCode            String?@unique(map: "reference_code") @db.VarChar(30) @map("reference_code")
+  serviceStartedAt        DateTime?@db.DateTime(0) @map("service_started_at")
+  completedAt              DateTime?@db.DateTime(0) @map("completed_at")
+  cancelledAt              DateTime?@db.DateTime(0) @map("cancelled_at")
+  cancellationReason       String?@db.Text @map("cancellation_reason")
+  cancelledBy              Int?@db.UnsignedInt @map("cancelled_by")
+  customerLocation         String?@db.VarChar(150) @map("customer_location")
+  assignedBarberId        Int?@db.UnsignedInt @map("assigned_barber_id")
+  assignedAt               DateTime?@db.DateTime(0) @map("assigned_at")
+  assignedBy               Int?@db.UnsignedInt @map("assigned_by")
+  services                  Service                    @relation(fields: [serviceId], references: [id], map: "appointments_ibfk_40")
+  barbers                   Barber                     @relation(fields: [barberId], references: [id], map: "appointments_ibfk_41")
+  customers                 Customer?                  @relation(fields: [customerId], references: [id], map: "appointments_ibfk_42")
+  barber_assignment_history BarberAssignmentHistory[]
+  barber_earnings           BarberEarning?
+  payments                  Payment?
+
+  @@index([appointmentDate, appointmentTime], map: "appointments_appointment_date_appointment_time")
+  @@index([barberId, appointmentDate], map: "appointments_barber_id_appointment_date")
+  @@index([status], map: "appointments_status")
+  @@index([customerId], map: "customer_id")
+  @@index([serviceId], map: "service_id")
+
+  @@map("appointments")
+}
+
+model BarberAssignmentHistory {
+  id                                                            Int                              @id @default(autoincrement()) @db.UnsignedInt
+  appointmentId                                                Int@db.UnsignedInt @map("appointment_id")
+  previousBarberId                                            Int?@db.UnsignedInt @map("previous_barber_id")
+  newBarberId                                                 Int?@db.UnsignedInt @map("new_barber_id")
+  action                                                        BarberAssignmentHistoryAction
+  reason                                                        String?                          @db.VarChar(300)
+  changedByAdminId                                           Int?@db.UnsignedInt @map("changed_by_admin_id")
+  createdAt                                                    DateTime?@db.DateTime(0) @map("created_at")
+  updatedAt                                                    DateTime?@db.DateTime(0) @map("updated_at")
+  appointments                                                  Appointment                     @relation(fields: [appointmentId], references: [id], onDelete: Cascade, map: "barber_assignment_history_ibfk_13")
+  previousBarber Barber?                         @relation("barber_assignment_history_previous_barber_idTobarbers", fields: [previousBarberId], references: [id], map: "barber_assignment_history_ibfk_14")
+  newBarber      Barber?                         @relation("barber_assignment_history_new_barber_idTobarbers", fields: [newBarberId], references: [id], map: "barber_assignment_history_ibfk_15")
+  admins                                                        Admin?                          @relation(fields: [changedByAdminId], references: [id], map: "barber_assignment_history_ibfk_16")
+
+  @@index([appointmentId], map: "barber_assignment_history_appointment_id")
+  @@index([changedByAdminId], map: "changed_by_admin_id")
+  @@index([newBarberId], map: "new_barber_id")
+  @@index([previousBarberId], map: "previous_barber_id")
+
+  @@map("barber_assignment_history")
+}
+
+/// This model or at least one of its fields has comments in the database, and requires an additional setup for migrations: Read more: https://pris.ly/d/database-comments
+model BarberAvailability {
+  id           Int       @id @default(autoincrement()) @db.UnsignedInt
+  barberId    Int@db.UnsignedInt @map("barber_id")
+  dayOfWeek  Int@db.UnsignedTinyInt @map("day_of_week")
+  startTime   String@db.VarChar(8) @map("start_time")
+  endTime     String@db.VarChar(8) @map("end_time")
+  isAvailable Boolean@default(true) @map("is_available")
+  createdAt   DateTime?@db.DateTime(0) @map("created_at")
+  updatedAt   DateTime?@db.DateTime(0) @map("updated_at")
+  barbers      Barber   @relation(fields: [barberId], references: [id], onDelete: Cascade, map: "barber_availability_ibfk_1")
+
+  @@unique([barberId, dayOfWeek], map: "barber_availability_barber_id_day_of_week")
+
+  @@map("barber_availability")
+}
+
+model BarberEarning {
+  id                       Int                                  @id @default(autoincrement()) @db.UnsignedInt
+  appointmentId           Int@unique(map: "appointment_id") @db.UnsignedInt @map("appointment_id")
+  barberId                Int@db.UnsignedInt @map("barber_id")
+  barberTypeSnapshot     BarberTypeSnapshot @map("barber_type_snapshot")
+  commissionType          CommissionType @map("commission_type")
+  commissionRateSnapshot Decimal@db.Decimal(10, 2) @map("commission_rate_snapshot")
+  serviceAmount           Decimal@db.Decimal(10, 2) @map("service_amount")
+  commissionAmount        Decimal@db.Decimal(10, 2) @map("commission_amount")
+  studioAmount            Decimal@db.Decimal(10, 2) @map("studio_amount")
+  status                   BarberEarningStatus               @default(PENDING)
+  earnedAt                DateTime?@db.DateTime(0) @map("earned_at")
+  paidAt                  DateTime?@db.DateTime(0) @map("paid_at")
+  createdAt               DateTime?@db.DateTime(0) @map("created_at")
+  updatedAt               DateTime?@db.DateTime(0) @map("updated_at")
+  appointments             Appointment                         @relation(fields: [appointmentId], references: [id], onDelete: Cascade, map: "barber_earnings_ibfk_7")
+  barbers                  Barber                              @relation(fields: [barberId], references: [id], onDelete: Cascade, map: "barber_earnings_ibfk_8")
+
+  @@index([appointmentId], map: "barber_earnings_appointment_id")
+  @@index([barberId, status], map: "barber_earnings_barber_id_status")
+  @@index([status], map: "barber_earnings_status")
+
+  @@map("barber_earnings")
+}
+
+model BarberNotification {
+  id         Int                       @id @default(autoincrement())
+  barberId  Int@db.UnsignedInt @map("barber_id")
+  type       BarberNotificationType @default(SYSTEM)
+  title      String                    @db.VarChar(160)
+  message    String                    @db.Text
+  readAt    DateTime?@db.DateTime(0) @map("read_at")
+  createdAt DateTime?@db.DateTime(0) @map("created_at")
+  updatedAt DateTime?@db.DateTime(0) @map("updated_at")
+  barbers    Barber                   @relation(fields: [barberId], references: [id], onDelete: Cascade, map: "barber_notifications_ibfk_1")
+
+  @@index([barberId], map: "barber_notifications_barber_id")
+  @@index([readAt], map: "barber_notifications_read_at")
+
+  @@map("barber_notifications")
+}
+
+model BarberService {
+  id         Int       @id @default(autoincrement()) @db.UnsignedInt
+  barberId  Int@db.UnsignedInt @map("barber_id")
+  serviceId Int@db.UnsignedInt @map("service_id")
+  createdAt DateTime?@db.DateTime(0) @map("created_at")
+  updatedAt DateTime?@db.DateTime(0) @map("updated_at")
+  barbers    Barber   @relation(fields: [barberId], references: [id], onDelete: Cascade, map: "barber_services_ibfk_29")
+  services   Service  @relation(fields: [serviceId], references: [id], onDelete: Cascade, map: "barber_services_ibfk_30")
+
+  @@unique([barberId, serviceId], map: "barber_services_barber_id_service_id")
+  @@unique([barberId, serviceId], map: "barber_services_serviceId_barberId_unique")
+  @@index([serviceId], map: "service_id")
+
+  @@map("barber_services")
+}
+
+/// This model or at least one of its fields has comments in the database, and requires an additional setup for migrations: Read more: https://pris.ly/d/database-comments
+model Barber {
+  id                                                                              Int                         @id @default(autoincrement()) @db.UnsignedInt
+  name                                                                            String                      @db.VarChar(150)
+  slug                                                                            String                      @unique(map: "slug") @db.VarChar(160)
+  image                                                                           String?                     @db.VarChar(500)
+  specialty                                                                       String?                     @db.VarChar(255)
+  biography                                                                       String?                     @db.Text
+  experience                                                                      Int                         @default(0) @db.UnsignedInt
+  rating                                                                          Decimal                     @default(0.0) @db.Decimal(2, 1)
+  isActive                                                                       Boolean@default(true) @map("is_active")
+  createdAt                                                                      DateTime?@db.DateTime(0) @map("created_at")
+  updatedAt                                                                      DateTime?@db.DateTime(0) @map("updated_at")
+  phone                                                                           String?                     @db.VarChar(32)
+  email                                                                           String?                     @db.VarChar(255)
+  barberType                                                                     BarberType@default(INTERNAL) @map("barber_type")
+  location                                                                        String?                     @db.VarChar(150)
+  commissionType                                                                 BarberCommissionType@default(PERCENTAGE) @map("commission_type")
+  commissionValue                                                                Decimal@default(0.00) @db.Decimal(10, 2) @map("commission_value")
+  portalEnabled                                                                  Boolean@default(false) @map("portal_enabled")
+  passwordHash                                                                   String?@db.VarChar(255) @map("password_hash")
+  appointments                                                                    Appointment[]
+  previousBarberAssignments BarberAssignmentHistory[] @relation("barber_assignment_history_previous_barber_idTobarbers")
+  newBarberAssignments      BarberAssignmentHistory[] @relation("barber_assignment_history_new_barber_idTobarbers")
+  barber_availability                                                             BarberAvailability[]
+  barber_earnings                                                                 BarberEarning[]
+  barber_notifications                                                            BarberNotification[]
+  barber_services                                                                 BarberService[]
+  checkout_sessions                                                               CheckoutSession[]
+  commission_rate_history                                                         CommissionRateHistory[]
+  gallery                                                                         Gallery[]
+  reviews                                                                         Review[]
+
+  @@index([isActive], map: "barbers_is_active")
+  @@index([slug], map: "barbers_slug")
+
+  @@map("barbers")
+}
+
+model CheckoutSession {
+  id                       Int                               @id @default(autoincrement()) @db.UnsignedInt
+  sessionToken            String@unique(map: "session_token") @db.VarChar(64) @map("session_token")
+  customerName            String@db.VarChar(150) @map("customer_name")
+  customerPhone           String@db.VarChar(20) @map("customer_phone")
+  customerEmail           String? @map("customer_email")
+  serviceId               Int@db.UnsignedInt @map("service_id")
+  barberId                Int@db.UnsignedInt @map("barber_id")
+  appointmentDate         DateTime@db.Date @map("appointment_date")
+  appointmentTime         String@db.VarChar(5) @map("appointment_time")
+  notes                    String?                           @db.Text
+  totalAmount             Decimal@default(0.00) @db.Decimal(10, 2) @map("total_amount")
+  status                   CheckoutSessionStatus          @default(OPEN)
+  paystackReference       String? @map("paystack_reference")
+  convertedAppointmentId Int?@db.UnsignedInt @map("converted_appointment_id")
+  receiptUrl              String?@db.VarChar(500) @map("receipt_url")
+  receiptPublicId        String?@db.VarChar(500) @map("receipt_public_id")
+  createdAt               DateTime?@db.DateTime(0) @map("created_at")
+  updatedAt               DateTime?@db.DateTime(0) @map("updated_at")
+  paymentMethod           CheckoutPaymentMethod? @map("payment_method")
+  transactionReference    String? @map("transaction_reference")
+  customerLocation        String?@db.VarChar(150) @map("customer_location")
+  barbers                  Barber                           @relation(fields: [barberId], references: [id], onDelete: Cascade, map: "checkout_sessions_ibfk_10")
+  services                 Service                          @relation(fields: [serviceId], references: [id], onDelete: Cascade, map: "checkout_sessions_ibfk_9")
+
+  @@index([barberId], map: "barber_id")
+  @@index([appointmentDate], map: "checkout_sessions_appointment_date")
+  @@index([paystackReference], map: "checkout_sessions_paystack_reference")
+  @@index([status], map: "checkout_sessions_status")
+  @@index([serviceId], map: "service_id")
+
+  @@map("checkout_sessions")
+}
+
+model CommissionRateHistory {
+  id                  Int                                     @id @default(autoincrement())
+  barberId           Int@db.UnsignedInt @map("barber_id")
+  commissionType     RateHistoryCommissionType @map("commission_type")
+  commissionValue    Decimal@db.Decimal(10, 2) @map("commission_value")
+  effectiveFrom      DateTime@db.DateTime(0) @map("effective_from")
+  changedByAdminId Int?@db.UnsignedInt @map("changed_by_admin_id")
+  createdAt          DateTime?@db.DateTime(0) @map("created_at")
+  updatedAt          DateTime?@db.DateTime(0) @map("updated_at")
+  barbers             Barber                                 @relation(fields: [barberId], references: [id], onDelete: Cascade, map: "commission_rate_history_ibfk_1")
+  admins              Admin?                                 @relation(fields: [changedByAdminId], references: [id], map: "commission_rate_history_ibfk_2")
+
+  @@index([changedByAdminId], map: "changed_by_admin_id")
+  @@index([barberId], map: "commission_rate_history_barber_id")
+  @@index([effectiveFrom], map: "commission_rate_history_effective_from")
+
+  @@map("commission_rate_history")
+}
+
+model ContactMessage {
+  id              Int                     @id @default(autoincrement()) @db.UnsignedInt
+  name            String                  @db.VarChar(150)
+  phone           String?                 @db.VarChar(30)
+  email           String                  @db.VarChar(255)
+  subject         String?                 @db.VarChar(200)
+  message         String                  @db.Text
+  isRead         Boolean@default(false) @map("is_read")
+  createdAt      DateTime?@db.DateTime(0) @map("created_at")
+  updatedAt      DateTime?@db.DateTime(0) @map("updated_at")
+  status          ContactMessageStatus @default(NEW)
+  repliedAt      DateTime?@db.DateTime(0) @map("replied_at")
+  archivedAt     DateTime?@db.DateTime(0) @map("archived_at")
+  contact_replies ContactReply[]
+
+  @@index([isRead], map: "contact_messages_is_read")
+
+  @@map("contact_messages")
+}
+
+model ContactReply {
+  id                  Int                    @id @default(autoincrement()) @db.UnsignedInt
+  contactMessageId  Int@db.UnsignedInt @map("contact_message_id")
+  adminId            Int?@db.UnsignedInt @map("admin_id")
+  adminName          String?@db.VarChar(100) @map("admin_name")
+  recipientEmail     String@db.VarChar(255) @map("recipient_email")
+  subject             String                 @db.VarChar(250)
+  message             String                 @db.Text
+  status              ContactReplyStatus @default(PENDING)
+  sentAt             DateTime?@db.DateTime(0) @map("sent_at")
+  createdAt          DateTime?@db.DateTime(0) @map("created_at")
+  updatedAt          DateTime?@db.DateTime(0) @map("updated_at")
+  providerMessageId String?@db.VarChar(255) @map("provider_message_id")
+  contact_messages    ContactMessage       @relation(fields: [contactMessageId], references: [id], onDelete: Cascade, map: "contact_replies_ibfk_17")
+  admins              Admin?                @relation(fields: [adminId], references: [id], map: "contact_replies_ibfk_18")
+
+  @@index([adminId], map: "admin_id")
+  @@index([contactMessageId], map: "contact_replies_contact_message_id")
+
+  @@map("contact_replies")
+}
+
+model CustomerOtp {
+  id          Int                   @id @default(autoincrement()) @db.UnsignedInt
+  phone       String                @db.VarChar(30)
+  purpose     CustomerOtpPurpose
+  codeHash   String@db.VarChar(255) @map("code_hash")
+  attempts    Int                   @default(0) @db.UnsignedInt
+  consumedAt DateTime?@db.DateTime(0) @map("consumed_at")
+  expiresAt  DateTime@db.DateTime(0) @map("expires_at")
+  createdAt  DateTime?@db.DateTime(0) @map("created_at")
+  updatedAt  DateTime?@db.DateTime(0) @map("updated_at")
+
+  @@index([phone, purpose], map: "customer_otps_phone_purpose")
+
+  @@map("customer_otps")
+}
+
+model Customer {
+  id                  Int            @id @default(autoincrement()) @db.UnsignedInt
+  fullName           String@db.VarChar(150) @map("full_name")
+  phone               String         @db.VarChar(30)
+  email               String?        @db.VarChar(255)
+  createdAt          DateTime?@db.DateTime(0) @map("created_at")
+  updatedAt          DateTime?@db.DateTime(0) @map("updated_at")
+  customerCode       String?@unique(map: "customer_code") @db.VarChar(12) @map("customer_code")
+  passwordHash       String?@db.VarChar(255) @map("password_hash")
+  preferredBarberId Int?@db.UnsignedInt @map("preferred_barber_id")
+  favoriteServiceId Int?@db.UnsignedInt @map("favorite_service_id")
+  avatarUrl          String?@db.VarChar(500) @map("avatar_url")
+  reminderOptIn     Boolean@default(true) @map("reminder_opt_in")
+  isActive           Boolean@default(true) @map("is_active")
+  lastLoginAt       DateTime?@db.DateTime(0) @map("last_login_at")
+  googleSub          String?@unique(map: "customers_google_sub") @db.VarChar(255) @map("google_sub")
+  phoneVerified      Boolean@default(true) @map("phone_verified")
+  appointments        Appointment[]
+  payments            Payment[]
+
+  @@index([email], map: "customers_email")
+  @@index([phone], map: "customers_phone")
+
+  @@map("customers")
+}
+
+model Gallery {
+  id         Int              @id @default(autoincrement()) @db.UnsignedInt
+  title      String           @db.VarChar(200)
+  image      String           @db.VarChar(500)
+  category   GalleryCategory @default(HAIRCUT)
+  barberId  Int?@db.UnsignedInt @map("barber_id")
+  createdAt DateTime?@db.DateTime(0) @map("created_at")
+  updatedAt DateTime?@db.DateTime(0) @map("updated_at")
+  barbers    Barber?         @relation(fields: [barberId], references: [id], map: "gallery_ibfk_1")
+
+  @@index([barberId], map: "gallery_barber_id")
+  @@index([category], map: "gallery_category")
+
+  @@map("gallery")
+}
+
+model PaymentSetting {
+  id                      Int       @id @default(autoincrement()) @db.UnsignedInt
+  shopName               String@db.VarChar(150) @map("shop_name")
+  shopAddress            String?@db.VarChar(300) @map("shop_address")
+  shopPhone              String?@db.VarChar(30) @map("shop_phone")
+  shopLogo               String?@db.VarChar(500) @map("shop_logo")
+  bankName               String?@db.VarChar(100) @map("bank_name")
+  accountName            String?@db.VarChar(150) @map("account_name")
+  accountNumber          String?@db.VarChar(30) @map("account_number")
+  opayAccountName       String?@db.VarChar(150) @map("opay_account_name")
+  opayAccountNumber     String?@db.VarChar(30) @map("opay_account_number")
+  paymentInstructions    String?@db.Text @map("payment_instructions")
+  enabledPaymentMethods String@db.LongText @map("enabled_payment_methods")
+  minAmount              Decimal@default(0.00) @db.Decimal(10, 2) @map("min_amount")
+  fullPaymentRequired   Boolean@default(true) @map("full_payment_required")
+  receiptRequired        Boolean@default(true) @map("receipt_required")
+  createdAt              DateTime?@db.DateTime(0) @map("created_at")
+  updatedAt              DateTime?@db.DateTime(0) @map("updated_at")
+
+  @@map("payment_settings")
+}
+
+model Payment {
+  id                    Int                      @id @default(autoincrement()) @db.UnsignedInt
+  appointmentId        Int@unique(map: "appointment_id") @db.UnsignedInt @map("appointment_id")
+  customerId           Int?@db.UnsignedInt @map("customer_id")
+  amount                Decimal                  @default(0.00) @db.Decimal(10, 2)
+  paymentMethod        PaymentMethod? @map("payment_method")
+  transactionReference String? @map("transaction_reference")
+  paymentDate          DateTime?@db.Date @map("payment_date")
+  receiptUrl           String?@db.VarChar(500) @map("receipt_url")
+  receiptPublicId     String?@db.VarChar(500) @map("receipt_public_id")
+  note                  String?                  @db.Text
+  status                PaymentStatus          @default(UNPAID)
+  rejectionReason      String?@db.Text @map("rejection_reason")
+  verifiedBy           Int?@db.UnsignedInt @map("verified_by")
+  verifiedAt           DateTime?@db.DateTime(0) @map("verified_at")
+  accessToken          String@unique(map: "access_token") @db.VarChar(64) @map("access_token")
+  createdAt            DateTime?@db.DateTime(0) @map("created_at")
+  updatedAt            DateTime?@db.DateTime(0) @map("updated_at")
+  providerRef          String?@db.VarChar(64) @map("provider_ref")
+  appointments          Appointment             @relation(fields: [appointmentId], references: [id], onDelete: Cascade, map: "payments_ibfk_23")
+  customers             Customer?               @relation(fields: [customerId], references: [id], map: "payments_ibfk_24")
+
+  @@index([customerId], map: "customer_id")
+  @@index([appointmentId], map: "payments_appointment_id")
+  @@index([paymentDate], map: "payments_payment_date")
+  @@index([paymentMethod], map: "payments_payment_method")
+  @@index([status], map: "payments_status")
+
+  @@map("payments")
+}
+
+model Review {
+  id             Int       @id @default(autoincrement()) @db.UnsignedInt
+  customerName  String@db.VarChar(150) @map("customer_name")
+  customerImage String?@db.VarChar(500) @map("customer_image")
+  rating         Int       @db.UnsignedTinyInt
+  comment        String    @db.Text
+  isApproved    Boolean@default(false) @map("is_approved")
+  createdAt     DateTime?@db.DateTime(0) @map("created_at")
+  updatedAt     DateTime?@db.DateTime(0) @map("updated_at")
+  status         String    @default("PENDING") @db.VarChar(10)
+  customerPhone String?@db.VarChar(32) @map("customer_phone")
+  customerEmail String?@db.VarChar(255) @map("customer_email")
+  serviceId     Int?@db.UnsignedInt @map("service_id")
+  serviceName   String?@db.VarChar(150) @map("service_name")
+  barberId      Int?@db.UnsignedInt @map("barber_id")
+  barbers        Barber?  @relation(fields: [barberId], references: [id], map: "reviews_ibfk_1")
+
+  @@index([barberId], map: "index_reviews_barber_id")
+  @@index([status], map: "index_reviews_status")
+  @@index([barberId], map: "reviews_barber_id")
+  @@index([isApproved], map: "reviews_is_approved")
+  @@index([status], map: "reviews_status")
+
+  @@map("reviews")
+}
+
+/// This model or at least one of its fields has comments in the database, and requires an additional setup for migrations: Read more: https://pris.ly/d/database-comments
+model Service {
+  id                Int                 @id @default(autoincrement()) @db.UnsignedInt
+  name              String              @db.VarChar(150)
+  slug              String              @unique(map: "slug") @db.VarChar(160)
+  description       String?             @db.Text
+  price             Decimal             @db.Decimal(10, 2)
+  duration          Int                 @db.UnsignedInt
+  image             String?             @db.VarChar(500)
+  category          String              @default("HAIRCUTS") @db.VarChar(50)
+  isActive         Boolean@default(true) @map("is_active")
+  createdAt        DateTime?@db.DateTime(0) @map("created_at")
+  updatedAt        DateTime?@db.DateTime(0) @map("updated_at")
+  appointments      Appointment[]
+  barber_services   BarberService[]
+  checkout_sessions CheckoutSession[]
+
+  @@index([category], map: "services_category")
+  @@index([isActive], map: "services_is_active")
+  @@index([slug], map: "services_slug")
+
+  @@map("services")
+}
+
+enum BarberNotificationType {
+  ASSIGNMENT
+  EARNING
+  APPOINTMENT
+  SYSTEM
+}
+
+enum RateHistoryCommissionType {
+  PERCENTAGE
+  FIXED
+}
+
+enum CustomerOtpPurpose {
+  LOGIN
+  REGISTER
+}
+
+enum BarberTypeSnapshot {
+  INTERNAL
+  EXTERNAL
+}
+
+enum GalleryCategory {
+  HAIRCUT
+  FADE
+  BEARD
+  STYLING
+  KIDS
+  SALON
+}
+
+enum BarberAssignmentHistoryAction {
+  ASSIGNED
+  REASSIGNED
+  REMOVED
+}
+
+enum CommissionType {
+  PERCENTAGE
+  FIXED
+}
+
+enum PaymentMethod {
+  OPAY
+  BANK_TRANSFER
+  CASH
+  OTHER
+  ONLINE
+}
+
+enum ContactReplyStatus {
+  PENDING
+  SENT
+  FAILED
+}
+
+enum AppointmentStatus {
+  PAYMENT_REQUIRED
+  PAYMENT_SUBMITTED
+  PAYMENT_VERIFIED
+  PAYMENT_REJECTED
+  READY_FOR_SERVICE
+  IN_PROGRESS
+  COMPLETED
+  CANCELLED
+}
+
+enum BarberEarningStatus {
+  PENDING
+  EARNED
+  PAID
+  CANCELLED
+}
+
+enum ContactMessageStatus {
+  NEW
+  READ
+  REPLIED
+  ARCHIVED
+}
+
+enum PaymentStatus {
+  UNPAID
+  PENDING_VERIFICATION
+  PAID
+  REJECTED
+  REFUNDED
+  CANCELLED
+}
+
+enum CheckoutSessionStatus {
+  OPEN
+  AWAITING_PAYMENT
+  CONVERTED
+  EXPIRED
+}
+
+enum BarberType {
+  INTERNAL
+  EXTERNAL
+}
+
+enum BarberCommissionType {
+  PERCENTAGE
+  FIXED
+}
+
+enum CheckoutPaymentMethod {
+  OPAY
+  BANK_TRANSFER
+  CASH
+  OTHER
+  ONLINE
+}

@@ -1,7 +1,8 @@
 import type { NextFunction, Request, Response } from 'express'
 import jwt from 'jsonwebtoken'
 import { env } from '../config/env'
-import { Barber } from '../models'
+import { prisma } from '../config/database'
+import type { Barber } from '@prisma/client'
 import { ForbiddenError, UnauthorizedError } from '../utils/errors'
 import type { AuthPayload } from './auth'
 
@@ -11,10 +12,6 @@ declare module 'express-serve-static-core' {
   }
 }
 
-/**
- * Guards the Barber Portal API. Validates a `BARBER`-role JWT and loads the
- * barber, enforcing that their profile is active AND portal access is enabled.
- */
 export async function requireBarber(req: Request, _res: Response, next: NextFunction): Promise<void> {
   try {
     const authHeader = req.headers.authorization
@@ -36,7 +33,7 @@ export async function requireBarber(req: Request, _res: Response, next: NextFunc
       throw new ForbiddenError('This token is not valid for the barber portal.')
     }
 
-    const barber = await Barber.findByPk(payload.sub)
+    const barber = await prisma.barber.findUnique({ where: { id: payload.sub } })
     if (!barber || !barber.isActive) {
       throw new UnauthorizedError('Barber account no longer exists or has been deactivated.')
     }

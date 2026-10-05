@@ -1,5 +1,5 @@
-import { Op } from 'sequelize'
-import { Appointment, Service } from '../models'
+import { prisma } from '../config/database'
+import type { Prisma, Service as ServiceModel } from '@prisma/client'
 import { ConflictError, NotFoundError } from '../utils/errors'
 import { slugify } from '../utils/slug'
 import { getPagination } from '../utils/response'
@@ -16,17 +16,17 @@ export interface ServicePublic {
   image: string | null
   category: string
   isActive: boolean
-  createdAt: Date
-  updatedAt: Date
+  createdAt: Date | null
+  updatedAt: Date | null
 }
 
-export function serializeService(service: Service): ServicePublic {
+export function serializeService(service: ServiceModel): ServicePublic {
   return {
     id: service.id,
     name: service.name,
     slug: service.slug,
     description: service.description,
-    price: Number(service.price),
+    price: service.price.toNumber(),
     duration: service.duration,
     image: service.image,
     category: service.category,
@@ -41,11 +41,10 @@ async function uniqueSlug(name: string, excludeId?: number): Promise<string> {
   let candidate = base
   let counter = 2
 
-  while (true) {
-    const existing = await Service.findOne({
-      where: excludeId
-        ? { slug: candidate, id: { [Op.not]: excludeId } }
-        : { slug: candidate },
+  for (;;) {
+    const existing = await prisma.service.findFirst({
+      where: excludeId ? { slug: candidate, id: { not: excludeId } } : { slug: candidate },
+      select: { id: true },
     })
     if (!existing) return candidate
     candidate = `${base}-${counter}`
@@ -55,7 +54,7 @@ async function uniqueSlug(name: string, excludeId?: number): Promise<string> {
 
 export async function createService(input: CreateServiceInput): Promise<ServicePublic> {
   const slug = await uniqueSlug(input.name)
-  const service = await Service.create({ ...input, slug })
+  const service = await prisma.service.create({ data: { ...input, slug } })
   return serializeService(service)
 }
 
@@ -64,8 +63,7 @@ export async function listServices(
   includeInactive = false,
 ): Promise<Paged<ServicePublic>> {
   const { page, perPage, offset, limit } = getPagination(query as Record<string, unknown>)
-
-  const where = {
+  const where: Prisma.ServiceWhereInput = {
     ...(query.category ? { category: query.category } : {}),
     ...(!includeInactive
       ? { isActive: true }
@@ -74,32 +72,25 @@ export async function listServices(
         : {}),
     ...(query.search
       ? {
-          [Op.or]: [
-            { name: { [Op.like]: `%${query.search}%` } },
-            { slug: { [Op.like]: `%${query.search}%` } },
-            { description: { [Op.like]: `%${query.search}%` } },
+          OR: [
+            { name: { contains: query.search } },
+            { slug: { contains: query.search } },
+            { description: { contains: query.search } },
           ],
         }
       : {}),
   }
 
-  const { rows, count } = await Service.findAndCountAll({
-    where,
-    order: [['name', 'ASC']],
-    offset,
-    limit,
-  })
+  const [rows, total] = await prisma.$transaction([
+    prisma.service.findMany({ where, orderBy: { name: 'asc' }, skip: offset, take: limit }),
+    prisma.service.count({ where }),
+  ])
 
-  return {
-    items: rows.map(serializeService),
-    total: count,
-    page,
-    perPage,
-  }
+  return { items: rows.map(serializeService), total, page, perPage }
 }
 
 export async function getServiceById(id: number): Promise<ServicePublic> {
-  const service = await Service.findByPk(id)
+  const service = await prisma.service.findUnique({ where: { id } })
   if (!service) {
     throw new NotFoundError('Service not found.')
   }
@@ -107,32 +98,34 @@ export async function getServiceById(id: number): Promise<ServicePublic> {
 }
 
 export async function updateService(id: number, input: UpdateServiceInput): Promise<ServicePublic> {
-  const service = await Service.findByPk(id)
+  const service = await prisma.service.findUnique({ where: { id } })
   if (!service) {
     throw new NotFoundError('Service not found.')
   }
 
-  const changes: Partial<Service> = { ...input }
-  if (input.name && input.name !== service.name) {
-    changes.slug = await uniqueSlug(input.name, id)
-  }
-
-  await service.update(changes)
-  return serializeService(service)
+  const slug = input.name && input.name !== service.name ? await uniqueSlug(input.name, id) : undefined
+  const updated = await prisma.service.update({
+    where: { id },
+    data: {
+      ...input,
+      ...(slug ? { slug } : {}),
+    },
+  })
+  return serializeService(updated)
 }
 
 export async function deleteService(id: number): Promise<void> {
-  const service = await Service.findByPk(id)
+  const service = await prisma.service.findUnique({ where: { id }, select: { id: true } })
   if (!service) {
     throw new NotFoundError('Service not found.')
   }
 
-  const appointmentCount = await Appointment.count({ where: { serviceId: id } })
+  const appointmentCount = await prisma.appointment.count({ where: { serviceId: id } })
   if (appointmentCount > 0) {
     throw new ConflictError(
       'This service has appointments attached. Deactivate it instead of deleting.',
     )
   }
 
-  await service.destroy()
+  await prisma.service.delete({ where: { id } })
 }

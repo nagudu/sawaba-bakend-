@@ -1,6 +1,6 @@
-node_modules/
-dist/
+# Prisma generated client — produced by `npm run db:generate` (also runs on postinstall)
+src/generated/prisma/
+node_modules
 .env
-*.log
-.DS_Store
-Thumbs.db
+.env.*
+!.env.example

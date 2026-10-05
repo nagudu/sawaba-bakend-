@@ -6,9 +6,10 @@ import {
   type InferCreationAttributes,
 } from 'sequelize'
 import { sequelize } from '../config/database'
+import { REVIEW_STATUSES, type ReviewStatus } from '../types'
 
-export const REVIEW_STATUSES = ['PENDING', 'APPROVED', 'REJECTED'] as const
-export type ReviewStatus = (typeof REVIEW_STATUSES)[number]
+export { REVIEW_STATUSES }
+export type { ReviewStatus }
 
 export class Review extends Model<InferAttributes<Review>, InferCreationAttributes<Review>> {
   declare id: CreationOptional<number>

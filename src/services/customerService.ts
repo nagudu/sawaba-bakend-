@@ -1,5 +1,5 @@
-import { Op, type Transaction } from 'sequelize'
-import { Appointment, Customer, Payment, Service, Barber } from '../models'
+import { prisma } from '../config/database'
+import type { Customer, Prisma } from '@prisma/client'
 import { normalizeNigerianPhone, isPlausiblePhone } from '../utils/phone'
 import { UnprocessableError } from '../utils/errors'
 
@@ -9,115 +9,145 @@ export interface CustomerInput {
   email?: string | null
 }
 
-/** Normalizes input and looks up (or creates) the single customer per phone. */
-export async function findOrCreateCustomer(input: CustomerInput, t?: Transaction): Promise<Customer> {
+export async function findOrCreateCustomer(
+  input: CustomerInput,
+  tx?: Prisma.TransactionClient,
+): Promise<Customer> {
+  const db = tx ?? prisma
   const phone = normalizeNigerianPhone(input.phone)
   if (!isPlausiblePhone(phone)) {
     throw new UnprocessableError('Provide a valid phone number.')
   }
 
-  const existing = await Customer.findOne({ where: { phone }, ...(t ? { transaction: t } : {}) })
+  const existing = await db.customer.findFirst({ where: { phone } })
   if (existing) {
-    // Keep the appointment copy in sync with the most recent spelling of the
-    // customer's name/email without overwriting a richer stored value.
-    const patch: Record<string, string> = {}
+    const patch: { fullName?: string; email?: string } = {}
     if (input.fullName && input.fullName !== existing.fullName) patch.fullName = input.fullName
     if (input.email && !existing.email) patch.email = input.email
-    if (Object.keys(patch).length) await existing.update(patch, { transaction: t })
+    if (Object.keys(patch).length > 0) {
+      return db.customer.update({
+        where: { id: existing.id },
+        data: patch,
+      })
+    }
     return existing
   }
 
-  return Customer.create(
-    {
+  return db.customer.create({
+    data: {
       fullName: input.fullName,
       phone,
       email: input.email ?? null,
     },
-    t ? { transaction: t } : undefined,
-  )
+  })
 }
 
-/** Stable display code CUS-0001 — a reference, never a security credential. */
-export async function ensureCustomerCode(customer: Customer): Promise<string> {
+export async function ensureCustomerCode(
+  customer: Customer,
+  tx?: Prisma.TransactionClient,
+): Promise<string> {
+  const db = tx ?? prisma
   if (customer.customerCode) return customer.customerCode
   const padded = String(customer.id).padStart(4, '0')
   const candidate = `CUS-${padded}`
-  if (!(await Customer.findOne({ where: { customerCode: candidate } }))) {
-    await customer.update({ customerCode: candidate })
+  const existing = await db.customer.findUnique({ where: { customerCode: candidate } })
+  if (!existing) {
+    await db.customer.update({
+      where: { id: customer.id },
+      data: { customerCode: candidate },
+    })
     return candidate
   }
-  // Collision fallback (imported data etc.) — keep counting up.
+
   for (let n = customer.id + 1; ; n += 1) {
     const next = `CUS-${String(n).padStart(4, '0')}`
-    if (!(await Customer.findOne({ where: { customerCode: next } }))) {
-      await customer.update({ customerCode: next })
+    const taken = await db.customer.findUnique({ where: { customerCode: next } })
+    if (!taken) {
+      await db.customer.update({
+        where: { id: customer.id },
+        data: { customerCode: next },
+      })
       return next
     }
   }
 }
 
-/** Backfills customerCode for every legacy customer lacking one. Idempotent. */
 export async function backfillCustomerCodes(): Promise<number> {
-  const missing = await Customer.findAll({ where: { customerCode: null } })
+  const missing = await prisma.customer.findMany({ where: { customerCode: null } })
   for (const customer of missing) {
     await ensureCustomerCode(customer)
   }
   return missing.length
 }
 
-/** Merges appointment/payment phone copies into normalized customer accounts. Idempotent. */
 export async function backfillCustomerLinks(): Promise<{ customers: number; appointments: number }> {
-  // 1. normalize every stored customer phone
-  const customers = await Customer.findAll()
+  const customers = await prisma.customer.findMany()
   const seen = new Map<string, number>()
   let merged = 0
+
   for (const customer of customers) {
     const phone = normalizeNigerianPhone(customer.phone)
     if (phone !== customer.phone || seen.has(phone)) {
       const dup = seen.get(phone)
       if (dup) {
-        // Two rows collapsed onto the same normalized phone: move appointments
-        // and payments to the older account and retire the duplicate.
-        await Appointment.update({ customerId: dup }, { where: { customerId: customer.id } })
-        await Payment.update({ customerId: dup }, { where: { customerId: customer.id } })
-        await customer.destroy()
+        await prisma.appointment.updateMany({
+          where: { customerId: customer.id },
+          data: { customerId: dup },
+        })
+        await prisma.payment.updateMany({
+          where: { customerId: customer.id },
+          data: { customerId: dup },
+        })
+        await prisma.customer.delete({ where: { id: customer.id } })
         merged += 1
         continue
       }
-      await customer.update({ phone })
+      await prisma.customer.update({
+        where: { id: customer.id },
+        data: { phone },
+      })
     }
     seen.set(phone, customer.id)
   }
 
-  // 2. link appointments that reference a known phone but have no customerId
-  const unlinked = await Appointment.findAll({
+  const unlinked = await prisma.appointment.findMany({
     where: { customerId: null },
-    attributes: ['id', 'customerName', 'customerPhone', 'customerEmail'],
+    select: { id: true, customerName: true, customerPhone: true, customerEmail: true },
   })
+
   for (const appointment of unlinked) {
     const phone = normalizeNigerianPhone(appointment.customerPhone)
-    const customer =
-      (await Customer.findOne({ where: { phone } })) ??
-      (await Customer.create({
-        fullName: appointment.customerName,
-        phone,
-        email: appointment.customerEmail ?? null,
-      }))
-    await appointment.update({
-      customerId: customer.id,
-      customerPhone: phone,
-      customerName: appointment.customerName || customer.fullName,
+    let customer = await prisma.customer.findFirst({ where: { phone } })
+    if (!customer) {
+      customer = await prisma.customer.create({
+        data: {
+          fullName: appointment.customerName,
+          phone,
+          email: appointment.customerEmail ?? null,
+        },
+      })
+    }
+    await prisma.appointment.update({
+      where: { id: appointment.id },
+      data: {
+        customerId: customer.id,
+        customerPhone: phone,
+        customerName: appointment.customerName || customer.fullName,
+      },
     })
   }
 
-  // 3. same for payments without a customer link
-  const orphanPayments = await Payment.findAll({
+  const orphanPayments = await prisma.payment.findMany({
     where: { customerId: null },
-    include: [{ model: Appointment, as: 'appointment', attributes: ['id', 'customerId'] }],
+    include: { appointment: { select: { id: true, customerId: true } } },
   })
+
   for (const payment of orphanPayments) {
     if (payment.appointment?.customerId) {
-      await payment.update({ customerId: payment.appointment.customerId })
+      await prisma.payment.update({
+        where: { id: payment.id },
+        data: { customerId: payment.appointment.customerId },
+      })
     }
   }
 
@@ -134,28 +164,27 @@ export interface CustomerStats {
 }
 
 export async function getCustomerStats(customerId: number): Promise<CustomerStats> {
-  const appointments = await Appointment.findAll({
+  const appointments = await prisma.appointment.findMany({
     where: { customerId },
-    attributes: ['status'],
-    include: [
-      {
-        model: Payment,
-        as: 'payment',
-        attributes: ['status', 'amount'],
-        required: false,
+    select: {
+      status: true,
+      payment: {
+        select: { status: true, amount: true },
       },
-    ],
+    },
   })
 
   let completed = 0
   let cancelled = 0
   let pending = 0
   let totalSpent = 0
+
   for (const appointment of appointments) {
     const status = appointment.status as string
     if (status === 'COMPLETED') completed += 1
     else if (status === 'CANCELLED') cancelled += 1
     else pending += 1
+
     if (appointment.payment?.status === 'PAID') {
       totalSpent += Number(appointment.payment.amount)
     }
@@ -181,43 +210,51 @@ export async function listCustomers(query: {
   const search = query.search?.trim()
   const normalized = search ? normalizeNigerianPhone(search) : ''
 
-  const where = {
-    ...(query.includeInactive ? {} : { isActive: true }),
-    ...(search
-      ? {
-          [Op.or]: [
-            { fullName: { [Op.like]: `%${search}%` } },
-            { phone: { [Op.like]: `%${search}%` } },
-            { email: { [Op.like]: `%${search}%` } },
-            { customerCode: { [Op.like]: `%${search}%` } },
-            // Digit-only search matches normalized phone regardless of input format.
-            ...(normalized.length >= 3 ? [{ phone: { [Op.like]: `%${normalized}%` } }] : []),
-          ],
-        }
-      : {}),
+  const where: {
+    isActive?: boolean
+    OR?: Array<{
+      fullName?: { contains: string }
+      phone?: { contains: string }
+      email?: { contains: string }
+      customerCode?: { contains: string }
+    }>
+  } = {}
+
+  if (!query.includeInactive) {
+    where.isActive = true
   }
 
-  const { rows, count } = await Customer.findAndCountAll({
-    where,
-    order: [['createdAt', 'DESC']],
-    offset: (page - 1) * perPage,
-    limit: perPage,
-  })
+  if (search) {
+    where.OR = [
+      { fullName: { contains: search } },
+      { phone: { contains: search } },
+      { email: { contains: search } },
+      { customerCode: { contains: search } },
+      ...(normalized.length >= 3 ? [{ phone: { contains: normalized } }] : []),
+    ]
+  }
+
+  const [rows, count] = await Promise.all([
+    prisma.customer.findMany({
+      where,
+      orderBy: { createdAt: 'desc' },
+      skip: (page - 1) * perPage,
+      take: perPage,
+    }),
+    prisma.customer.count({ where }),
+  ])
 
   const items = await Promise.all(
     rows.map(async (customer) => {
       const stats = await getCustomerStats(customer.id)
-      const last = await Appointment.findOne({
+      const last = await prisma.appointment.findFirst({
         where: { customerId: customer.id },
-        order: [
-          ['appointmentDate', 'DESC'],
-          ['appointmentTime', 'DESC'],
-        ],
-        include: [
-          { model: Payment, as: 'payment', attributes: ['status'] },
-          { model: Service, as: 'service', attributes: ['id', 'name'] },
-          { model: Barber, as: 'barber', attributes: ['id', 'name'] },
-        ],
+        orderBy: [{ appointmentDate: 'desc' }, { appointmentTime: 'desc' }],
+        include: {
+          payment: { select: { status: true } },
+          service: { select: { id: true, name: true } },
+          barber: { select: { id: true, name: true } },
+        },
       })
       return {
         id: customer.id,

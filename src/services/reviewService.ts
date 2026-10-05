@@ -1,9 +1,9 @@
-import { Op } from 'sequelize'
-import { Review, type ReviewStatus } from '../models'
+import { prisma } from '../config/database'
+import type { Prisma, Review as ReviewModel, ReviewStatus as PrismaReviewStatus } from '@prisma/client'
 import { NotFoundError } from '../utils/errors'
 import { getPagination } from '../utils/response'
 import type { CreateReviewInput, UpdateReviewInput } from '../validators/review'
-import type { Paged } from '../types'
+import type { Paged, ReviewStatus } from '../types'
 
 export interface ReviewPublic {
   id: number
@@ -18,11 +18,11 @@ export interface ReviewPublic {
   comment: string
   status: ReviewStatus
   isApproved: boolean
-  createdAt: Date
-  updatedAt: Date
+  createdAt: Date | null
+  updatedAt: Date | null
 }
 
-function serializeReview(review: Review): ReviewPublic {
+function serializeReview(review: ReviewModel): ReviewPublic {
   return {
     id: review.id,
     customerName: review.customerName,
@@ -32,9 +32,9 @@ function serializeReview(review: Review): ReviewPublic {
     serviceId: review.serviceId ?? null,
     serviceName: review.serviceName ?? null,
     barberId: review.barberId ?? null,
-    rating: Number(review.rating),
+    rating: review.rating,
     comment: review.comment,
-    status: review.status,
+    status: review.status as ReviewStatus,
     isApproved: review.status === 'APPROVED',
     createdAt: review.createdAt,
     updatedAt: review.updatedAt,
@@ -42,18 +42,20 @@ function serializeReview(review: Review): ReviewPublic {
 }
 
 export async function createReview(input: CreateReviewInput): Promise<ReviewPublic> {
-  const review = await Review.create({
-    customerName: input.customerName,
-    customerPhone: input.customerPhone ?? null,
-    customerEmail: input.customerEmail ?? null,
-    customerImage: input.customerImage ?? null,
-    serviceId: input.serviceId ?? null,
-    serviceName: input.serviceName ?? null,
-    barberId: input.barberId ?? null,
-    rating: input.rating,
-    comment: input.comment,
-    status: 'PENDING',
-    isApproved: false,
+  const review = await prisma.review.create({
+    data: {
+      customerName: input.customerName,
+      customerPhone: input.customerPhone ?? null,
+      customerEmail: input.customerEmail ?? null,
+      customerImage: input.customerImage ?? null,
+      serviceId: input.serviceId ?? null,
+      serviceName: input.serviceName ?? null,
+      barberId: input.barberId ?? null,
+      rating: input.rating,
+      comment: input.comment,
+      status: 'PENDING',
+      isApproved: false,
+    },
   })
   return serializeReview(review)
 }
@@ -67,81 +69,90 @@ export async function listReviews(query: {
   perPage?: number
 }): Promise<Paged<ReviewPublic>> {
   const { page, perPage, offset, limit } = getPagination(query)
+  const where: Prisma.ReviewWhereInput = {}
 
-  const where: { [key: PropertyKey]: unknown } = {}
   if (query.status) {
-    if (query.status !== 'all') where.status = query.status
+    if (query.status !== 'all') where.status = query.status as PrismaReviewStatus
   } else if (query.approved === 'true') {
     where.status = 'APPROVED'
   } else if (query.approved === 'false') {
     where.status = 'PENDING'
   }
 
-  // Filter by barber when the validated `barberId` query param is present —
-  // used by barber profiles to fetch only their own approved reviews.
   if (query.barberId) {
     where.barberId = query.barberId
   }
 
   if (query.search) {
-    where[Op.or] = [
-      { customerName: { [Op.like]: `%${query.search}%` } },
-      { comment: { [Op.like]: `%${query.search}%` } },
-      { customerPhone: { [Op.like]: `%${query.search}%` } },
-      { customerEmail: { [Op.like]: `%${query.search}%` } },
-      { serviceName: { [Op.like]: `%${query.search}%` } },
+    where.OR = [
+      { customerName: { contains: query.search } },
+      { comment: { contains: query.search } },
+      { customerPhone: { contains: query.search } },
+      { customerEmail: { contains: query.search } },
+      { serviceName: { contains: query.search } },
     ]
   }
 
-  const { rows, count } = await Review.findAndCountAll({
-    where,
-    order: [['createdAt', 'DESC']],
-    offset,
-    limit,
-  })
+  const [rows, total] = await prisma.$transaction([
+    prisma.review.findMany({
+      where,
+      orderBy: { createdAt: 'desc' },
+      skip: offset,
+      take: limit,
+    }),
+    prisma.review.count({ where }),
+  ])
 
-  return { items: rows.map(serializeReview), total: count, page, perPage }
+  return { items: rows.map(serializeReview), total, page, perPage }
 }
 
 export async function updateReview(id: number, input: UpdateReviewInput): Promise<ReviewPublic> {
-  const review = await Review.findByPk(id)
-  if (!review) {
+  const existing = await prisma.review.findUnique({ where: { id }, select: { id: true } })
+  if (!existing) {
     throw new NotFoundError('Review not found.')
   }
 
-  const patch: Record<string, unknown> = { ...input }
+  const patch: Prisma.ReviewUpdateInput = { ...input }
   if (input.status !== undefined) {
+    patch.status = input.status as PrismaReviewStatus
     patch.isApproved = input.status === 'APPROVED'
   } else if (input.isApproved !== undefined) {
     patch.status = input.isApproved ? 'APPROVED' : 'PENDING'
+    patch.isApproved = input.isApproved
   }
 
-  await review.update(patch)
-  return serializeReview(review)
+  const updated = await prisma.review.update({ where: { id }, data: patch })
+  return serializeReview(updated)
 }
 
 export async function deleteReview(id: number): Promise<void> {
-  const review = await Review.findByPk(id)
-  if (!review) {
+  const existing = await prisma.review.findUnique({ where: { id }, select: { id: true } })
+  if (!existing) {
     throw new NotFoundError('Review not found.')
   }
-  await review.destroy()
+  await prisma.review.delete({ where: { id } })
 }
 
 export async function approveReview(id: number): Promise<ReviewPublic> {
-  const review = await Review.findByPk(id)
-  if (!review) {
+  const existing = await prisma.review.findUnique({ where: { id }, select: { id: true } })
+  if (!existing) {
     throw new NotFoundError('Review not found.')
   }
-  await review.update({ status: 'APPROVED', isApproved: true })
-  return serializeReview(review)
+  const updated = await prisma.review.update({
+    where: { id },
+    data: { status: 'APPROVED', isApproved: true },
+  })
+  return serializeReview(updated)
 }
 
 export async function rejectReview(id: number): Promise<ReviewPublic> {
-  const review = await Review.findByPk(id)
-  if (!review) {
+  const existing = await prisma.review.findUnique({ where: { id }, select: { id: true } })
+  if (!existing) {
     throw new NotFoundError('Review not found.')
   }
-  await review.update({ status: 'REJECTED', isApproved: false })
-  return serializeReview(review)
+  const updated = await prisma.review.update({
+    where: { id },
+    data: { status: 'REJECTED', isApproved: false },
+  })
+  return serializeReview(updated)
 }

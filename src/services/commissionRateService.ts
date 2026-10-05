@@ -1,8 +1,7 @@
-import { Op, type WhereOptions } from 'sequelize'
-import { Admin, Barber, CommissionRateHistory } from '../models'
+import { prisma } from '../config/database'
+import type { Barber, CommissionRateHistory, CommissionType } from '@prisma/client'
 import { NotFoundError, UnprocessableError } from '../utils/errors'
 import { getPagination } from '../utils/response'
-import type { CommissionType } from '../models/Barber'
 import type { Paged } from '../types'
 
 export interface CommissionRateRow {
@@ -69,22 +68,33 @@ export async function listCommissionRates(
   query: CommissionRateSearchInput,
 ): Promise<Paged<CommissionRateRow>> {
   const { page, perPage, offset, limit } = getPagination(query as unknown as Record<string, unknown>)
-  const where: WhereOptions = {}
+  const where: {
+    commissionType?: CommissionType
+    OR?: Array<{
+      name?: { contains: string }
+      location?: { contains: string }
+    }>
+  } = {}
+
   if (query.commissionType) where.commissionType = query.commissionType
   if (query.search) {
-    Object.assign(where, {
-      [Op.or]: [
-        { name: { [Op.like]: `%${query.search}%` } },
-        { location: { [Op.like]: `%${query.search}%` } },
-      ],
-    })
+    const search = query.search
+    where.OR = [
+      { name: { contains: search } },
+      { location: { contains: search } },
+    ]
   }
-  const { rows, count } = await Barber.findAndCountAll({
-    where,
-    order: [['name', 'ASC']],
-    offset,
-    limit,
-  })
+
+  const [rows, count] = await Promise.all([
+    prisma.barber.findMany({
+      where,
+      orderBy: { name: 'asc' },
+      skip: offset,
+      take: limit,
+    }),
+    prisma.barber.count({ where }),
+  ])
+
   return { items: rows.map(serializeRateRow), total: count, page, perPage }
 }
 
@@ -92,24 +102,28 @@ export async function getCommissionRateHistory(
   barberId: number,
   query: { page?: unknown; perPage?: unknown },
 ): Promise<Paged<CommissionRateHistoryItem>> {
-  const barber = await Barber.findByPk(barberId)
+  const barber = await prisma.barber.findUnique({ where: { id: barberId } })
   if (!barber) throw new NotFoundError('Barber not found.')
-  const { page, perPage, offset, limit } = getPagination(query as unknown as Record<string, unknown>)
-  const { rows, count } = await CommissionRateHistory.findAndCountAll({
-    where: { barberId },
-    order: [['effectiveFrom', 'DESC']],
-    offset,
-    limit,
-  })
-  return Promise.all(rows.map(async (row) => serializeHistoryItem(row, await resolveAdminName(row.changedByAdminId)))).then(
-    (items) => ({ items, total: count, page, perPage }),
-  )
-}
 
-async function resolveAdminName(adminId: number | null | undefined): Promise<string | null> {
-  if (!adminId) return null
-  const admin = await Admin.findByPk(adminId, { attributes: ['name'] })
-  return admin?.name ?? null
+  const { page, perPage, offset, limit } = getPagination(query as unknown as Record<string, unknown>)
+
+  const [rows, count] = await Promise.all([
+    prisma.commissionRateHistory.findMany({
+      where: { barberId },
+      include: { changedBy: { select: { name: true } } },
+      orderBy: { effectiveFrom: 'desc' },
+      skip: offset,
+      take: limit,
+    }),
+    prisma.commissionRateHistory.count({ where: { barberId } }),
+  ])
+
+  return {
+    items: rows.map((row) => serializeHistoryItem(row, row.changedBy?.name ?? null)),
+    total: count,
+    page,
+    perPage,
+  }
 }
 
 export async function updateCommissionRate(
@@ -117,23 +131,34 @@ export async function updateCommissionRate(
   changedByAdminId: number,
   input: CommissionRateUpdateInput,
 ): Promise<CommissionRateRow> {
-  const barber = await Barber.findByPk(barberId)
+  const barber = await prisma.barber.findUnique({ where: { id: barberId } })
   if (!barber) throw new NotFoundError('Barber not found.')
+
   const nextType = input.commissionType ?? ((barber.commissionType as CommissionType) ?? 'PERCENTAGE')
   const nextValue = input.commissionValue ?? Number(barber.commissionValue ?? 0)
+
   if (!Number.isFinite(nextValue) || nextValue < 0) {
     throw new UnprocessableError('Commission value must be a non-negative number.')
   }
   if (nextType === 'PERCENTAGE' && nextValue > 100) {
     throw new UnprocessableError('Percentage commission must be between 0 and 100.')
   }
-  await barber.update({ commissionType: nextType, commissionValue: nextValue })
-  await CommissionRateHistory.create({
-    barberId,
-    commissionType: nextType,
-    commissionValue: nextValue,
-    effectiveFrom: input.effectiveFrom ?? new Date(),
-    changedByAdminId,
-  })
-  return serializeRateRow(barber)
+
+  const [updatedBarber] = await prisma.$transaction([
+    prisma.barber.update({
+      where: { id: barberId },
+      data: { commissionType: nextType, commissionValue: nextValue },
+    }),
+    prisma.commissionRateHistory.create({
+      data: {
+        barberId,
+        commissionType: nextType,
+        commissionValue: nextValue,
+        effectiveFrom: input.effectiveFrom ?? new Date(),
+        changedByAdminId,
+      },
+    }),
+  ])
+
+  return serializeRateRow(updatedBarber)
 }

@@ -36,3 +36,39 @@ export const createAdminSchema = z.object({
 })
 
 export type CreateAdminInput = z.infer<typeof createAdminSchema>
+
+export const forgotPasswordRequestSchema = z.object({
+  email: z.string().trim().toLowerCase().email('Provide a valid email address.'),
+  target: z.enum(['ADMIN', 'CUSTOMER']).optional().default('ADMIN'),
+})
+
+export type ForgotPasswordRequestInput = z.infer<typeof forgotPasswordRequestSchema>
+
+export const forgotPasswordVerifySchema = z.object({
+  email: z.string().trim().toLowerCase().email('Provide a valid email address.'),
+  code: z.string().trim().length(6, 'Verification code must be 6 digits.'),
+  target: z.enum(['ADMIN', 'CUSTOMER']).optional().default('ADMIN'),
+})
+
+export type ForgotPasswordVerifyInput = z.infer<typeof forgotPasswordVerifySchema>
+
+export const forgotPasswordResetSchema = z.object({
+  email: z.string().trim().toLowerCase().email('Provide a valid email address.'),
+  code: z.string().trim().length(6, 'Verification code must be 6 digits.'),
+  newPassword: z
+    .string()
+    .min(8, 'New password must be at least 8 characters.')
+    .regex(/[A-Za-z]/, 'New password must contain a letter.')
+    .regex(/\d/, 'New password must contain a number.'),
+  target: z.enum(['ADMIN', 'CUSTOMER']).optional().default('ADMIN'),
+})
+
+export type ForgotPasswordResetInput = z.infer<typeof forgotPasswordResetSchema>
+
+export const updateAdminProfileSchema = z.object({
+  name: z.string().trim().min(2, 'Name must be at least 2 characters.').max(100).optional(),
+  email: z.string().trim().toLowerCase().email('Provide a valid email address.').optional(),
+  avatarUrl: z.string().trim().optional().nullable(),
+})
+
+export type UpdateAdminProfileInput = z.infer<typeof updateAdminProfileSchema>

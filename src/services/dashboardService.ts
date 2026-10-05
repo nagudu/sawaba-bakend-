@@ -1,6 +1,6 @@
-import { col, fn, Op } from 'sequelize'
-import { Appointment, Barber, Customer, Payment, Service } from '../models'
+import { prisma } from '../config/database'
 import { AppointmentStatusValue, CONFIRMED_STATUSES, PENDING_STATUSES } from '../config/appointmentStatuses'
+import type { AppointmentStatus } from '@prisma/client'
 
 export interface DashboardData {
   totals: {
@@ -21,6 +21,7 @@ export interface DashboardData {
   }
   recentAppointments: Array<{
     id: number
+    referenceCode?: string | null
     customerName: string
     appointmentDate: string
     appointmentTime: string
@@ -43,41 +44,39 @@ export async function getDashboardData(): Promise<DashboardData> {
     pendingVerification,
     paid,
     rejected,
-    revenueRow,
+    revenueAggregate,
+    recentRaw,
   ] = await Promise.all([
-    Appointment.count(),
-    Appointment.count({
-      where: { status: { [Op.in]: PENDING_STATUSES } },
+    prisma.appointment.count(),
+    prisma.appointment.count({
+      where: { status: { in: PENDING_STATUSES as unknown as AppointmentStatus[] } },
     }),
-    Appointment.count({
-      where: { status: { [Op.in]: CONFIRMED_STATUSES } },
+    prisma.appointment.count({
+      where: { status: { in: CONFIRMED_STATUSES as unknown as AppointmentStatus[] } },
     }),
-    Appointment.count({ where: { status: AppointmentStatusValue.COMPLETED } }),
-    Appointment.count({ where: { status: AppointmentStatusValue.CANCELLED } }),
-    Customer.count(),
-    Barber.count(),
-    Service.count({ where: { isActive: true } }),
-    Payment.count({ where: { status: 'PENDING_VERIFICATION' } }),
-    Payment.count({ where: { status: 'PAID' } }),
-    Payment.count({ where: { status: 'REJECTED' } }),
-    Payment.findOne({
-      attributes: [[fn('COALESCE', fn('SUM', col('amount')), 0), 'revenue']],
+    prisma.appointment.count({ where: { status: AppointmentStatusValue.COMPLETED } }),
+    prisma.appointment.count({ where: { status: AppointmentStatusValue.CANCELLED } }),
+    prisma.customer.count(),
+    prisma.barber.count(),
+    prisma.service.count({ where: { isActive: true } }),
+    prisma.payment.count({ where: { status: 'PENDING_VERIFICATION' } }),
+    prisma.payment.count({ where: { status: 'PAID' } }),
+    prisma.payment.count({ where: { status: 'REJECTED' } }),
+    prisma.payment.aggregate({
+      _sum: { amount: true },
       where: { status: 'PAID' },
-      raw: true,
+    }),
+    prisma.appointment.findMany({
+      orderBy: { createdAt: 'desc' },
+      take: 8,
+      include: {
+        service: { select: { id: true, name: true } },
+        barber: { select: { id: true, name: true } },
+      },
     }),
   ])
 
-  const revenueRowValue = (revenueRow as { revenue?: string | number } | null)?.revenue
-  const revenue = Number(revenueRowValue ?? 0)
-
-  const recentRaw = await Appointment.findAll({
-    order: [['createdAt', 'DESC']],
-    limit: 8,
-    include: [
-      { model: Service, as: 'service', attributes: ['id', 'name'] },
-      { model: Barber, as: 'barber', attributes: ['id', 'name'] },
-    ],
-  })
+  const revenue = Number(revenueAggregate._sum.amount ?? 0)
 
   return {
     totals: {

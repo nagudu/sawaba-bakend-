@@ -1,11 +1,9 @@
-import { Op, type Transaction } from 'sequelize'
-import { Appointment, Barber, BarberEarning, BarberNotification, Payment } from '../models'
+import { prisma } from '../config/database'
+import type { Prisma, BarberType, CommissionType, EarningStatus } from '@prisma/client'
 import { NotFoundError, UnprocessableError } from '../utils/errors'
 import { getPagination } from '../utils/response'
 import { AppointmentStatusValue } from '../config/appointmentStatuses'
 import type { EarningsQuery } from '../validators/barberEarning'
-import type { BarberEarning as BarberEarningModel } from '../models/BarberEarning'
-import type { BarberType, CommissionType } from '../models/Barber'
 import type { Paged } from '../types'
 
 /**
@@ -32,11 +30,11 @@ export interface CommissionBreakdown {
 
 /** Pure calculation — PERCENTAGE of service amount, or FIXED naira (never above the service amount). */
 export function calculateCommission(
-  barber: Pick<Barber, 'barberType' | 'commissionType' | 'commissionValue'>,
+  barber: { barberType?: BarberType | null; commissionType?: CommissionType | null; commissionValue?: number | Prisma.Decimal | null },
   serviceAmount: number,
 ): CommissionBreakdown {
   const amount = Number(serviceAmount) || 0
-  const type = barber.commissionType ?? 'PERCENTAGE'
+  const type: CommissionType = barber.commissionType ?? 'PERCENTAGE'
   const rate = Number(barber.commissionValue ?? 0)
 
   let commission = 0
@@ -66,14 +64,14 @@ export async function createEarningSnapshot(
   appointmentId: number,
   barberId: number,
   serviceAmount: number,
-  transaction?: Transaction,
-): Promise<BarberEarningModel> {
-  const barber = await Barber.findByPk(barberId)
+  tx: Prisma.TransactionClient | typeof prisma = prisma,
+) {
+  const barber = await tx.barber.findUnique({ where: { id: barberId } })
   if (!barber) {
     throw new NotFoundError('Barber not found for commission snapshot.')
   }
 
-  const existing = await BarberEarning.findOne({ where: { appointmentId }, transaction })
+  const existing = await tx.barberEarning.findUnique({ where: { appointmentId } })
   if (existing && existing.status !== 'CANCELLED') {
     return existing // idempotent — never duplicate or overwrite a snapshot
   }
@@ -83,8 +81,9 @@ export async function createEarningSnapshot(
   if (existing) {
     // Cancelled earning from a reactivated appointment — refresh to PENDING
     // with the CURRENT config (the prior attempt never earned).
-    await existing.update(
-      {
+    return tx.barberEarning.update({
+      where: { id: existing.id },
+      data: {
         barberId,
         barberTypeSnapshot: breakdown.barberType,
         commissionType: breakdown.commissionType,
@@ -96,13 +95,11 @@ export async function createEarningSnapshot(
         earnedAt: null,
         paidAt: null,
       },
-      { transaction },
-    )
-    return existing
+    })
   }
 
-  return BarberEarning.create(
-    {
+  return tx.barberEarning.create({
+    data: {
       appointmentId,
       barberId,
       barberTypeSnapshot: breakdown.barberType,
@@ -113,8 +110,7 @@ export async function createEarningSnapshot(
       studioAmount: breakdown.studioAmount,
       status: 'PENDING',
     },
-    { transaction },
-  )
+  })
 }
 
 /**
@@ -122,11 +118,14 @@ export async function createEarningSnapshot(
  *   COMPLETED + payment PAID → EARNED
  *   CANCELLED                → CANCELLED (unless already PAID — money was settled)
  */
-export async function syncEarningForAppointment(appointmentId: number, transaction?: Transaction): Promise<void> {
-  const appointment = await Appointment.findByPk(appointmentId, { transaction })
+export async function syncEarningForAppointment(
+  appointmentId: number,
+  tx: Prisma.TransactionClient | typeof prisma = prisma,
+): Promise<void> {
+  const appointment = await tx.appointment.findUnique({ where: { id: appointmentId } })
   if (!appointment) return
 
-  const earning = await BarberEarning.findOne({ where: { appointmentId }, transaction })
+  const earning = await tx.barberEarning.findUnique({ where: { appointmentId } })
   if (!earning) {
     // Appointments created before this feature (or via legacy paths) get their
     // snapshot here, on the first lifecycle transition touching them.
@@ -135,7 +134,7 @@ export async function syncEarningForAppointment(appointmentId: number, transacti
         appointmentId,
         appointment.assignedBarberId ?? appointment.barberId,
         Number(appointment.totalAmount),
-        transaction,
+        tx,
       )
     }
     return
@@ -146,32 +145,40 @@ export async function syncEarningForAppointment(appointmentId: number, transacti
   }
 
   if (appointment.status === AppointmentStatusValue.CANCELLED) {
-    await earning.update({ status: 'CANCELLED', earnedAt: null }, { transaction })
+    await tx.barberEarning.update({
+      where: { id: earning.id },
+      data: { status: 'CANCELLED', earnedAt: null },
+    })
     return
   }
 
   if (appointment.status !== AppointmentStatusValue.COMPLETED) {
     // Moved backwards out of COMPLETED (reactivation flows) → back to PENDING.
     if (earning.status === 'EARNED') {
-      await earning.update({ status: 'PENDING', earnedAt: null }, { transaction })
+      await tx.barberEarning.update({
+        where: { id: earning.id },
+        data: { status: 'PENDING', earnedAt: null },
+      })
     }
     return
   }
 
   // COMPLETED — earned only when the actual money has been confirmed.
-  const payment = await Payment.findOne({ where: { appointmentId }, transaction })
+  const payment = await tx.payment.findUnique({ where: { appointmentId } })
   const paymentPaid = payment?.status === 'PAID'
   if (paymentPaid) {
-    await earning.update({ status: 'EARNED', earnedAt: new Date() }, { transaction })
-    await BarberNotification.create(
-      {
+    await tx.barberEarning.update({
+      where: { id: earning.id },
+      data: { status: 'EARNED', earnedAt: new Date() },
+    })
+    await tx.barberNotification.create({
+      data: {
         barberId: earning.barberId,
         type: 'EARNING',
         title: 'Commission earned',
         message: `Your commission of ₦${Number(earning.commissionAmount).toLocaleString()} for appointment #${appointmentId} is now earned and awaiting payout.`,
       },
-      { transaction },
-    )
+    })
   }
 }
 
@@ -194,13 +201,24 @@ export interface EarningPublic {
   serviceAmount: number
   commissionAmount: number
   studioAmount: number
-  status: BarberEarningModel['status']
+  status: EarningStatus
   earnedAt: Date | null
   paidAt: Date | null
   createdAt: Date
 }
 
-export function serializeEarning(earning: BarberEarningModel): EarningPublic {
+type EarningWithRelations = Prisma.BarberEarningGetPayload<{
+  include: {
+    appointment: {
+      include: {
+        payment: { select: { status: true } }
+      }
+    }
+    barber: { select: { id: true; name: true; location: true } }
+  }
+}>
+
+export function serializeEarning(earning: EarningWithRelations): EarningPublic {
   const appointment = earning.appointment
   return {
     id: earning.id,
@@ -228,56 +246,51 @@ export function serializeEarning(earning: BarberEarningModel): EarningPublic {
   }
 }
 
-const earningScope = [
-  { model: Appointment, as: 'appointment', include: [{ model: Payment, as: 'payment', attributes: ['status'] }] },
-  { model: Barber, as: 'barber', attributes: ['id', 'name', 'location'] },
-]
+const earningInclude = {
+  appointment: {
+    include: {
+      payment: { select: { status: true } },
+    },
+  },
+  barber: { select: { id: true, name: true, location: true } },
+} as const
 
 export async function listEarnings(query: EarningsQuery): Promise<Paged<EarningPublic>> {
   const { page, perPage, offset, limit } = getPagination(query as Record<string, unknown>)
 
-  const where = {
+  const where: Prisma.BarberEarningWhereInput = {
     ...(query.barberId ? { barberId: query.barberId } : {}),
     ...(query.barberType ? { barberTypeSnapshot: query.barberType } : {}),
-    ...(query.status ? { status: query.status } : {}),
+    ...(query.status ? { status: query.status as EarningStatus } : {}),
     ...(query.from || query.to
       ? {
           createdAt: {
-            ...(query.from ? { [Op.gte]: new Date(`${query.from}T00:00:00`) } : {}),
-            ...(query.to ? { [Op.lte]: new Date(`${query.to}T23:59:59.999`) } : {}),
+            ...(query.from ? { gte: new Date(`${query.from}T00:00:00`) } : {}),
+            ...(query.to ? { lte: new Date(`${query.to}T23:59:59.999`) } : {}),
           },
         }
       : {}),
   }
 
-  const { rows, count } = await BarberEarning.findAndCountAll({
-    where,
-    include: [
-      {
-        ...earningScope[0],
-        ...(query.appointmentRef || query.location
-          ? {
-              where: {
-                ...(query.appointmentRef
-                  ? { referenceCode: { [Op.like]: `%${query.appointmentRef}%` } }
-                  : {}),
-                ...(query.location
-                  ? { customerLocation: { [Op.like]: `%${query.location}%` } }
-                  : {}),
-              },
-              required: true,
-            }
-          : {}),
-      },
-      earningScope[1],
-    ],
-    distinct: true,
-    order: [['createdAt', 'DESC']],
-    offset,
-    limit,
-  })
+  if (query.appointmentRef || query.location) {
+    where.appointment = {
+      ...(query.appointmentRef ? { referenceCode: { contains: query.appointmentRef } } : {}),
+      ...(query.location ? { customerLocation: { contains: query.location } } : {}),
+    }
+  }
 
-  return { items: rows.map(serializeEarning), total: count, page, perPage }
+  const [rows, total] = await Promise.all([
+    prisma.barberEarning.findMany({
+      where,
+      include: earningInclude,
+      orderBy: { createdAt: 'desc' },
+      skip: offset,
+      take: limit,
+    }),
+    prisma.barberEarning.count({ where }),
+  ])
+
+  return { items: rows.map(serializeEarning), total, page, perPage }
 }
 
 export interface EarningsSummaryRow {
@@ -297,32 +310,36 @@ export interface EarningsSummaryRow {
 
 /** Per-barber aggregates over the snapshot ledger (requirement #11). */
 export async function getEarningsSummary(query: EarningsQuery): Promise<EarningsSummaryRow[]> {
-  const barberWhere = {
+  const barberWhere: Prisma.BarberWhereInput = {
     ...(query.barberType ? { barberType: query.barberType } : {}),
-    ...(query.location ? { location: { [Op.like]: `%${query.location}%` } } : {}),
+    ...(query.location ? { location: { contains: query.location } } : {}),
   }
 
-  const earningWhere = {
-    ...(query.status ? { status: query.status } : {}),
+  const earningWhere: Prisma.BarberEarningWhereInput = {
+    ...(query.status ? { status: query.status as EarningStatus } : {}),
     ...(query.from || query.to
       ? {
           createdAt: {
-            ...(query.from ? { [Op.gte]: new Date(`${query.from}T00:00:00`) } : {}),
-            ...(query.to ? { [Op.lte]: new Date(`${query.to}T23:59:59.999`) } : {}),
+            ...(query.from ? { gte: new Date(`${query.from}T00:00:00`) } : {}),
+            ...(query.to ? { lte: new Date(`${query.to}T23:59:59.999`) } : {}),
           },
         }
       : {}),
   }
 
-  const barbers = await Barber.findAll({
+  const barbers = await prisma.barber.findMany({
     where: barberWhere,
-    include: [{ model: BarberEarning, as: 'earnings', where: earningWhere, required: false }],
-    order: [['name', 'ASC']],
-  }) as unknown as Array<Barber & { earnings?: BarberEarningModel[] }>
+    include: {
+      earnings: {
+        where: earningWhere,
+      },
+    },
+    orderBy: { name: 'asc' },
+  })
 
   const rows: EarningsSummaryRow[] = []
   for (const barber of barbers) {
-    const earnings = (barber.earnings ?? []) as BarberEarningModel[]
+    const earnings = barber.earnings ?? []
     if (earnings.length === 0) continue
     const nonCancelled = earnings.filter((e) => e.status !== 'CANCELLED')
     if (nonCancelled.length === 0) continue
@@ -361,45 +378,63 @@ export interface CommissionReport {
 
 /** Report totals (requirement #18) — filterable by date range, barber, type, location. */
 export async function getCommissionReport(query: EarningsQuery): Promise<CommissionReport> {
-  const barberIds = query.barberId
-    ? [query.barberId]
-    : (
-        await Barber.findAll({
-          where: {
-            ...(query.barberType ? { barberType: query.barberType } : {}),
-            ...(query.location ? { location: { [Op.like]: `%${query.location}%` } } : {}),
-          },
-          attributes: ['id'],
-        })
-      ).map((b) => b.id)
-
-  if (barberIds.length === 0) {
-    return { totals: { barberRevenue: 0, internalCommission: 0, externalCommission: 0, paidCommission: 0, pendingCommission: 0, studioRevenue: 0 }, count: 0 }
+  let barberIds: number[]
+  if (query.barberId) {
+    barberIds = [query.barberId]
+  } else {
+    const barbers = await prisma.barber.findMany({
+      where: {
+        ...(query.barberType ? { barberType: query.barberType } : {}),
+        ...(query.location ? { location: { contains: query.location } } : {}),
+      },
+      select: { id: true },
+    })
+    barberIds = barbers.map((b) => b.id)
   }
 
-  const where = {
-    barberId: { [Op.in]: barberIds },
-    ...(query.status ? { status: query.status } : {}),
+  if (barberIds.length === 0) {
+    return {
+      totals: {
+        barberRevenue: 0,
+        internalCommission: 0,
+        externalCommission: 0,
+        paidCommission: 0,
+        pendingCommission: 0,
+        studioRevenue: 0,
+      },
+      count: 0,
+    }
+  }
+
+  const where: Prisma.BarberEarningWhereInput = {
+    barberId: { in: barberIds },
+    ...(query.status ? { status: query.status as EarningStatus } : {}),
     ...(query.from || query.to
       ? {
           createdAt: {
-            ...(query.from ? { [Op.gte]: new Date(`${query.from}T00:00:00`) } : {}),
-            ...(query.to ? { [Op.lte]: new Date(`${query.to}T23:59:59.999`) } : {}),
+            ...(query.from ? { gte: new Date(`${query.from}T00:00:00`) } : {}),
+            ...(query.to ? { lte: new Date(`${query.to}T23:59:59.999`) } : {}),
           },
         }
       : {}),
   }
 
-  const earnings = await BarberEarning.findAll({ where })
+  const earnings = await prisma.barberEarning.findMany({ where })
   const active = earnings.filter((e) => e.status !== 'CANCELLED')
 
   return {
     totals: {
       barberRevenue: active.reduce((sum, e) => sum + Number(e.serviceAmount), 0),
-      internalCommission: active.filter((e) => e.barberTypeSnapshot === 'INTERNAL').reduce((sum, e) => sum + Number(e.commissionAmount), 0),
-      externalCommission: active.filter((e) => e.barberTypeSnapshot === 'EXTERNAL').reduce((sum, e) => sum + Number(e.commissionAmount), 0),
+      internalCommission: active
+        .filter((e) => e.barberTypeSnapshot === 'INTERNAL')
+        .reduce((sum, e) => sum + Number(e.commissionAmount), 0),
+      externalCommission: active
+        .filter((e) => e.barberTypeSnapshot === 'EXTERNAL')
+        .reduce((sum, e) => sum + Number(e.commissionAmount), 0),
       paidCommission: earnings.filter((e) => e.status === 'PAID').reduce((sum, e) => sum + Number(e.commissionAmount), 0),
-      pendingCommission: earnings.filter((e) => e.status === 'PENDING' || e.status === 'EARNED').reduce((sum, e) => sum + Number(e.commissionAmount), 0),
+      pendingCommission: earnings
+        .filter((e) => e.status === 'PENDING' || e.status === 'EARNED')
+        .reduce((sum, e) => sum + Number(e.commissionAmount), 0),
       studioRevenue: active.reduce((sum, e) => sum + Number(e.studioAmount), 0),
     },
     count: active.length,
@@ -428,36 +463,32 @@ export interface BarberPerformanceRow {
  * Per-barber performance report (requirement #16/#18) — appointment-based
  * metrics that the earnings ledger alone cannot show: bookings, completion /
  * cancellation rates, revenue and average ticket per barber.
- *
- * A barber counts toward a booking when they are the assigned barber, or —
- * when no assignment was made — the customer's booked barber. Cancelled
- * bookings are excluded from revenue/avg-ticket but still reported so the
- * cancellation rate is honest.
  */
 export async function getBarberPerformance(query: EarningsQuery): Promise<BarberPerformanceRow[]> {
-  const barberWhere = {
+  const barberWhere: Prisma.BarberWhereInput = {
     ...(query.barberType ? { barberType: query.barberType } : {}),
-    ...(query.location ? { location: { [Op.like]: `%${query.location}%` } } : {}),
+    ...(query.location ? { location: { contains: query.location } } : {}),
     ...(query.barberId ? { id: query.barberId } : {}),
   }
 
-  const barbers = await Barber.findAll({ where: barberWhere, order: [['name', 'ASC']] })
+  const barbers = await prisma.barber.findMany({ where: barberWhere, orderBy: { name: 'asc' } })
   if (barbers.length === 0) return []
 
-  const dateFilter = query.from || query.to
-    ? {
-        appointmentDate: {
-          ...(query.from ? { [Op.gte]: query.from } : {}),
-          ...(query.to ? { [Op.lte]: query.to } : {}),
-        },
-      }
-    : {}
+  const barberIds = barbers.map((b) => b.id)
 
-  const appointments = await Appointment.findAll({
+  const dateFilter: Prisma.AppointmentWhereInput = {}
+  if (query.from || query.to) {
+    dateFilter.appointmentDate = {
+      ...(query.from ? { gte: query.from } : {}),
+      ...(query.to ? { lte: query.to } : {}),
+    }
+  }
+
+  const appointments = await prisma.appointment.findMany({
     where: {
-      [Op.or]: [
-        { assignedBarberId: { [Op.in]: barbers.map((b) => b.id) } },
-        { assignedBarberId: null, barberId: { [Op.in]: barbers.map((b) => b.id) } },
+      OR: [
+        { assignedBarberId: { in: barberIds } },
+        { assignedBarberId: null, barberId: { in: barberIds } },
       ],
       ...dateFilter,
     },
@@ -496,21 +527,20 @@ export async function getBarberPerformance(query: EarningsQuery): Promise<Barber
     }
   })
 
-  // Commission totals come from the frozen snapshot ledger, not live config,
-  // so a rate change never rewrites reported history (#9).
-  const earningWhere = {
-    barberId: { [Op.in]: barbers.map((b) => b.id) },
-    ...(query.status ? { status: query.status } : {}),
+  // Commission totals come from the frozen snapshot ledger, not live config
+  const earningWhere: Prisma.BarberEarningWhereInput = {
+    barberId: { in: barberIds },
+    ...(query.status ? { status: query.status as EarningStatus } : {}),
     ...(query.from || query.to
       ? {
           createdAt: {
-            ...(query.from ? { [Op.gte]: new Date(`${query.from}T00:00:00`) } : {}),
-            ...(query.to ? { [Op.lte]: new Date(`${query.to}T23:59:59.999`) } : {}),
+            ...(query.from ? { gte: new Date(`${query.from}T00:00:00`) } : {}),
+            ...(query.to ? { lte: new Date(`${query.to}T23:59:59.999`) } : {}),
           },
         }
       : {}),
   }
-  const earnings = await BarberEarning.findAll({ where: earningWhere })
+  const earnings = await prisma.barberEarning.findMany({ where: earningWhere })
   const commissionByBarber = new Map<number, number>()
   for (const earning of earnings) {
     if (earning.status === 'CANCELLED') continue
@@ -528,8 +558,9 @@ export async function getBarberPerformance(query: EarningsQuery): Promise<Barber
 
 /** Admin settles a payout — only EARNED rows can be marked PAID. */
 export async function markEarningPaid(earningId: number): Promise<EarningPublic> {
-  const earning = await BarberEarning.findByPk(earningId, {
-    include: earningScope as never,
+  const earning = await prisma.barberEarning.findUnique({
+    where: { id: earningId },
+    include: earningInclude,
   })
   if (!earning) {
     throw new NotFoundError('Earning record not found.')
@@ -541,12 +572,21 @@ export async function markEarningPaid(earningId: number): Promise<EarningPublic>
         : `Only EARNED commissions can be marked as paid (this one is ${earning.status}). Complete the appointment and verify its payment first.`,
     )
   }
-  await earning.update({ status: 'PAID', paidAt: new Date() })
-  await BarberNotification.create({
-    barberId: earning.barberId,
-    type: 'EARNING',
-    title: 'Commission paid',
-    message: `Your commission of ₦${Number(earning.commissionAmount).toLocaleString()} for appointment #${earning.appointmentId} has been paid out.`,
+
+  const updated = await prisma.barberEarning.update({
+    where: { id: earningId },
+    data: { status: 'PAID', paidAt: new Date() },
+    include: earningInclude,
   })
-  return serializeEarning(earning)
+
+  await prisma.barberNotification.create({
+    data: {
+      barberId: earning.barberId,
+      type: 'EARNING',
+      title: 'Commission paid',
+      message: `Your commission of ₦${Number(earning.commissionAmount).toLocaleString()} for appointment #${earning.appointmentId} has been paid out.`,
+    },
+  })
+
+  return serializeEarning(updated)
 }

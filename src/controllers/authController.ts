@@ -3,9 +3,21 @@ import {
   loginAdmin,
   getMe,
   changeAdminPassword,
+  updateAdminProfile,
+  requestPasswordReset,
+  verifyPasswordResetOtp,
+  resetPasswordWithOtp,
 } from '../services/authService'
 import { successRes } from '../utils/response'
-import type { LoginInput, ChangePasswordInput } from '../validators/auth'
+import { uploadImageToCloudinary } from '../utils/upload'
+import type {
+  LoginInput,
+  ChangePasswordInput,
+  UpdateAdminProfileInput,
+  ForgotPasswordRequestInput,
+  ForgotPasswordVerifyInput,
+  ForgotPasswordResetInput,
+} from '../validators/auth'
 
 export async function loginHandler(req: Request, res: Response, next: NextFunction): Promise<void> {
   try {
@@ -26,11 +38,62 @@ export async function meHandler(req: Request, res: Response, next: NextFunction)
   }
 }
 
+export async function updateProfileHandler(req: Request, res: Response, next: NextFunction): Promise<void> {
+  try {
+    let avatarUrl = req.body.avatarUrl as string | undefined
+    if (req.file) {
+      const uploaded = await uploadImageToCloudinary(req.file.buffer, 'sawaba-admins', req.file.mimetype)
+      avatarUrl = uploaded.url
+    }
+
+    const input: UpdateAdminProfileInput = {
+      ...(req.body.name ? { name: String(req.body.name).trim() } : {}),
+      ...(req.body.email ? { email: String(req.body.email).trim().toLowerCase() } : {}),
+      ...(avatarUrl !== undefined ? { avatarUrl } : {}),
+    }
+
+    const admin = await updateAdminProfile(req.admin!.id, input)
+    successRes(res, 'Admin profile updated successfully.', { admin }, 200)
+  } catch (error) {
+    next(error)
+  }
+}
+
 export async function changePasswordHandler(req: Request, res: Response, next: NextFunction): Promise<void> {
   try {
     const input = req.body as ChangePasswordInput
     await changeAdminPassword(req.admin!.id, input.currentPassword, input.newPassword)
     successRes(res, 'Password updated successfully.', {}, 200)
+  } catch (error) {
+    next(error)
+  }
+}
+
+export async function requestPasswordResetHandler(req: Request, res: Response, next: NextFunction): Promise<void> {
+  try {
+    const { email, target } = req.body as ForgotPasswordRequestInput
+    const result = await requestPasswordReset(email, target)
+    successRes(res, result.message, { devCode: result.devCode }, 200)
+  } catch (error) {
+    next(error)
+  }
+}
+
+export async function verifyPasswordResetHandler(req: Request, res: Response, next: NextFunction): Promise<void> {
+  try {
+    const { email, code, target } = req.body as ForgotPasswordVerifyInput
+    const result = await verifyPasswordResetOtp(email, code, target)
+    successRes(res, 'Verification code confirmed.', result, 200)
+  } catch (error) {
+    next(error)
+  }
+}
+
+export async function resetPasswordHandler(req: Request, res: Response, next: NextFunction): Promise<void> {
+  try {
+    const { email, code, newPassword, target } = req.body as ForgotPasswordResetInput
+    await resetPasswordWithOtp(email, code, newPassword, target)
+    successRes(res, 'Password has been reset successfully. You can now sign in with your new password.', {}, 200)
   } catch (error) {
     next(error)
   }

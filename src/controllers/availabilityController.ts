@@ -1,7 +1,7 @@
 import type { Request, Response, NextFunction } from 'express'
 import { getAvailableTimeSlots } from '../services/availabilityService'
 import { successRes } from '../utils/response'
-import { Service } from '../models'
+import { prisma } from '../config/database'
 
 export async function getAvailabilityHandler(req: Request, res: Response, next: NextFunction): Promise<void> {
   try {
@@ -11,7 +11,7 @@ export async function getAvailabilityHandler(req: Request, res: Response, next: 
 
     let duration = durationOverride
     if (!duration && req.query.serviceId) {
-      const service = await Service.findByPk(Number(req.query.serviceId))
+      const service = await prisma.service.findUnique({ where: { id: Number(req.query.serviceId) } })
       if (service) duration = service.duration
     }
     if (!duration) duration = 30

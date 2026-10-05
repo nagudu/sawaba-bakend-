@@ -4,14 +4,24 @@
   "description": "REST API for SAWABA Grooming Studio — appointments, services, barbers, gallery, reviews and contact management.",
   "main": "dist/server.js",
   "scripts": {
-    "dev": "tsx watch src/server.ts",
-    "build": "tsc -p tsconfig.json",
+    "dev": "node ../scripts/sync-prisma.js && tsx watch src/server.ts",
+    "build": "node ../scripts/sync-prisma.js && tsc -p tsconfig.json",
     "start": "node dist/server.js",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "db:sync": "tsx src/scripts/sync.ts",
+    "db:push": "node ../scripts/prepare-prisma.js && prisma db push && node ../scripts/sync-prisma.js",
     "db:seed": "tsx src/scripts/seed.ts",
-    "db:backfill-customers": "tsx src/scripts/backfillCustomers.ts",
-    "smtp:verify": "tsx src/scripts/verifySmtp.ts"
+    "prisma:generate": "node ../scripts/prepare-prisma.js && prisma generate --schema=../prisma/schema.prisma && node ../scripts/sync-prisma.js",
+    "db:backfill-customers": "tsx src/scripts/legacy/backfillCustomers.ts",
+    "smtp:verify": "tsx src/scripts/legacy/verifySmtp.ts",
+    "db:generate": "prisma generate",
+    "db:validate": "prisma validate",
+    "db:pull": "prisma db pull --force",
+    "db:parity": "tsx src/scripts/prismaParity.ts",
+    "postinstall": "prisma generate",
+    "db:field-types": "tsx src/scripts/genPrismaFieldTypes.ts"
+  },
+  "prisma": {
+    "schema": "../prisma/schema.prisma"
   },
   "keywords": [
     "sawaba",
@@ -20,12 +30,14 @@
     "appointments",
     "rest",
     "api",
-    "sequelize",
-    "mysql"
+    "prisma",
+    "mysql",
+    "postgresql"
   ],
   "license": "UNLICENSED",
   "private": true,
   "dependencies": {
+    "@prisma/client": "^6.19.3",
     "@types/nodemailer": "^8.0.1",
     "bcryptjs": "^2.4.3",
     "cloudinary": "^2.5.1",
@@ -38,10 +50,9 @@
     "jsonwebtoken": "^9.0.2",
     "morgan": "^1.10.0",
     "multer": "^1.4.5-lts.1",
-    "mysql2": "^3.12.0",
     "nodemailer": "^10.0.10",
+    "prisma": "7.10.0",
     "resend": "^6.28.0",
-    "sequelize": "^6.37.5",
     "swagger-jsdoc": "^6.2.8",
     "swagger-ui-express": "^5.0.1",
     "zod": "^3.24.1"
@@ -56,6 +67,7 @@
     "@types/node": "^22.10.5",
     "@types/swagger-jsdoc": "^6.0.4",
     "@types/swagger-ui-express": "^4.1.7",
+    "prisma": "^6.19.3",
     "tsx": "^4.19.2",
     "typescript": "^5.7.3"
   },

@@ -1,7 +1,7 @@
 import type { NextFunction, Request, Response } from 'express'
 import multer from 'multer'
 import { ZodError } from 'zod'
-import { UniqueConstraintError, ForeignKeyConstraintError } from 'sequelize'
+import { Prisma } from '@prisma/client'
 import { AppError } from '../utils/errors'
 
 export function notFoundHandler(req: Request, res: Response): void {
@@ -35,21 +35,31 @@ export function errorHandler(error: unknown, _req: Request, res: Response, _next
     return
   }
 
-  if (error instanceof UniqueConstraintError) {
-    const field = error.errors[0]?.path
-    res.status(409).json({
-      success: false,
-      message: `A record with the same ${field ?? 'value'} already exists.`,
-    })
-    return
-  }
+  if (error instanceof Prisma.PrismaClientKnownRequestError) {
+    if (error.code === 'P2002') {
+      const target = Array.isArray(error.meta?.target) ? error.meta.target.join(', ') : 'value'
+      res.status(409).json({
+        success: false,
+        message: `A record with the same ${target} already exists.`,
+      })
+      return
+    }
 
-  if (error instanceof ForeignKeyConstraintError) {
-    res.status(400).json({
-      success: false,
-      message: 'No link could be made with the provided record: related record not found.',
-    })
-    return
+    if (error.code === 'P2003') {
+      res.status(400).json({
+        success: false,
+        message: 'No link could be made with the provided record: related record not found.',
+      })
+      return
+    }
+
+    if (error.code === 'P2025') {
+      res.status(404).json({
+        success: false,
+        message: 'Record not found.',
+      })
+      return
+    }
   }
 
   const parseError = error as { type?: string; status?: number }

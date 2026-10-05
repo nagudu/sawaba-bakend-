@@ -1,49 +1,32 @@
-import { Op } from 'sequelize'
-import { Appointment, Barber, BarberAvailability, CheckoutSession, Service } from '../models'
+import { prisma } from '../config/database'
 import { AppointmentStatusValue } from '../config/appointmentStatuses'
 import { NotFoundError } from '../utils/errors'
 
-/**
- * How long checkout sessions may hold their slot.
- *
- * STRICT AVAILABILITY RULE: a slot only shows as unavailable when a REAL
- * booking (appointment) or a payment genuinely in flight occupies it.
- * Merely-staged (OPEN) sessions hold NOTHING — a customer who abandons a
- * checkout must never make a free slot look taken to everyone else.
- * Sessions already inside a Paystack checkout (money possibly in flight) do
- * hold for 45 minutes — longer than Paystack's own 30-minute transaction
- * expiry, so a slow-but-honest payment can never be orphaned.
- */
 const SESSION_HOLD_MINUTES = 20
 const AWAITING_PAYMENT_HOLD_MINUTES = 45
 
-/** Expires stale checkout sessions, then returns the slot intervals they hold. */
 async function checkoutSessionHolds(
   barberId: number,
   date: string,
   fallbackDuration: number,
 ): Promise<Array<{ start: number; end: number }>> {
-  await CheckoutSession.update(
-    { status: 'EXPIRED' },
-    {
-      where: {
-        status: 'OPEN',
-        updatedAt: { [Op.lt]: new Date(Date.now() - SESSION_HOLD_MINUTES * 60 * 1000) },
-      },
+  await prisma.checkoutSession.updateMany({
+    where: {
+      status: 'OPEN',
+      updatedAt: { lt: new Date(Date.now() - SESSION_HOLD_MINUTES * 60 * 1000) },
     },
-  )
-  await CheckoutSession.update(
-    { status: 'EXPIRED' },
-    {
-      where: {
-        status: 'AWAITING_PAYMENT',
-        updatedAt: { [Op.lt]: new Date(Date.now() - AWAITING_PAYMENT_HOLD_MINUTES * 60 * 1000) },
-      },
-    },
-  )
+    data: { status: 'EXPIRED' },
+  })
 
-  // ONLY in-flight payments hold a slot. Staged-but-unpaid sessions do not.
-  const sessions = await CheckoutSession.findAll({
+  await prisma.checkoutSession.updateMany({
+    where: {
+      status: 'AWAITING_PAYMENT',
+      updatedAt: { lt: new Date(Date.now() - AWAITING_PAYMENT_HOLD_MINUTES * 60 * 1000) },
+    },
+    data: { status: 'EXPIRED' },
+  })
+
+  const sessions = await prisma.checkoutSession.findMany({
     where: {
       barberId,
       appointmentDate: date,
@@ -53,7 +36,7 @@ async function checkoutSessionHolds(
   if (sessions.length === 0) return []
 
   const serviceIds = [...new Set(sessions.map((s) => s.serviceId))]
-  const services = await Service.findAll({ where: { id: serviceIds } })
+  const services = await prisma.service.findMany({ where: { id: { in: serviceIds } } })
   const durationMap = new Map(services.map((s) => [s.id, s.duration]))
 
   return sessions.map((session) => {
@@ -68,11 +51,6 @@ export interface TimeSlot {
   available: boolean
 }
 
-/**
- * Default opening hours for barbers the admin has not configured yet.
- * Mirrors the seeded schedule so unconfigured barbers stay bookable
- * instead of silently having zero slots.
- */
 export const DEFAULT_HOURS: Record<number, { start: string; end: string }> = {
   0: { start: '11:00', end: '18:00' }, // Sunday
   1: { start: '09:00', end: '20:00' },
@@ -101,33 +79,31 @@ function toDateInput(date: Date): string {
   return `${year}-${month}-${day}`
 }
 
-/** Returns the list of bookable time slots for a barber on a given date. */
 export async function getAvailableTimeSlots(
   barberId: number,
   date: string,
   serviceDurationMinutes = 30,
 ): Promise<TimeSlot[]> {
-  const barber = await Barber.findByPk(barberId)
+  const barber = await prisma.barber.findUnique({ where: { id: barberId } })
   if (!barber) {
     throw new NotFoundError('Barber not found.')
   }
 
   const dayOfWeek = new Date(`${date}T00:00:00`).getDay()
+  const barberSchedule = await prisma.barberAvailability.findMany({ where: { barberId } })
 
-  // Configured barbers use their own schedule; barbers with no availability
-  // rows at all fall back to the salon's default opening hours so they stay
-  // bookable (an admin can still restrict them from the dashboard).
-  const barberSchedule = await BarberAvailability.findAll({ where: { barberId } })
   if (barberSchedule.length === 0) {
     const fallback = DEFAULT_HOURS[dayOfWeek]
     if (!fallback) return []
-    const existing = await Appointment.findAll({
+
+    const existing = await prisma.appointment.findMany({
       where: {
         barberId,
         appointmentDate: date,
-        status: { [Op.ne]: AppointmentStatusValue.CANCELLED },
+        status: { not: AppointmentStatusValue.CANCELLED },
       },
     })
+
     const bookings = [
       ...existing.map((appointment) => {
         const start = hhmmToMinutes(appointment.appointmentTime)
@@ -163,16 +139,16 @@ export async function getAvailableTimeSlots(
     end: hhmmToMinutes(availability[0].endTime),
   }
 
-  const existing = await Appointment.findAll({
+  const existing = await prisma.appointment.findMany({
     where: {
       barberId,
       appointmentDate: date,
-      status: { [Op.ne]: AppointmentStatusValue.CANCELLED },
+      status: { not: AppointmentStatusValue.CANCELLED },
     },
   })
 
   const serviceIds = [...new Set(existing.map((a) => a.serviceId))]
-  const services = await Service.findAll({ where: { id: serviceIds } })
+  const services = await prisma.service.findMany({ where: { id: { in: serviceIds } } })
   const serviceMap = new Map(services.map((s) => [s.id, s.duration]))
 
   const bookings = [

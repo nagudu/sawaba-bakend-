@@ -1,11 +1,11 @@
 import crypto from 'node:crypto'
+import { prisma } from '../config/database'
 import { NotFoundError, UnprocessableError } from '../utils/errors'
 import {
   applyProviderVerification,
   getPaymentByAccessToken,
   type PublicPaymentBundle,
 } from './paymentService'
-import type { Payment } from '../models/Payment'
 
 /**
  * Paystack online-payment integration.
@@ -55,7 +55,7 @@ async function paystackRequest<T>(
       },
       body: body === undefined ? undefined : JSON.stringify(body),
     })
-  } catch (error) {
+  } catch {
     throw new UnprocessableError('Unable to connect to the payment gateway. Please try again.')
   }
   const json = (await response.json().catch(() => null)) as
@@ -126,9 +126,12 @@ export async function initializePaystack(token: string): Promise<PaystackInitRes
     },
   )
 
-  await payment.update({
-    paymentMethod: 'ONLINE',
-    transactionReference: init.reference,
+  await prisma.payment.update({
+    where: { id: payment.id },
+    data: {
+      paymentMethod: 'ONLINE',
+      transactionReference: init.reference,
+    },
   })
 
   return {
@@ -143,7 +146,7 @@ export async function verifyPaystack(
   token: string,
   reference: string,
 ): Promise<PublicPaymentBundle> {
-  const payment: Payment = await getPaymentByAccessToken(token)
+  const payment = await getPaymentByAccessToken(token)
   if (payment.status === 'PAID') {
     // Already verified (e.g. by the webhook moments earlier) — just return current state.
     return applyProviderVerification(payment.appointmentId, null)

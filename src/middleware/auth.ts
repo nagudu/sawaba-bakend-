@@ -1,9 +1,9 @@
 import type { NextFunction, Request, Response } from 'express'
 import jwt from 'jsonwebtoken'
 import { env } from '../config/env'
-import { Admin } from '../models'
+import { prisma } from '../config/database'
+import type { Admin, Role } from '@prisma/client'
 import { ForbiddenError, UnauthorizedError } from '../utils/errors'
-import type { Role } from '../types'
 
 export interface AuthPayload {
   sub: number
@@ -37,7 +37,7 @@ export async function requireAdmin(req: Request, _res: Response, next: NextFunct
       throw new UnauthorizedError('Access token is expired or invalid.')
     }
 
-    const admin = await Admin.findByPk(payload.sub)
+    const admin = await prisma.admin.findUnique({ where: { id: payload.sub } })
     if (!admin || !admin.isActive) {
       throw new UnauthorizedError('Account no longer exists or has been deactivated.')
     }
