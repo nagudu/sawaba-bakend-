@@ -17,6 +17,14 @@ const options: swaggerJsdoc.Options = {
     },
     servers: [
       {
+        url: '/',
+        description: 'Current host (Production / Vercel / Local)',
+      },
+      {
+        url: 'https://sawaba.vercel.app',
+        description: 'Production server (Vercel)',
+      },
+      {
         url: `http://localhost:${env.port}`,
         description: 'Local development server',
       },
@@ -48,3 +56,4 @@ const options: swaggerJsdoc.Options = {
 }
 
 export const swaggerSpec = swaggerJsdoc(options)
+export { getSwaggerHtml } from './swaggerHtml'

@@ -58,8 +58,8 @@ export async function registerHandler(req: Request, res: Response, next: NextFun
 
 export async function loginPasswordHandler(req: Request, res: Response, next: NextFunction): Promise<void> {
   try {
-    const { phone, password } = req.body as CustomerLoginPasswordInput
-    const { token, customer } = await loginWithPassword(phone, password)
+    const { identifier, password } = req.body as CustomerLoginPasswordInput
+    const { token, customer } = await loginWithPassword(identifier, password)
     successRes(res, 'Welcome back!', { token, customer: serializeCustomer(customer) }, 200)
   } catch (error) {
     next(error)

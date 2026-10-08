@@ -23,6 +23,17 @@ import { barberPortalRouter } from './barberPortal'
 
 export const apiRouter = Router()
 
+apiRouter.get('/', (_req, res) => {
+  res.json({
+    success: true,
+    message: 'Welcome to SAWABA Grooming Studio API',
+    status: 'online',
+    version: '1.0.0',
+    documentation: '/api/docs',
+    health: '/health',
+  })
+})
+
 apiRouter.use('/auth', authRouter)
 apiRouter.use('/services', servicesRouter)
 apiRouter.use('/barbers', barbersRouter)

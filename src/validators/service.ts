@@ -19,7 +19,16 @@ export const createServiceSchema = z.object({
   description: z.string().trim().max(2000).optional().nullable(),
   price: z.coerce.number().min(0, 'Price cannot be negative.'),
   duration: z.coerce.number().int().min(5, 'Duration must be at least 5 minutes.').max(480),
-  image: z.string().trim().url('Image must be a valid URL.').max(500).optional().nullable(),
+  image: z
+    .string()
+    .trim()
+    .max(500)
+    .refine(
+      (value) => !value || /^(https?:\/\/|\/(?:uploads|api|images)\/)/.test(value),
+      'Image must be a valid URL or a server upload path.',
+    )
+    .optional()
+    .nullable(),
   category: z.enum(SERVICE_CATEGORIES).default('HAIRCUTS'),
   isActive: z.coerce.boolean().default(true),
 })

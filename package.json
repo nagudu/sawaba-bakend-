@@ -4,13 +4,13 @@
   "description": "REST API for SAWABA Grooming Studio — appointments, services, barbers, gallery, reviews and contact management.",
   "main": "dist/server.js",
   "scripts": {
-    "dev": "node ../scripts/sync-prisma.js && tsx watch src/server.ts",
-    "build": "node ../scripts/sync-prisma.js && tsc -p tsconfig.json",
+    "dev": "node scripts/safe-sync.js && tsx watch src/server.ts",
+    "build": "node scripts/prepare-prisma.js && prisma generate && node scripts/safe-sync.js && tsc -p tsconfig.json",
     "start": "node dist/server.js",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "db:push": "node ../scripts/prepare-prisma.js && prisma db push && node ../scripts/sync-prisma.js",
+    "db:push": "node scripts/prepare-prisma.js && prisma db push && node scripts/safe-sync.js",
     "db:seed": "tsx src/scripts/seed.ts",
-    "prisma:generate": "node ../scripts/prepare-prisma.js && prisma generate --schema=../prisma/schema.prisma && node ../scripts/sync-prisma.js",
+    "prisma:generate": "node scripts/prepare-prisma.js && prisma generate && node scripts/safe-sync.js",
     "db:backfill-customers": "tsx src/scripts/legacy/backfillCustomers.ts",
     "smtp:verify": "tsx src/scripts/legacy/verifySmtp.ts",
     "db:generate": "prisma generate",
@@ -21,7 +21,7 @@
     "db:field-types": "tsx src/scripts/genPrismaFieldTypes.ts"
   },
   "prisma": {
-    "schema": "../prisma/schema.prisma"
+    "schema": "prisma/schema.prisma"
   },
   "keywords": [
     "sawaba",
@@ -51,7 +51,7 @@
     "morgan": "^1.10.0",
     "multer": "^1.4.5-lts.1",
     "nodemailer": "^10.0.10",
-    "prisma": "7.10.0",
+    "prisma": "^6.19.3",
     "resend": "^6.28.0",
     "swagger-jsdoc": "^6.2.8",
     "swagger-ui-express": "^5.0.1",

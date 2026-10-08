@@ -18,7 +18,7 @@ import {
   forgotPasswordResetSchema,
   updateAdminProfileSchema,
 } from '../validators/auth'
-import { authLimiter } from '../middleware/rateLimiter'
+import { authLimiter, passwordResetLimiter } from '../middleware/rateLimiter'
 import { upload } from '../utils/upload'
 
 export const authRouter = Router()
@@ -70,11 +70,11 @@ authRouter.post('/change-password', requireAdmin, validate(changePasswordSchema)
  * /api/auth/forgot-password/request:
  *   post:
  *     tags: [Auth]
- *     summary: Request a 6-digit password reset code sent to email
+ *     summary: Request a 6-digit password reset code (email or SMS)
  */
 authRouter.post(
   '/forgot-password/request',
-  authLimiter,
+  passwordResetLimiter,
   validate(forgotPasswordRequestSchema),
   requestPasswordResetHandler,
 )
@@ -84,11 +84,11 @@ authRouter.post(
  * /api/auth/forgot-password/verify:
  *   post:
  *     tags: [Auth]
- *     summary: Verify 6-digit password reset code
+ *     summary: Verify 6-digit password reset code (returns a one-time reset token)
  */
 authRouter.post(
   '/forgot-password/verify',
-  authLimiter,
+  passwordResetLimiter,
   validate(forgotPasswordVerifySchema),
   verifyPasswordResetHandler,
 )
@@ -98,11 +98,11 @@ authRouter.post(
  * /api/auth/forgot-password/reset:
  *   post:
  *     tags: [Auth]
- *     summary: Reset password using verified code
+ *     summary: Reset password with the reset token from /verify
  */
 authRouter.post(
   '/forgot-password/reset',
-  authLimiter,
+  passwordResetLimiter,
   validate(forgotPasswordResetSchema),
   resetPasswordHandler,
 )

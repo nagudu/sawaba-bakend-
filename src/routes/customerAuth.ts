@@ -31,7 +31,7 @@ export const customerAuthRouter = Router()
  *   post:
  *     tags: [Account]
  *     summary: Request a login OTP (public)
- *     description: Sends a 6-digit code to the customer's saved email. Only existing accounts receive codes.
+ *     description: Sends a 6-digit code by SMS (when configured) or to the customer's saved email. Only existing accounts receive codes.
  */
 customerAuthRouter.post('/otp/request', otpLimiter, validate(customerOtpRequestSchema), requestOtpHandler)
 

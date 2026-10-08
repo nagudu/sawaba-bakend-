@@ -15,3 +15,16 @@ export function normalizeNigerianPhone(input: string): string {
 export function isPlausiblePhone(normalized: string): boolean {
   return normalized.length >= 10 && normalized.length <= 13
 }
+
+/**
+ * Converts a normalized Nigerian number (e.g. 08031234567) into E.164 form
+ * (+2348031234567) for SMS providers. Returns null for anything that cannot be
+ * safely mapped so callers fall back to email delivery.
+ */
+export function toE164(normalized: string): string | null {
+  const digits = (normalized ?? '').replace(/\D/g, '')
+  if (digits.length === 13 && digits.startsWith('234')) return `+${digits}`
+  if (digits.length === 11 && digits.startsWith('0')) return `+234${digits.slice(1)}`
+  if (digits.length === 10 && !digits.startsWith('0')) return `+234${digits}`
+  return null
+}

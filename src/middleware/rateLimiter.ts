@@ -37,10 +37,29 @@ export const customerAuthLimiter = rateLimit({
   ...defaultConfig,
 })
 
-/** OTP request/verify: 10 per 15 min per IP (sends email — costly and abusable). */
+/** OTP request/verify: 10 per 15 min per IP (sends email/SMS — costly and abusable). */
 export const otpLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   limit: 10,
+  ...defaultConfig,
+})
+
+/**
+ * Password-reset request/verify/reset: 8 per 15 min per IP. Unlike the login
+ * limiter this counts EVERY attempt (correct or not) — every call either sends
+ * an email/SMS or is a verification oracle, so both are costly and abusable.
+ */
+export const passwordResetLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  limit: 8,
+  ...defaultConfig,
+})
+
+/** Barber login: 10 FAILED attempts per 15 min per IP (correct logins skip). */
+export const barberAuthLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  limit: 10,
+  skipSuccessfulRequests: true,
   ...defaultConfig,
 })
 

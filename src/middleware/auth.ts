@@ -37,6 +37,10 @@ export async function requireAdmin(req: Request, _res: Response, next: NextFunct
       throw new UnauthorizedError('Access token is expired or invalid.')
     }
 
+    if (payload.role !== 'ADMIN') {
+      throw new ForbiddenError('This token is not valid for the admin area.')
+    }
+
     const admin = await prisma.admin.findUnique({ where: { id: payload.sub } })
     if (!admin || !admin.isActive) {
       throw new UnauthorizedError('Account no longer exists or has been deactivated.')

@@ -13,7 +13,6 @@ import {
 } from '../services/barberService'
 import { successRes } from '../utils/response'
 import { uploadImageToCloudinary, deleteImageByUrl } from '../utils/upload'
-import { AppError } from '../utils/errors'
 import type { CreateBarberInput, UpdateBarberInput } from '../validators/barber'
 
 async function withUploadedImage(req: Request, next: NextFunction, fallback: string | null): Promise<string | null | undefined> {
@@ -24,7 +23,7 @@ async function withUploadedImage(req: Request, next: NextFunction, fallback: str
     const uploaded = await uploadImageToCloudinary(file.buffer, 'sawaba-barbers', file.mimetype)
     return uploaded.url
   } catch (error) {
-    next(new AppError('Image upload failed. Please try again.', 500))
+    next(error)
     return undefined
   }
 }
@@ -94,6 +93,9 @@ export async function updateBarberHandler(req: Request, res: Response, next: Nex
 
     const input: UpdateBarberInput = { ...req.body, image }
     const barber = await updateBarber(id, input)
+    if (req.file && existing.image && existing.image !== barber.image) {
+      await deleteImageByUrl(existing.image).catch(() => undefined)
+    }
     const message = barber.credentialNotice
       ? `Barber updated successfully. ${barber.credentialNotice}`
       : 'Barber updated successfully.'

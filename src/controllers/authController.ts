@@ -9,7 +9,7 @@ import {
   resetPasswordWithOtp,
 } from '../services/authService'
 import { successRes } from '../utils/response'
-import { uploadImageToCloudinary } from '../utils/upload'
+import { uploadImageToCloudinary, deleteImageByUrl } from '../utils/upload'
 import type {
   LoginInput,
   ChangePasswordInput,
@@ -42,8 +42,12 @@ export async function updateProfileHandler(req: Request, res: Response, next: Ne
   try {
     let avatarUrl = req.body.avatarUrl as string | undefined
     if (req.file) {
+      const current = await getMe(req.admin!.id)
       const uploaded = await uploadImageToCloudinary(req.file.buffer, 'sawaba-admins', req.file.mimetype)
       avatarUrl = uploaded.url
+      if (current.avatarUrl && current.avatarUrl !== avatarUrl) {
+        await deleteImageByUrl(current.avatarUrl).catch(() => undefined)
+      }
     }
 
     const input: UpdateAdminProfileInput = {
@@ -73,7 +77,7 @@ export async function requestPasswordResetHandler(req: Request, res: Response, n
   try {
     const { email, target } = req.body as ForgotPasswordRequestInput
     const result = await requestPasswordReset(email, target)
-    successRes(res, result.message, { devCode: result.devCode }, 200)
+    successRes(res, result.message, {}, 200)
   } catch (error) {
     next(error)
   }
@@ -91,8 +95,8 @@ export async function verifyPasswordResetHandler(req: Request, res: Response, ne
 
 export async function resetPasswordHandler(req: Request, res: Response, next: NextFunction): Promise<void> {
   try {
-    const { email, code, newPassword, target } = req.body as ForgotPasswordResetInput
-    await resetPasswordWithOtp(email, code, newPassword, target)
+    const { email, resetToken, newPassword, target } = req.body as ForgotPasswordResetInput
+    await resetPasswordWithOtp(email, resetToken, newPassword, target)
     successRes(res, 'Password has been reset successfully. You can now sign in with your new password.', {}, 200)
   } catch (error) {
     next(error)

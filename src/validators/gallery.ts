@@ -9,11 +9,26 @@ export const GALLERY_CATEGORIES = [
   'SALON',
 ] as const
 
+/**
+ * Accepted image references — either an absolute (Cloudinary) URL or a
+ * server-relative upload/seed path. The gallery stores both forms, so the
+ * strict `.url()` check wrongly rejected seed/local images on edit.
+ */
+const imageRef = z
+  .string()
+  .trim()
+  .min(1, 'Image is required.')
+  .max(500)
+  .refine(
+    (value) => /^(https?:\/\/|\/(?:uploads|api)\/)/.test(value),
+    'Image must be a valid URL or a server upload path.',
+  )
+
 export const createGallerySchema = z.object({
   title: z.string().trim().min(2, 'Title must be at least 2 characters.').max(200),
   category: z.enum(GALLERY_CATEGORIES).default('HAIRCUT'),
   barberId: z.coerce.number().int().positive().optional().nullable(),
-  image: z.string().trim().url('Image must be a valid URL.').max(500).optional().nullable(),
+  image: imageRef.optional().nullable(),
 })
 
 export const updateGallerySchema = createGallerySchema.partial()

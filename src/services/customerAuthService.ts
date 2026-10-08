@@ -1,11 +1,11 @@
-import crypto from 'node:crypto'
 import bcrypt from 'bcryptjs'
 import jwt from 'jsonwebtoken'
 import { env } from '../config/env'
 import { prisma } from '../config/database'
 import type { Customer } from '@prisma/client'
-import { normalizeNigerianPhone, isPlausiblePhone } from '../utils/phone'
+import { normalizeNigerianPhone, isPlausiblePhone, toE164 } from '../utils/phone'
 import {
+  AppError,
   ConflictError,
   ForbiddenError,
   NotFoundError,
@@ -13,10 +13,15 @@ import {
   UnprocessableError,
 } from '../utils/errors'
 import { ensureCustomerCode } from './customerService'
-import { sendEmail } from './mailer'
-
-const OTP_TTL_MINUTES = 10
-const MAX_ATTEMPTS = 5
+import { sendEmail, isValidRecipient } from './mailer'
+import { isSmsConfigured, sendSms } from './smsService'
+import {
+  generateOtp,
+  hashOtp,
+  OTP_TTL_MINUTES,
+  RESEND_COOLDOWN_SECONDS,
+  MAX_OTP_ATTEMPTS,
+} from './otpService'
 
 export interface CustomerTokenPayload {
   sub: number
@@ -37,32 +42,45 @@ export function signCustomerToken(customer: Customer): string {
   })
 }
 
-function generateOtp(): string {
-  return String(crypto.randomInt(0, 1_000_000)).padStart(6, '0')
-}
-
-function hashOtp(code: string, phone: string): string {
-  return crypto.createHmac('sha256', env.jwtSecret).update(`${phone}:${code}`).digest('hex')
-}
-
-async function deliverOtp(
+/**
+ * Stores a login OTP and delivers it via SMS when SMS is configured, otherwise
+ * by email. The code is never returned to the caller; a failed delivery throws
+ * an honest AppError (and the stored code is deleted) so the UI never hints a
+ * code exists that the user cannot have received.
+ */
+async function storeAndDeliverLoginOtp(
   customer: { fullName: string; email: string | null },
   phone: string,
   code: string,
-): Promise<{ devCode: string | null }> {
+): Promise<void> {
   const expires = new Date(Date.now() + OTP_TTL_MINUTES * 60_000)
 
   await prisma.customerOtp.deleteMany({ where: { phone, purpose: 'LOGIN' } })
-  await prisma.customerOtp.create({
+  const otp = await prisma.customerOtp.create({
     data: {
       phone,
       purpose: 'LOGIN',
-      codeHash: hashOtp(code, phone),
+      codeHash: hashOtp(code, `login:${phone}`),
       expiresAt: expires,
     },
   })
 
-  if (customer.email) {
+  const e164 = toE164(phone)
+  let delivered = false
+
+  if (isSmsConfigured() && e164) {
+    try {
+      await sendSms(
+        e164,
+        `Your SAWABA verification code is ${code}. It expires in ${OTP_TTL_MINUTES} minutes. Do not share it.`,
+      )
+      delivered = true
+    } catch (smsErr) {
+      console.warn('[customer-auth] otp SMS failed:', (smsErr as Error).message)
+    }
+  }
+
+  if (!delivered && customer.email && isValidRecipient(customer.email)) {
     try {
       await sendEmail({
         to: customer.email,
@@ -70,20 +88,24 @@ async function deliverOtp(
         text: `Hello ${customer.fullName},\n\nYour SAWABA verification code is ${code}. It expires in ${OTP_TTL_MINUTES} minutes.\n\nIf you did not request this, you can safely ignore this email.`,
         html: `<p>Hello ${customer.fullName},</p><p>Your SAWABA verification code is <strong style="font-size:22px;letter-spacing:4px;">${code}</strong>. It expires in ${OTP_TTL_MINUTES} minutes.</p><p style="color:#888;font-size:12px;">If you did not request this, you can safely ignore this email.</p>`,
       })
-    } catch (error) {
-      console.error('[customer-auth] otp email failed:', (error as Error).message)
+      delivered = true
+    } catch (mailErr) {
+      console.warn('[customer-auth] otp email failed:', (mailErr as Error).message)
     }
   }
 
-  return {
-    devCode: env.nodeEnv !== 'production' ? code : null,
+  if (!delivered) {
+    await prisma.customerOtp.delete({ where: { id: otp.id } })
+    throw new AppError(
+      'We could not deliver your code right now. Please try again in a moment or contact support.',
+      502,
+    )
   }
 }
 
 export async function requestLoginOtp(rawPhone: string): Promise<{
   found: boolean
   message: string
-  devCode: string | null
 }> {
   const phone = normalizeNigerianPhone(rawPhone)
   if (!isPlausiblePhone(phone)) {
@@ -95,16 +117,29 @@ export async function requestLoginOtp(rawPhone: string): Promise<{
     return {
       found: false,
       message: 'No account found for this number. Please create one first.',
-      devCode: null,
+    }
+  }
+
+  // Resend cooldown: refuse a new code while an unexpired one was just issued.
+  const live = await prisma.customerOtp.findFirst({
+    where: { phone, purpose: 'LOGIN', consumedAt: null, expiresAt: { gt: new Date() } },
+    orderBy: { createdAt: 'desc' },
+  })
+  if (live) {
+    const waited = (Date.now() - live.createdAt.getTime()) / 1000
+    if (waited < RESEND_COOLDOWN_SECONDS) {
+      const wait = Math.ceil(RESEND_COOLDOWN_SECONDS - waited)
+      throw new AppError(`Please wait ${wait} second${wait === 1 ? '' : 's'} before requesting another code.`, 429)
     }
   }
 
   const code = generateOtp()
-  const { devCode } = await deliverOtp(customer, phone, code)
+  await storeAndDeliverLoginOtp(customer, phone, code)
+
+  const channel = toE164(phone) ? 'your phone' : customer.email ?? 'your contact'
   return {
     found: true,
-    message: `We sent a 6-digit code to ${customer.email ?? 'your contact'}. It expires in ${OTP_TTL_MINUTES} minutes.`,
-    devCode,
+    message: `We sent a 6-digit code to ${channel}. It expires in ${OTP_TTL_MINUTES} minutes.`,
   }
 }
 
@@ -121,11 +156,11 @@ export async function verifyLoginOtp(
   if (!record) {
     throw new UnauthorizedError('This code has expired. Please request a new one.')
   }
-  if (record.attempts >= MAX_ATTEMPTS) {
+  if (record.attempts >= MAX_OTP_ATTEMPTS) {
     await prisma.customerOtp.delete({ where: { id: record.id } })
     throw new UnauthorizedError('Too many incorrect attempts. Please request a new code.')
   }
-  if (record.codeHash !== hashOtp(code.trim(), phone)) {
+  if (record.codeHash !== hashOtp(code.trim(), `login:${phone}`)) {
     await prisma.customerOtp.update({
       where: { id: record.id },
       data: { attempts: { increment: 1 } },
@@ -205,17 +240,46 @@ export async function registerCustomer(input: {
 }
 
 export async function loginWithPassword(
-  rawPhone: string,
+  rawIdentifier: string,
   password: string,
 ): Promise<{ token: string; customer: Customer }> {
-  const phone = normalizeNigerianPhone(rawPhone)
-  const customer = await prisma.customer.findFirst({ where: { phone, isActive: true } })
+  const identifier = rawIdentifier.trim()
+  const looksLikeEmail = identifier.includes('@')
+
+  let customer: Customer | null = null
+  if (looksLikeEmail) {
+    customer = await prisma.customer.findFirst({
+      where: {
+        email: identifier.toLowerCase(),
+        isActive: true,
+      },
+    })
+  } else {
+    try {
+      const phone = normalizeNigerianPhone(identifier)
+      customer = await prisma.customer.findFirst({
+        where: {
+          phone,
+          isActive: true,
+        },
+      })
+    } catch {
+      // If phone normalization fails, try direct match
+      customer = await prisma.customer.findFirst({
+        where: {
+          phone: identifier,
+          isActive: true,
+        },
+      })
+    }
+  }
+
   if (!customer?.passwordHash) {
-    throw new UnauthorizedError('No password login for this number. Use phone code instead.')
+    throw new UnauthorizedError('No password login for this account. Use phone code instead.')
   }
   const ok = await bcrypt.compare(password, customer.passwordHash)
   if (!ok) {
-    throw new UnauthorizedError('Incorrect phone number or password.')
+    throw new UnauthorizedError('Incorrect email/phone or password.')
   }
   await ensureCustomerCode(customer)
   const updated = await prisma.customer.update({

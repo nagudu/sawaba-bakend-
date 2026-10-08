@@ -7,7 +7,7 @@ import {
   deleteGalleryItem,
 } from '../services/galleryService'
 import { successRes } from '../utils/response'
-import { uploadImageToCloudinary } from '../utils/upload'
+import { uploadImageToCloudinary, deleteImageByUrl } from '../utils/upload'
 import { AppError } from '../utils/errors'
 import type { CreateGalleryInput, UpdateGalleryInput } from '../validators/gallery'
 
@@ -54,6 +54,7 @@ export async function getGalleryByIdHandler(req: Request, res: Response, next: N
 export async function updateGalleryHandler(req: Request, res: Response, next: NextFunction): Promise<void> {
   try {
     const id = Number(req.params.id)
+    const existing = await getGalleryById(id)
     const uploadedImage = req.file ? await uploadImageToCloudinary(req.file.buffer, 'sawaba-gallery', req.file.mimetype) : null
 
     const input: UpdateGalleryInput = {
@@ -63,6 +64,9 @@ export async function updateGalleryHandler(req: Request, res: Response, next: Ne
     }
 
     const item = await updateGalleryItem(id, input)
+    if (uploadedImage && existing.image && existing.image !== item.image) {
+      await deleteImageByUrl(existing.image).catch(() => undefined)
+    }
     successRes(res, 'Gallery item updated successfully.', item, 200)
   } catch (error) {
     next(error)

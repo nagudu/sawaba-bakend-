@@ -8,7 +8,8 @@ import { env } from '../config/env'
 import { AppError } from './errors'
 
 const ALLOWED_MIME_TYPES = new Set(['image/jpeg', 'image/png', 'image/webp', 'image/gif', 'image/avif'])
-export const MAX_IMAGE_SIZE_MB = 5
+// Vercel serverless request body ceiling is 4.5MB; capping upload file size at 4MB prevents 413 Gateway errors
+export const MAX_IMAGE_SIZE_MB = 4
 
 export const upload = multer({
   storage: multer.memoryStorage(),
@@ -26,9 +27,24 @@ export interface UploadedImage {
   publicId: string
 }
 
-const PLACEHOLDER_VALUES = new Set(['your-cloud-name', 'your-api-key', 'your-api-secret'])
+const PLACEHOLDER_VALUES = new Set([
+  'your-cloud-name',
+  'your-api-key',
+  'your-api-secret',
+  'your_cloud_name',
+  'your_api_key',
+  'your_api_secret',
+])
 
-function credentialsConfigured(): boolean {
+export function credentialsConfigured(): boolean {
+  if (
+    process.env.CLOUDINARY_URL &&
+    process.env.CLOUDINARY_URL.startsWith('cloudinary://') &&
+    !process.env.CLOUDINARY_URL.includes('your-api-key') &&
+    !process.env.CLOUDINARY_URL.includes('your_api_key')
+  ) {
+    return true
+  }
   return (
     Boolean(env.cloudinary.cloudName) &&
     Boolean(env.cloudinary.apiKey) &&
@@ -39,12 +55,41 @@ function credentialsConfigured(): boolean {
   )
 }
 
+/** Detects if the code is executing within a Vercel Serverless environment. */
+export function isVercelRuntime(): boolean {
+  return process.env.VERCEL === '1' || Boolean(process.env.VERCEL_ENV)
+}
+
+/**
+ * Determines whether to upload to Cloudinary or write to local disk.
+ * - If UPLOAD_DRIVER is explicitly set ('cloudinary' or 'local'), respect it.
+ * - On Vercel, the filesystem is ephemeral and read-only, so Cloudinary is required.
+ * - If Cloudinary credentials are configured, prefer Cloudinary.
+ * - Otherwise falls back to local disk (offline-first development).
+ */
+export function getUploadDriver(): 'cloudinary' | 'local' {
+  const explicit = process.env.UPLOAD_DRIVER?.trim().toLowerCase()
+  if (explicit === 'cloudinary' || explicit === 'local') {
+    return explicit
+  }
+
+  if (isVercelRuntime()) {
+    return 'cloudinary'
+  }
+
+  if (credentialsConfigured()) {
+    return 'cloudinary'
+  }
+
+  return 'local'
+}
+
 // ─── Local disk storage (offline-first default) ───────────────────────────────
-// UPLOAD_DRIVER=local (default) writes images into backend/uploads/<folder>/
+// UPLOAD_DRIVER=local writes images into backend/uploads/<folder>/
 // and stores web paths like /uploads/<folder>/<file> in the database. The
 // backend serves /uploads statically, so everything works with no internet
-// and no third-party account. UPLOAD_DRIVER=cloudinary keeps the legacy
-// behavior for cloud deployments.
+// and no third-party account. On Vercel (or when Cloudinary is configured),
+// Cloudinary is automatically selected.
 
 // CommonJS build: resolve from this compiled file (dist/utils/upload.js → backend/uploads)
 export const uploadsRoot = process.env.UPLOADS_DIR
@@ -69,6 +114,12 @@ export function localUploadPath(url: string): string | null {
 }
 
 function saveLocalImage(buffer: Buffer, folder: string, mimetype: string): UploadedImage {
+  if (isVercelRuntime()) {
+    throw new AppError(
+      'Local file uploads cannot be persisted on Vercel Serverless. Please configure Cloudinary credentials (CLOUDINARY_CLOUD_NAME, CLOUDINARY_API_KEY, and CLOUDINARY_API_SECRET, or CLOUDINARY_URL) in your Vercel Project Settings > Environment Variables.',
+      503,
+    )
+  }
   const sub = path.basename(folder || 'misc')
   const dir = path.join(uploadsRoot, sub)
   fs.mkdirSync(dir, { recursive: true })
@@ -88,17 +139,57 @@ function deleteLocalImage(publicId: string): void {
   }
 }
 
-/** Deletes a stored image when it is a local upload; Cloudinary images keep their legacy cleanup. */
+/** Deletes a stored image when it is a local upload; Cloudinary images use Cloudinary destroy. */
 export async function deleteImageFromCloudinary(publicId: string): Promise<void> {
   if (!publicId) return
   if (publicId.startsWith('local:')) {
     deleteLocalImage(publicId)
     return
   }
-  await cloudinary.uploader.destroy(publicId).catch(() => undefined)
+  if (credentialsConfigured()) {
+    await cloudinary.uploader.destroy(publicId).catch(() => undefined)
+  }
 }
 
-/** Deletes an image given only its stored URL — works for /uploads paths and cloud URLs. */
+/**
+ * Extracts the full Cloudinary public_id from a Cloudinary URL, including folder paths
+ * and stripping any transformation segments (e.g. /image/upload/v1234/folder/photo.jpg -> folder/photo).
+ */
+export function extractCloudinaryPublicId(url: string): string | null {
+  try {
+    const parsed = new URL(url)
+    const marker = '/image/upload/'
+    const idx = parsed.pathname.indexOf(marker)
+    if (idx === -1) return null
+
+    const sub = parsed.pathname.slice(idx + marker.length)
+    const parts = sub.split('/')
+
+    let startIdx = 0
+    while (startIdx < parts.length) {
+      const part = parts[startIdx]
+      if (/^v\d+$/.test(part)) {
+        startIdx++
+        break
+      }
+      if (part.includes(',') || /^[a-z]_[a-z0-9_-]+$/i.test(part)) {
+        startIdx++
+        continue
+      }
+      break
+    }
+
+    const publicPathWithExt = parts.slice(startIdx).join('/')
+    if (!publicPathWithExt) return null
+
+    const dotIdx = publicPathWithExt.lastIndexOf('.')
+    return dotIdx !== -1 ? publicPathWithExt.slice(0, dotIdx) : publicPathWithExt
+  } catch {
+    return null
+  }
+}
+
+/** Deletes an image given only its stored URL — works for /uploads paths and Cloudinary URLs. */
 export async function deleteImageByUrl(url: string): Promise<void> {
   if (!url) return
   if (isLocalUploadUrl(url)) {
@@ -108,15 +199,10 @@ export async function deleteImageByUrl(url: string): Promise<void> {
     }
     return
   }
-  if (url.includes('cloudinary')) {
-    // Legacy cloud URLs: derive the public id from the path.
-    try {
-      const parsed = new URL(url)
-      const file = parsed.pathname.split('/').pop() ?? ''
-      const id = file.split('.')[0]
-      if (id) await cloudinary.uploader.destroy(id).catch(() => undefined)
-    } catch {
-      // ignore malformed URLs
+  if (url.includes('cloudinary') && credentialsConfigured()) {
+    const publicId = extractCloudinaryPublicId(url)
+    if (publicId) {
+      await cloudinary.uploader.destroy(publicId).catch(() => undefined)
     }
   }
 }
@@ -126,20 +212,23 @@ export async function uploadImageToCloudinary(
   folder?: string,
   mimetype: string = 'image/jpeg',
 ): Promise<UploadedImage> {
-  const driver = (process.env.UPLOAD_DRIVER ?? 'local').toLowerCase()
+  const driver = getUploadDriver()
 
   if (driver === 'cloudinary') {
     if (!credentialsConfigured()) {
-      throw new AppError(
-        'Image upload is not configured. Add your real Cloudinary API key and secret to backend/.env, or paste an image URL instead of uploading a file.',
-        503,
-      )
+      const isVercel = isVercelRuntime()
+      const errorMsg = isVercel
+        ? 'Image upload is not configured. Since this backend runs on Vercel Serverless, persistent image storage requires Cloudinary. Please add CLOUDINARY_CLOUD_NAME, CLOUDINARY_API_KEY, and CLOUDINARY_API_SECRET (or CLOUDINARY_URL) to your Vercel Project Settings > Environment Variables.'
+        : 'Image upload is not configured. Add your real Cloudinary credentials to backend/.env (CLOUDINARY_CLOUD_NAME, CLOUDINARY_API_KEY, and CLOUDINARY_API_SECRET, or CLOUDINARY_URL), or set UPLOAD_DRIVER=local for offline local storage.'
+      throw new AppError(errorMsg, 503)
     }
+
     const id = crypto.randomBytes(12).toString('hex')
+    const targetFolder = folder ?? env.cloudinary.uploadFolder
     const result = await new Promise<UploadApiResponse>((resolve, reject) => {
       const stream = cloudinary.uploader.upload_stream(
         {
-          folder: folder ?? env.cloudinary.uploadFolder,
+          folder: targetFolder,
           public_id: id,
           resource_type: 'image',
           transformation: [{ width: 1200, crop: 'limit', quality: 'auto', fetch_format: 'auto' }],

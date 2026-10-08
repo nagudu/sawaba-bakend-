@@ -1,5 +1,5 @@
 import 'dotenv/config'
-import { verifyEmailProvider, isEmailConfigured, activeProvider, getFromAddress } from '../services/mailer'
+import { verifyEmailProvider, isEmailConfigured, activeProvider, getFromAddress } from '../../services/mailer'
 
 /**
  * Verifies the SMTP configuration from backend/.env without sending an email.

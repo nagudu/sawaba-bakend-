@@ -3,6 +3,7 @@ import multer from 'multer'
 import { ZodError } from 'zod'
 import { Prisma } from '@prisma/client'
 import { AppError } from '../utils/errors'
+import { MAX_IMAGE_SIZE_MB } from '../utils/upload'
 
 export function notFoundHandler(req: Request, res: Response): void {
   res.status(404).json({
@@ -29,7 +30,7 @@ export function errorHandler(error: unknown, _req: Request, res: Response, _next
   if (error instanceof multer.MulterError) {
     const message =
       error.code === 'LIMIT_FILE_SIZE'
-        ? 'File is too large. Maximum allowed size is 5MB.'
+        ? `File is too large. Maximum allowed size is ${MAX_IMAGE_SIZE_MB}MB.`
         : `Upload error: ${error.code}`
     res.status(400).json({ success: false, message })
     return
@@ -73,10 +74,14 @@ export function errorHandler(error: unknown, _req: Request, res: Response, _next
 
   const httpCode = (error as { http_code?: unknown }).http_code
   if (typeof httpCode === 'number' && httpCode >= 400 && httpCode <= 599) {
+    const rawMsg = (error as { message?: string }).message || ''
+    const isVercel = process.env.VERCEL === '1' || Boolean(process.env.VERCEL_ENV)
+    const hint = isVercel
+      ? 'Check your Cloudinary credentials (CLOUDINARY_CLOUD_NAME, API_KEY, API_SECRET or CLOUDINARY_URL) in Vercel Project Settings > Environment Variables.'
+      : 'Check your Cloudinary credentials (CLOUDINARY_CLOUD_NAME, API_KEY, API_SECRET or CLOUDINARY_URL) in backend/.env.'
     res.status(502).json({
       success: false,
-      message:
-        'Image upload failed. Check your Cloudinary credentials (CLOUDINARY_CLOUD_NAME, API_KEY, API_SECRET) in backend/.env.',
+      message: rawMsg ? `Cloudinary upload error (${httpCode}): ${rawMsg}. ${hint}` : `Image upload failed. ${hint}`,
     })
     return
   }
