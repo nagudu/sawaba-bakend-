@@ -7,25 +7,75 @@ import {
   deleteGalleryItem,
 } from '../services/galleryService'
 import { successRes } from '../utils/response'
-import { uploadImageToCloudinary, deleteImageByUrl } from '../utils/upload'
+import {
+  uploadImageToCloudinary,
+  uploadVideoToCloudinary,
+  deleteImageByUrl,
+  deleteVideoByUrl,
+  MAX_IMAGE_SIZE_MB,
+} from '../utils/upload'
 import { AppError } from '../utils/errors'
 import type { CreateGalleryInput, UpdateGalleryInput } from '../validators/gallery'
 
+type UploadedFiles = Request['files']
+type MediaType = 'IMAGE' | 'VIDEO'
+
+/** Pulls the first uploaded file for a given multipart field, if any. */
+function firstUploadedFile(files: UploadedFiles, field: string): Express.Multer.File | null {
+  if (!files || Array.isArray(files)) return null
+  const bucket = (files as Record<string, Express.Multer.File[]>)[field]
+  return bucket && bucket.length > 0 ? bucket[0] : null
+}
+
+/** Multer's request-wide limit is the (larger) video ceiling, so re-check the poster. */
+function assertImageWithinLimit(file: Express.Multer.File | null): void {
+  if (file && file.size > MAX_IMAGE_SIZE_MB * 1024 * 1024) {
+    throw new AppError(`Image is too large. Maximum allowed size is ${MAX_IMAGE_SIZE_MB}MB.`, 400)
+  }
+}
+
+function bodyString(value: unknown): string | undefined {
+  return typeof value === 'string' && value.trim() ? value.trim() : undefined
+}
+
 export async function createGalleryHandler(req: Request, res: Response, next: NextFunction): Promise<void> {
   try {
-    const uploadedImage = req.file ? await uploadImageToCloudinary(req.file.buffer, 'sawaba-gallery', req.file.mimetype) : null
+    const imageFile = firstUploadedFile(req.files, 'image')
+    const videoFile = firstUploadedFile(req.files, 'video')
+    assertImageWithinLimit(imageFile)
+
+    const uploadedVideo = videoFile
+      ? await uploadVideoToCloudinary(videoFile.buffer, 'sawaba-gallery/videos', videoFile.mimetype)
+      : null
+    const uploadedImage = imageFile
+      ? await uploadImageToCloudinary(imageFile.buffer, 'sawaba-gallery', imageFile.mimetype)
+      : null
+
+    const bodyImage = bodyString(req.body.image)
+    const bodyVideo = bodyString(req.body.video)
+
+    const mediaType: MediaType =
+      (req.body.mediaType as MediaType | undefined) ??
+      (uploadedVideo || bodyVideo ? 'VIDEO' : 'IMAGE')
+
+    const image =
+      bodyImage ??
+      uploadedImage?.url ??
+      (mediaType === 'VIDEO' ? uploadedVideo?.thumbnailUrl ?? null : null)
+
+    const video = bodyVideo ?? uploadedVideo?.url ?? null
 
     const input: CreateGalleryInput = {
-      ...req.body,
-      image: req.body.image ?? uploadedImage?.url ?? null,
+      title: req.body.title,
+      category: req.body.category,
+      mediaType,
       barberId: req.body.barberId ? Number(req.body.barberId) : null,
+      image,
+      video,
+      duration: req.body.duration,
     }
 
-    if (!input.image) {
-      throw new AppError('An image is required. Upload a file or provide an image URL.', 400)
-    }
-
-    const item = await createGallery(input)
+    const item = await createGallery(input, { videoPublicId: uploadedVideo?.publicId ?? null })
     successRes(res, 'Gallery item created successfully.', item, 201)
   } catch (error) {
     next(error)
@@ -55,18 +105,54 @@ export async function updateGalleryHandler(req: Request, res: Response, next: Ne
   try {
     const id = Number(req.params.id)
     const existing = await getGalleryById(id)
-    const uploadedImage = req.file ? await uploadImageToCloudinary(req.file.buffer, 'sawaba-gallery', req.file.mimetype) : null
+
+    const imageFile = firstUploadedFile(req.files, 'image')
+    const videoFile = firstUploadedFile(req.files, 'video')
+    assertImageWithinLimit(imageFile)
+
+    const uploadedVideo = videoFile
+      ? await uploadVideoToCloudinary(videoFile.buffer, 'sawaba-gallery/videos', videoFile.mimetype)
+      : null
+    const uploadedImage = imageFile
+      ? await uploadImageToCloudinary(imageFile.buffer, 'sawaba-gallery', imageFile.mimetype)
+      : null
+
+    const bodyImage = bodyString(req.body.image)
+    const bodyVideo = bodyString(req.body.video)
+
+    const mediaType: MediaType | undefined =
+      (req.body.mediaType as MediaType | undefined) ??
+      (uploadedVideo || bodyVideo ? 'VIDEO' : uploadedImage || bodyImage ? 'IMAGE' : undefined)
+
+    const image =
+      bodyImage ??
+      uploadedImage?.url ??
+      (mediaType === 'VIDEO' ? uploadedVideo?.thumbnailUrl ?? undefined : undefined)
+    const video = bodyVideo ?? uploadedVideo?.url ?? undefined
 
     const input: UpdateGalleryInput = {
-      ...req.body,
-      image: req.body.image ?? uploadedImage?.url ?? undefined,
-      barberId: req.body.barberId === undefined || req.body.barberId === null || req.body.barberId === '' ? null : Number(req.body.barberId),
+      ...(req.body.title !== undefined ? { title: req.body.title } : {}),
+      ...(req.body.category !== undefined ? { category: req.body.category } : {}),
+      ...(mediaType !== undefined ? { mediaType } : {}),
+      ...(req.body.barberId !== undefined
+        ? { barberId: req.body.barberId === '' || req.body.barberId === null ? null : Number(req.body.barberId) }
+        : {}),
+      ...(image !== undefined ? { image } : {}),
+      ...(video !== undefined ? { video } : {}),
+      ...(req.body.duration !== undefined ? { duration: req.body.duration } : {}),
     }
 
-    const item = await updateGalleryItem(id, input)
-    if (uploadedImage && existing.image && existing.image !== item.image) {
+    const item = await updateGalleryItem(id, input, {
+      ...(uploadedVideo ? { videoPublicId: uploadedVideo.publicId } : {}),
+    })
+
+    if ((uploadedImage || bodyImage) && existing.image && existing.image !== item.image) {
       await deleteImageByUrl(existing.image).catch(() => undefined)
     }
+    if ((uploadedVideo || bodyVideo) && existing.video && existing.video !== item.video) {
+      await deleteVideoByUrl(existing.video).catch(() => undefined)
+    }
+
     successRes(res, 'Gallery item updated successfully.', item, 200)
   } catch (error) {
     next(error)

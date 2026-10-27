@@ -1,37 +1,4 @@
 "use strict";
-var __createBinding = (this && this.__createBinding) || (Object.create ? (function(o, m, k, k2) {
-    if (k2 === undefined) k2 = k;
-    var desc = Object.getOwnPropertyDescriptor(m, k);
-    if (!desc || ("get" in desc ? !m.__esModule : desc.writable || desc.configurable)) {
-      desc = { enumerable: true, get: function() { return m[k]; } };
-    }
-    Object.defineProperty(o, k2, desc);
-}) : (function(o, m, k, k2) {
-    if (k2 === undefined) k2 = k;
-    o[k2] = m[k];
-}));
-var __setModuleDefault = (this && this.__setModuleDefault) || (Object.create ? (function(o, v) {
-    Object.defineProperty(o, "default", { enumerable: true, value: v });
-}) : function(o, v) {
-    o["default"] = v;
-});
-var __importStar = (this && this.__importStar) || (function () {
-    var ownKeys = function(o) {
-        ownKeys = Object.getOwnPropertyNames || function (o) {
-            var ar = [];
-            for (var k in o) if (Object.prototype.hasOwnProperty.call(o, k)) ar[ar.length] = k;
-            return ar;
-        };
-        return ownKeys(o);
-    };
-    return function (mod) {
-        if (mod && mod.__esModule) return mod;
-        var result = {};
-        if (mod != null) for (var k = ownKeys(mod), i = 0; i < k.length; i++) if (k[i] !== "default") __createBinding(result, mod, k[i]);
-        __setModuleDefault(result, mod);
-        return result;
-    };
-})();
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.getCustomerSummary = getCustomerSummary;
 exports.getCustomerAppointments = getCustomerAppointments;
@@ -39,13 +6,12 @@ exports.getCustomerPayments = getCustomerPayments;
 exports.getCustomerAppointmentById = getCustomerAppointmentById;
 exports.cancelOwnAppointment = cancelOwnAppointment;
 exports.getBookingPrefill = getBookingPrefill;
-const models_1 = require("../models");
+const database_1 = require("../config/database");
 const errors_1 = require("../utils/errors");
 const appointmentService_1 = require("./appointmentService");
 const customerService_1 = require("./customerService");
 const paymentService_1 = require("./paymentService");
 const appointmentStatuses_1 = require("../config/appointmentStatuses");
-/** Appointment statuses a customer may cancel themselves. */
 const CUSTOMER_CANCELLABLE = new Set([
     appointmentStatuses_1.AppointmentStatusValue.PAYMENT_REQUIRED,
     appointmentStatuses_1.AppointmentStatusValue.PAYMENT_SUBMITTED,
@@ -64,23 +30,18 @@ function daysAgoLabel(date) {
     const months = Math.floor(diffDays / 30);
     return months === 1 ? '1 month ago' : `${months} months ago`;
 }
-/** Everything the customer dashboard needs in one call (always customer-scoped). */
 async function getCustomerSummary(customer) {
     const [appointments, stats] = await Promise.all([
-        models_1.Appointment.findAll({
+        database_1.prisma.appointment.findMany({
             where: { customerId: customer.id },
-            include: [
-                { model: (await Promise.resolve().then(() => __importStar(require('../models')))).Service, as: 'service', attributes: ['id', 'name', 'price', 'duration'] },
-                { model: (await Promise.resolve().then(() => __importStar(require('../models')))).Barber, as: 'barber', attributes: ['id', 'name', 'image'] },
-                // Customer-safe assignment info (#15): name/image only.
-                { model: (await Promise.resolve().then(() => __importStar(require('../models')))).Barber, as: 'assignedBarber', attributes: ['id', 'name', 'image'] },
-                { model: models_1.Payment, as: 'payment', attributes: ['id', 'status', 'amount', 'paymentMethod', 'accessToken'] },
-            ],
-            order: [
-                ['appointmentDate', 'DESC'],
-                ['appointmentTime', 'DESC'],
-            ],
-            limit: 200,
+            include: {
+                service: { select: { id: true, name: true, price: true, duration: true } },
+                barber: { select: { id: true, name: true, image: true } },
+                assignedBarber: { select: { id: true, name: true, image: true } },
+                payment: { select: { id: true, status: true, amount: true, paymentMethod: true, accessToken: true } },
+            },
+            orderBy: [{ appointmentDate: 'desc' }, { appointmentTime: 'desc' }],
+            take: 200,
         }),
         (0, customerService_1.getCustomerStats)(customer.id),
     ]);
@@ -96,7 +57,6 @@ async function getCustomerSummary(customer) {
         ? a.appointmentTime.localeCompare(b.appointmentTime)
         : a.appointmentDate.localeCompare(b.appointmentDate));
     const past = serialized.filter((a) => !upcoming.includes(a));
-    // "Book Again": most frequent service across history (not forced — just a suggestion).
     const counts = new Map();
     for (const appointment of appointments) {
         const entry = counts.get(appointment.serviceId);
@@ -159,25 +119,24 @@ async function getCustomerSummary(customer) {
         usual,
     };
 }
-/** Full paginated booking history for the logged-in customer. */
 async function getCustomerAppointments(customer, query) {
     const page = Math.max(1, Number(query.page) || 1);
     const perPage = Math.min(50, Math.max(1, Number(query.perPage) || 20));
-    const { rows, count } = await models_1.Appointment.findAndCountAll({
-        where: { customerId: customer.id },
-        include: [
-            { model: (await Promise.resolve().then(() => __importStar(require('../models')))).Service, as: 'service', attributes: ['id', 'name', 'price', 'duration'] },
-            { model: (await Promise.resolve().then(() => __importStar(require('../models')))).Barber, as: 'barber', attributes: ['id', 'name', 'image'] },
-            { model: (await Promise.resolve().then(() => __importStar(require('../models')))).Barber, as: 'assignedBarber', attributes: ['id', 'name', 'image'] },
-            { model: models_1.Payment, as: 'payment' },
-        ],
-        order: [
-            ['appointmentDate', 'DESC'],
-            ['appointmentTime', 'DESC'],
-        ],
-        offset: (page - 1) * perPage,
-        limit: perPage,
-    });
+    const [rows, count] = await Promise.all([
+        database_1.prisma.appointment.findMany({
+            where: { customerId: customer.id },
+            include: {
+                service: { select: { id: true, name: true, price: true, duration: true } },
+                barber: { select: { id: true, name: true, image: true } },
+                assignedBarber: { select: { id: true, name: true, image: true } },
+                payment: true,
+            },
+            orderBy: [{ appointmentDate: 'desc' }, { appointmentTime: 'desc' }],
+            skip: (page - 1) * perPage,
+            take: perPage,
+        }),
+        database_1.prisma.appointment.count({ where: { customerId: customer.id } }),
+    ]);
     return {
         items: rows.map(appointmentService_1.serializeAppointment),
         total: count,
@@ -185,37 +144,32 @@ async function getCustomerAppointments(customer, query) {
         perPage,
     };
 }
-/** Payment history with receipt access — strictly scoped to this customer. */
 async function getCustomerPayments(customer, query) {
     const page = Math.max(1, Number(query.page) || 1);
     const perPage = Math.min(50, Math.max(1, Number(query.perPage) || 20));
-    const { rows, count } = await models_1.Payment.findAndCountAll({
-        where: { customerId: customer.id },
-        include: [
-            {
-                model: (await Promise.resolve().then(() => __importStar(require('../models')))).Appointment,
-                as: 'appointment',
-                attributes: ['id', 'referenceCode', 'customerName', 'appointmentDate', 'appointmentTime', 'status'],
-                include: [
-                    {
-                        model: (await Promise.resolve().then(() => __importStar(require('../models')))).Service,
-                        as: 'service',
-                        attributes: ['id', 'name', 'price'],
+    const [rows, count] = await Promise.all([
+        database_1.prisma.payment.findMany({
+            where: { customerId: customer.id },
+            include: {
+                appointment: {
+                    select: {
+                        id: true,
+                        referenceCode: true,
+                        customerName: true,
+                        appointmentDate: true,
+                        appointmentTime: true,
+                        status: true,
+                        service: { select: { id: true, name: true, price: true } },
+                        barber: { select: { id: true, name: true } },
                     },
-                    {
-                        model: (await Promise.resolve().then(() => __importStar(require('../models')))).Barber,
-                        as: 'barber',
-                        attributes: ['id', 'name'],
-                    },
-                ],
+                },
             },
-        ],
-        order: [['createdAt', 'DESC']],
-        offset: (page - 1) * perPage,
-        limit: perPage,
-    });
-    // accessToken IS included deliberately: it is the customer's own payment-
-    // page key, letting them open /pay and /receipt pages for their records.
+            orderBy: { createdAt: 'desc' },
+            skip: (page - 1) * perPage,
+            take: perPage,
+        }),
+        database_1.prisma.payment.count({ where: { customerId: customer.id } }),
+    ]);
     return {
         items: rows.map((payment) => ({
             id: payment.id,
@@ -242,49 +196,24 @@ async function getCustomerPayments(customer, query) {
         perPage,
     };
 }
-/** Single appointment detail — strictly scoped to the logged-in customer. */
 async function getCustomerAppointmentById(customer, appointmentId) {
-    const appointment = await models_1.Appointment.findByPk(appointmentId, {
-        include: [
-            {
-                model: (await Promise.resolve().then(() => __importStar(require('../models')))).Service,
-                as: 'service',
-                attributes: ['id', 'name', 'price', 'duration'],
-            },
-            {
-                model: (await Promise.resolve().then(() => __importStar(require('../models')))).Barber,
-                as: 'barber',
-                attributes: ['id', 'name', 'image'],
-            },
-            {
-                model: (await Promise.resolve().then(() => __importStar(require('../models')))).Barber,
-                as: 'assignedBarber',
-                attributes: ['id', 'name', 'image'],
-            },
-            {
-                model: models_1.Payment,
-                as: 'payment',
-                // Include the accessToken so the frontend can open /pay/:token directly.
-                attributes: ['id', 'status', 'amount', 'paymentMethod', 'transactionReference',
-                    'paymentDate', 'receiptUrl', 'rejectionReason', 'verifiedAt', 'accessToken'],
-            },
-        ],
+    const appointment = await database_1.prisma.appointment.findUnique({
+        where: { id: appointmentId },
+        include: {
+            service: { select: { id: true, name: true, price: true, duration: true } },
+            barber: { select: { id: true, name: true, image: true } },
+            assignedBarber: { select: { id: true, name: true, image: true } },
+            payment: true,
+        },
     });
-    // Return an identical 404 whether the appointment doesn't exist or belongs
-    // to a different customer — prevents ID enumeration.
     if (!appointment || appointment.customerId !== customer.id) {
         throw new errors_1.NotFoundError('Appointment not found.');
     }
     return (0, appointmentService_1.serializeAppointment)(appointment);
 }
-/** Customer cancels their own appointment — backend re-checks every rule. */
 async function cancelOwnAppointment(customer, appointmentId, reason) {
-    const appointment = await models_1.Appointment.findByPk(appointmentId);
-    if (!appointment) {
-        throw new errors_1.NotFoundError('Appointment not found.');
-    }
-    if (appointment.customerId !== customer.id) {
-        // Deliberately identical to "not found" so IDs cannot be probed.
+    const appointment = await database_1.prisma.appointment.findUnique({ where: { id: appointmentId } });
+    if (!appointment || appointment.customerId !== customer.id) {
         throw new errors_1.NotFoundError('Appointment not found.');
     }
     if (!CUSTOMER_CANCELLABLE.has(appointment.status)) {
@@ -294,42 +223,40 @@ async function cancelOwnAppointment(customer, appointmentId, reason) {
                 ? 'This appointment is already cancelled.'
                 : 'This appointment can no longer be cancelled online. Please call the salon.');
     }
-    await appointment.update({
-        status: appointmentStatuses_1.AppointmentStatusValue.CANCELLED,
-        cancelledAt: new Date(),
-        cancellationReason: reason ?? 'Cancelled by customer',
-        cancelledBy: null,
+    await database_1.prisma.appointment.update({
+        where: { id: appointmentId },
+        data: {
+            status: appointmentStatuses_1.AppointmentStatusValue.CANCELLED,
+            cancelledAt: new Date(),
+            cancellationReason: reason ?? 'Cancelled by customer',
+            cancelledBy: null,
+        },
     });
     await (0, paymentService_1.markPaymentCancelled)(appointment.id);
-    const fresh = await models_1.Appointment.findByPk(appointment.id, {
-        include: [
-            { model: (await Promise.resolve().then(() => __importStar(require('../models')))).Service, as: 'service', attributes: ['id', 'name', 'price', 'duration'] },
-            { model: (await Promise.resolve().then(() => __importStar(require('../models')))).Barber, as: 'barber', attributes: ['id', 'name', 'image'] },
-            { model: models_1.Payment, as: 'payment', attributes: ['id', 'status', 'amount', 'paymentMethod', 'accessToken'] },
-        ],
+    const fresh = await database_1.prisma.appointment.findUnique({
+        where: { id: appointment.id },
+        include: {
+            service: { select: { id: true, name: true, price: true, duration: true } },
+            barber: { select: { id: true, name: true, image: true } },
+            payment: true,
+        },
     });
     return (0, appointmentService_1.serializeAppointment)(fresh);
 }
-/**
- * Booking prefill for a logged-in customer: identity plus their usual
- * service/barber so the booking form starts 90% complete.
- */
 async function getBookingPrefill(customer) {
-    const [lastAppointment, recentServices] = await Promise.all([
-        models_1.Appointment.findOne({
+    const [lastAppointment, recentServicesRaw] = await Promise.all([
+        database_1.prisma.appointment.findFirst({
             where: { customerId: customer.id },
-            order: [['createdAt', 'DESC']],
-            include: [
-                { model: (await Promise.resolve().then(() => __importStar(require('../models')))).Service, as: 'service', attributes: ['id', 'name', 'price', 'duration'] },
-                { model: (await Promise.resolve().then(() => __importStar(require('../models')))).Barber, as: 'barber', attributes: ['id', 'name'] },
-            ],
+            orderBy: { createdAt: 'desc' },
+            include: {
+                service: { select: { id: true, name: true, price: true, duration: true } },
+                barber: { select: { id: true, name: true } },
+            },
         }),
-        models_1.Appointment.findAll({
+        database_1.prisma.appointment.findMany({
             where: { customerId: customer.id },
-            attributes: ['serviceId'],
-            group: ['serviceId'],
-            order: [],
-            raw: true,
+            select: { serviceId: true },
+            distinct: ['serviceId'],
         }),
     ]);
     let usualService = null;
@@ -343,9 +270,8 @@ async function getBookingPrefill(customer) {
         };
         usualBarberId = lastAppointment.barberId;
     }
-    // An explicit favorite overrides recency.
     if (customer.favoriteServiceId && (!usualService || customer.favoriteServiceId !== usualService.id)) {
-        const fav = await models_1.Service.findByPk(customer.favoriteServiceId);
+        const fav = await database_1.prisma.service.findUnique({ where: { id: customer.favoriteServiceId } });
         if (fav) {
             usualService = { id: fav.id, name: fav.name, price: Number(fav.price), duration: fav.duration };
         }
@@ -357,7 +283,7 @@ async function getBookingPrefill(customer) {
         usualService,
         usualBarberId,
         preferredBarberId: customer.preferredBarberId,
-        recentServiceIds: recentServices.map((r) => Number(r.serviceId)),
+        recentServiceIds: recentServicesRaw.map((r) => r.serviceId),
     };
 }
 //# sourceMappingURL=customerMeService.js.map

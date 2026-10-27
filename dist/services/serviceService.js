@@ -6,8 +6,7 @@ exports.listServices = listServices;
 exports.getServiceById = getServiceById;
 exports.updateService = updateService;
 exports.deleteService = deleteService;
-const sequelize_1 = require("sequelize");
-const models_1 = require("../models");
+const database_1 = require("../config/database");
 const errors_1 = require("../utils/errors");
 const slug_1 = require("../utils/slug");
 const response_1 = require("../utils/response");
@@ -17,7 +16,7 @@ function serializeService(service) {
         name: service.name,
         slug: service.slug,
         description: service.description,
-        price: Number(service.price),
+        price: service.price.toNumber(),
         duration: service.duration,
         image: service.image,
         category: service.category,
@@ -30,11 +29,10 @@ async function uniqueSlug(name, excludeId) {
     const base = (0, slug_1.slugify)(name);
     let candidate = base;
     let counter = 2;
-    while (true) {
-        const existing = await models_1.Service.findOne({
-            where: excludeId
-                ? { slug: candidate, id: { [sequelize_1.Op.not]: excludeId } }
-                : { slug: candidate },
+    for (;;) {
+        const existing = await database_1.prisma.service.findFirst({
+            where: excludeId ? { slug: candidate, id: { not: excludeId } } : { slug: candidate },
+            select: { id: true },
         });
         if (!existing)
             return candidate;
@@ -44,7 +42,7 @@ async function uniqueSlug(name, excludeId) {
 }
 async function createService(input) {
     const slug = await uniqueSlug(input.name);
-    const service = await models_1.Service.create({ ...input, slug });
+    const service = await database_1.prisma.service.create({ data: { ...input, slug } });
     return serializeService(service);
 }
 async function listServices(query, includeInactive = false) {
@@ -58,55 +56,51 @@ async function listServices(query, includeInactive = false) {
                 : {}),
         ...(query.search
             ? {
-                [sequelize_1.Op.or]: [
-                    { name: { [sequelize_1.Op.like]: `%${query.search}%` } },
-                    { slug: { [sequelize_1.Op.like]: `%${query.search}%` } },
-                    { description: { [sequelize_1.Op.like]: `%${query.search}%` } },
+                OR: [
+                    { name: { contains: query.search } },
+                    { slug: { contains: query.search } },
+                    { description: { contains: query.search } },
                 ],
             }
             : {}),
     };
-    const { rows, count } = await models_1.Service.findAndCountAll({
-        where,
-        order: [['name', 'ASC']],
-        offset,
-        limit,
-    });
-    return {
-        items: rows.map(serializeService),
-        total: count,
-        page,
-        perPage,
-    };
+    const [rows, total] = await database_1.prisma.$transaction([
+        database_1.prisma.service.findMany({ where, orderBy: { name: 'asc' }, skip: offset, take: limit }),
+        database_1.prisma.service.count({ where }),
+    ]);
+    return { items: rows.map(serializeService), total, page, perPage };
 }
 async function getServiceById(id) {
-    const service = await models_1.Service.findByPk(id);
+    const service = await database_1.prisma.service.findUnique({ where: { id } });
     if (!service) {
         throw new errors_1.NotFoundError('Service not found.');
     }
     return serializeService(service);
 }
 async function updateService(id, input) {
-    const service = await models_1.Service.findByPk(id);
+    const service = await database_1.prisma.service.findUnique({ where: { id } });
     if (!service) {
         throw new errors_1.NotFoundError('Service not found.');
     }
-    const changes = { ...input };
-    if (input.name && input.name !== service.name) {
-        changes.slug = await uniqueSlug(input.name, id);
-    }
-    await service.update(changes);
-    return serializeService(service);
+    const slug = input.name && input.name !== service.name ? await uniqueSlug(input.name, id) : undefined;
+    const updated = await database_1.prisma.service.update({
+        where: { id },
+        data: {
+            ...input,
+            ...(slug ? { slug } : {}),
+        },
+    });
+    return serializeService(updated);
 }
 async function deleteService(id) {
-    const service = await models_1.Service.findByPk(id);
+    const service = await database_1.prisma.service.findUnique({ where: { id }, select: { id: true } });
     if (!service) {
         throw new errors_1.NotFoundError('Service not found.');
     }
-    const appointmentCount = await models_1.Appointment.count({ where: { serviceId: id } });
+    const appointmentCount = await database_1.prisma.appointment.count({ where: { serviceId: id } });
     if (appointmentCount > 0) {
         throw new errors_1.ConflictError('This service has appointments attached. Deactivate it instead of deleting.');
     }
-    await service.destroy();
+    await database_1.prisma.service.delete({ where: { id } });
 }
 //# sourceMappingURL=serviceService.js.map

@@ -4,39 +4,27 @@ exports.DEFAULT_HOURS = void 0;
 exports.minutesToHHmm = minutesToHHmm;
 exports.hhmmToMinutes = hhmmToMinutes;
 exports.getAvailableTimeSlots = getAvailableTimeSlots;
-const sequelize_1 = require("sequelize");
-const models_1 = require("../models");
+const database_1 = require("../config/database");
 const appointmentStatuses_1 = require("../config/appointmentStatuses");
 const errors_1 = require("../utils/errors");
-/**
- * How long checkout sessions may hold their slot.
- *
- * STRICT AVAILABILITY RULE: a slot only shows as unavailable when a REAL
- * booking (appointment) or a payment genuinely in flight occupies it.
- * Merely-staged (OPEN) sessions hold NOTHING — a customer who abandons a
- * checkout must never make a free slot look taken to everyone else.
- * Sessions already inside a Paystack checkout (money possibly in flight) do
- * hold for 45 minutes — longer than Paystack's own 30-minute transaction
- * expiry, so a slow-but-honest payment can never be orphaned.
- */
 const SESSION_HOLD_MINUTES = 20;
 const AWAITING_PAYMENT_HOLD_MINUTES = 45;
-/** Expires stale checkout sessions, then returns the slot intervals they hold. */
 async function checkoutSessionHolds(barberId, date, fallbackDuration) {
-    await models_1.CheckoutSession.update({ status: 'EXPIRED' }, {
+    await database_1.prisma.checkoutSession.updateMany({
         where: {
             status: 'OPEN',
-            updatedAt: { [sequelize_1.Op.lt]: new Date(Date.now() - SESSION_HOLD_MINUTES * 60 * 1000) },
+            updatedAt: { lt: new Date(Date.now() - SESSION_HOLD_MINUTES * 60 * 1000) },
         },
+        data: { status: 'EXPIRED' },
     });
-    await models_1.CheckoutSession.update({ status: 'EXPIRED' }, {
+    await database_1.prisma.checkoutSession.updateMany({
         where: {
             status: 'AWAITING_PAYMENT',
-            updatedAt: { [sequelize_1.Op.lt]: new Date(Date.now() - AWAITING_PAYMENT_HOLD_MINUTES * 60 * 1000) },
+            updatedAt: { lt: new Date(Date.now() - AWAITING_PAYMENT_HOLD_MINUTES * 60 * 1000) },
         },
+        data: { status: 'EXPIRED' },
     });
-    // ONLY in-flight payments hold a slot. Staged-but-unpaid sessions do not.
-    const sessions = await models_1.CheckoutSession.findAll({
+    const sessions = await database_1.prisma.checkoutSession.findMany({
         where: {
             barberId,
             appointmentDate: date,
@@ -46,18 +34,13 @@ async function checkoutSessionHolds(barberId, date, fallbackDuration) {
     if (sessions.length === 0)
         return [];
     const serviceIds = [...new Set(sessions.map((s) => s.serviceId))];
-    const services = await models_1.Service.findAll({ where: { id: serviceIds } });
+    const services = await database_1.prisma.service.findMany({ where: { id: { in: serviceIds } } });
     const durationMap = new Map(services.map((s) => [s.id, s.duration]));
     return sessions.map((session) => {
         const start = hhmmToMinutes(session.appointmentTime);
         return { start, end: start + (durationMap.get(session.serviceId) ?? fallbackDuration) };
     });
 }
-/**
- * Default opening hours for barbers the admin has not configured yet.
- * Mirrors the seeded schedule so unconfigured barbers stay bookable
- * instead of silently having zero slots.
- */
 exports.DEFAULT_HOURS = {
     0: { start: '11:00', end: '18:00' }, // Sunday
     1: { start: '09:00', end: '20:00' },
@@ -82,26 +65,22 @@ function toDateInput(date) {
     const day = String(date.getDate()).padStart(2, '0');
     return `${year}-${month}-${day}`;
 }
-/** Returns the list of bookable time slots for a barber on a given date. */
 async function getAvailableTimeSlots(barberId, date, serviceDurationMinutes = 30) {
-    const barber = await models_1.Barber.findByPk(barberId);
+    const barber = await database_1.prisma.barber.findUnique({ where: { id: barberId } });
     if (!barber) {
         throw new errors_1.NotFoundError('Barber not found.');
     }
     const dayOfWeek = new Date(`${date}T00:00:00`).getDay();
-    // Configured barbers use their own schedule; barbers with no availability
-    // rows at all fall back to the salon's default opening hours so they stay
-    // bookable (an admin can still restrict them from the dashboard).
-    const barberSchedule = await models_1.BarberAvailability.findAll({ where: { barberId } });
+    const barberSchedule = await database_1.prisma.barberAvailability.findMany({ where: { barberId } });
     if (barberSchedule.length === 0) {
         const fallback = exports.DEFAULT_HOURS[dayOfWeek];
         if (!fallback)
             return [];
-        const existing = await models_1.Appointment.findAll({
+        const existing = await database_1.prisma.appointment.findMany({
             where: {
                 barberId,
                 appointmentDate: date,
-                status: { [sequelize_1.Op.ne]: appointmentStatuses_1.AppointmentStatusValue.CANCELLED },
+                status: { not: appointmentStatuses_1.AppointmentStatusValue.CANCELLED },
             },
         });
         const bookings = [
@@ -137,15 +116,15 @@ async function getAvailableTimeSlots(barberId, date, serviceDurationMinutes = 30
         start: hhmmToMinutes(availability[0].startTime),
         end: hhmmToMinutes(availability[0].endTime),
     };
-    const existing = await models_1.Appointment.findAll({
+    const existing = await database_1.prisma.appointment.findMany({
         where: {
             barberId,
             appointmentDate: date,
-            status: { [sequelize_1.Op.ne]: appointmentStatuses_1.AppointmentStatusValue.CANCELLED },
+            status: { not: appointmentStatuses_1.AppointmentStatusValue.CANCELLED },
         },
     });
     const serviceIds = [...new Set(existing.map((a) => a.serviceId))];
-    const services = await models_1.Service.findAll({ where: { id: serviceIds } });
+    const services = await database_1.prisma.service.findMany({ where: { id: { in: serviceIds } } });
     const serviceMap = new Map(services.map((s) => [s.id, s.duration]));
     const bookings = [
         ...existing.map((appointment) => {

@@ -3,8 +3,11 @@ Object.defineProperty(exports, "__esModule", { value: true });
 exports.successRes = successRes;
 exports.errorRes = errorRes;
 exports.getPagination = getPagination;
+const prismaSerialize_1 = require("./prismaSerialize");
 function successRes(res, message, data, status = 200) {
-    res.status(status).json({ success: true, message, data });
+    // Normalises Prisma values (Decimal, @db.Date) into the exact shapes Sequelize
+    // produced, so the frontend sees an unchanged API contract during the migration.
+    res.status(status).json({ success: true, message, data: (0, prismaSerialize_1.serializePrisma)(data) });
 }
 function errorRes(res, message, status = 400) {
     res.status(status).json({ success: false, message });

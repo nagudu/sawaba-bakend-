@@ -9,21 +9,16 @@ exports.changeBarberPassword = changeBarberPassword;
 const bcryptjs_1 = __importDefault(require("bcryptjs"));
 const jsonwebtoken_1 = __importDefault(require("jsonwebtoken"));
 const env_1 = require("../config/env");
-const models_1 = require("../models");
+const database_1 = require("../config/database");
 const errors_1 = require("../utils/errors");
 const barberService_1 = require("./barberService");
-/**
- * Issues a barber-portal JWT. Roles are explicitly checked by requireBarber,
- * so a barber token can never be used to hit admin endpoints and vice-versa.
- */
 function signToken(barber) {
     return jsonwebtoken_1.default.sign({ sub: barber.id, email: barber.email ?? '', name: barber.name, role: 'BARBER' }, env_1.env.jwtSecret, { expiresIn: env_1.env.jwtExpiresIn });
 }
-/** Signs in a barber using their email OR phone and the admin-issued password. */
 async function loginBarber(input) {
     const identifier = input.identifier.trim().toLowerCase();
     const byEmail = identifier.includes('@');
-    const barber = await models_1.Barber.findOne({
+    const barber = await database_1.prisma.barber.findFirst({
         where: byEmail ? { email: identifier } : { phone: identifier },
     });
     if (!barber || !barber.passwordHash) {
@@ -41,17 +36,22 @@ async function loginBarber(input) {
     }
     return { token: signToken(barber), barber: (0, barberService_1.serializeBarberForAdmin)(barber) };
 }
-/** Returns the scoped, portal-safe profile of the authenticated barber. */
 async function getBarberMe(barberId) {
-    const barber = await models_1.Barber.findByPk(barberId);
+    const barber = await database_1.prisma.barber.findUnique({
+        where: { id: barberId },
+        include: {
+            barberServices: {
+                include: { service: true },
+            },
+        },
+    });
     if (!barber) {
         throw new errors_1.UnauthorizedError('Barber account no longer exists.');
     }
-    return (0, barberService_1.serializeBarberForAdmin)(barber);
+    return (0, barberService_1.serializeBarberForAdmin)(barber, true);
 }
-/** Allows a barber to rotate their own portal password. */
 async function changeBarberPassword(barberId, input) {
-    const barber = await models_1.Barber.findByPk(barberId);
+    const barber = await database_1.prisma.barber.findUnique({ where: { id: barberId } });
     if (!barber) {
         throw new errors_1.UnauthorizedError('Barber account no longer exists.');
     }
@@ -59,7 +59,10 @@ async function changeBarberPassword(barberId, input) {
     if (!matches) {
         throw new errors_1.AppError('Current password is incorrect.', 400);
     }
-    barber.passwordHash = await bcryptjs_1.default.hash(input.newPassword, 12);
-    await barber.save();
+    const newHash = await bcryptjs_1.default.hash(input.newPassword, 12);
+    await database_1.prisma.barber.update({
+        where: { id: barberId },
+        data: { passwordHash: newHash },
+    });
 }
 //# sourceMappingURL=barberAuthService.js.map

@@ -19,7 +19,13 @@ exports.createServiceSchema = zod_1.z.object({
     description: zod_1.z.string().trim().max(2000).optional().nullable(),
     price: zod_1.z.coerce.number().min(0, 'Price cannot be negative.'),
     duration: zod_1.z.coerce.number().int().min(5, 'Duration must be at least 5 minutes.').max(480),
-    image: zod_1.z.string().trim().url('Image must be a valid URL.').max(500).optional().nullable(),
+    image: zod_1.z
+        .string()
+        .trim()
+        .max(500)
+        .refine((value) => !value || /^(https?:\/\/|\/(?:uploads|api|images)\/)/.test(value), 'Image must be a valid URL or a server upload path.')
+        .optional()
+        .nullable(),
     category: zod_1.z.enum(exports.SERVICE_CATEGORIES).default('HAIRCUTS'),
     isActive: zod_1.z.coerce.boolean().default(true),
 });

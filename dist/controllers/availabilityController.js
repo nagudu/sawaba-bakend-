@@ -3,7 +3,7 @@ Object.defineProperty(exports, "__esModule", { value: true });
 exports.getAvailabilityHandler = getAvailabilityHandler;
 const availabilityService_1 = require("../services/availabilityService");
 const response_1 = require("../utils/response");
-const models_1 = require("../models");
+const database_1 = require("../config/database");
 async function getAvailabilityHandler(req, res, next) {
     try {
         const barberId = Number(req.query.barberId);
@@ -11,7 +11,7 @@ async function getAvailabilityHandler(req, res, next) {
         const durationOverride = Number(req.query.duration) || undefined;
         let duration = durationOverride;
         if (!duration && req.query.serviceId) {
-            const service = await models_1.Service.findByPk(Number(req.query.serviceId));
+            const service = await database_1.prisma.service.findUnique({ where: { id: Number(req.query.serviceId) } });
             if (service)
                 duration = service.duration;
         }

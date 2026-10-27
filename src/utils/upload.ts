@@ -11,6 +11,16 @@ const ALLOWED_MIME_TYPES = new Set(['image/jpeg', 'image/png', 'image/webp', 'im
 // Vercel serverless request body ceiling is 4.5MB; capping upload file size at 4MB prevents 413 Gateway errors
 export const MAX_IMAGE_SIZE_MB = 4
 
+const ALLOWED_VIDEO_MIME_TYPES = new Set([
+  'video/mp4',
+  'video/webm',
+  'video/ogg',
+  'video/quicktime',
+  'video/x-m4v',
+  'video/x-matroska',
+])
+export const MAX_VIDEO_SIZE_MB = 50
+
 export const upload = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: MAX_IMAGE_SIZE_MB * 1024 * 1024 },
@@ -22,9 +32,38 @@ export const upload = multer({
   },
 })
 
+/**
+ * Multer instance for gallery media. Accepts an optional poster/thumbnail on the
+ * `image` field (≤4MB, image MIME types) and an optional clip on the `video`
+ * field (≤50MB, video MIME types). The byte limit is the video ceiling so large
+ * clips pass; the controller enforces the tighter image cap afterwards.
+ */
+export const galleryUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: MAX_VIDEO_SIZE_MB * 1024 * 1024, files: 2 },
+  fileFilter: (_req, file, cb) => {
+    if (file.fieldname === 'video') {
+      if (!ALLOWED_VIDEO_MIME_TYPES.has(file.mimetype)) {
+        return cb(new AppError('Only MP4, WEBM, OGG, MOV, M4V and MKV videos are allowed.', 400))
+      }
+      return cb(null, true)
+    }
+    if (!ALLOWED_MIME_TYPES.has(file.mimetype)) {
+      return cb(new AppError('Only JPEG, PNG, WEBP, GIF and AVIF images are allowed.', 400))
+    }
+    cb(null, true)
+  },
+})
+
 export interface UploadedImage {
   url: string
   publicId: string
+}
+
+export interface UploadedVideo {
+  url: string
+  publicId: string
+  thumbnailUrl: string | null
 }
 
 const PLACEHOLDER_VALUES = new Set([
@@ -104,6 +143,15 @@ const EXTENSIONS: Record<string, string> = {
   'image/avif': 'avif',
 }
 
+const VIDEO_EXTENSIONS: Record<string, string> = {
+  'video/mp4': 'mp4',
+  'video/webm': 'webm',
+  'video/ogg': 'ogv',
+  'video/quicktime': 'mov',
+  'video/x-m4v': 'm4v',
+  'video/x-matroska': 'mkv',
+}
+
 export const isLocalUploadUrl = (url: string): boolean => url.startsWith('/uploads/')
 
 /** Absolute filesystem path for a stored local upload URL (null for external URLs). */
@@ -155,10 +203,13 @@ export async function deleteImageFromCloudinary(publicId: string): Promise<void>
  * Extracts the full Cloudinary public_id from a Cloudinary URL, including folder paths
  * and stripping any transformation segments (e.g. /image/upload/v1234/folder/photo.jpg -> folder/photo).
  */
-export function extractCloudinaryPublicId(url: string): string | null {
+export function extractCloudinaryPublicId(
+  url: string,
+  resourceType: 'image' | 'video' = 'image',
+): string | null {
   try {
     const parsed = new URL(url)
-    const marker = '/image/upload/'
+    const marker = `/${resourceType}/upload/`
     const idx = parsed.pathname.indexOf(marker)
     if (idx === -1) return null
 
@@ -246,4 +297,82 @@ export async function uploadImageToCloudinary(
 
   // Default: local disk — works fully offline.
   return saveLocalImage(buffer, folder ?? 'misc', mimetype)
+}
+
+// ─── Video uploads ────────────────────────────────────────────────────────────
+
+function saveLocalVideo(buffer: Buffer, folder: string, mimetype: string): UploadedVideo {
+  if (isVercelRuntime()) {
+    throw new AppError(
+      'Local video uploads cannot be persisted on Vercel Serverless. Please configure Cloudinary credentials (CLOUDINARY_CLOUD_NAME, CLOUDINARY_API_KEY, and CLOUDINARY_API_SECRET, or CLOUDINARY_URL) in your Vercel Project Settings > Environment Variables.',
+      503,
+    )
+  }
+  const ext = VIDEO_EXTENSIONS[mimetype] ?? 'mp4'
+  const dir = path.join(uploadsRoot, folder)
+  fs.mkdirSync(dir, { recursive: true })
+  const name = `${Date.now()}-${crypto.randomBytes(8).toString('hex')}.${ext}`
+  fs.writeFileSync(path.join(dir, name), buffer)
+  return { url: `/uploads/${folder}/${name}`, publicId: `local:${folder}/${name}`, thumbnailUrl: null }
+}
+
+/** Deletes a stored video given only its stored URL — works for /uploads paths and Cloudinary URLs. */
+export async function deleteVideoByUrl(url: string): Promise<void> {
+  if (!url) return
+  if (isLocalUploadUrl(url)) {
+    const target = localUploadPath(url)
+    if (target && target.startsWith(uploadsRoot) && fs.existsSync(target)) {
+      fs.unlinkSync(target)
+    }
+    return
+  }
+  if (url.includes('cloudinary') && credentialsConfigured()) {
+    const publicId = extractCloudinaryPublicId(url, 'video')
+    if (publicId) {
+      await cloudinary.uploader.destroy(publicId, { resource_type: 'video' }).catch(() => undefined)
+    }
+  }
+}
+
+export async function uploadVideoToCloudinary(
+  buffer: Buffer,
+  folder?: string,
+  mimetype: string = 'video/mp4',
+): Promise<UploadedVideo> {
+  const driver = getUploadDriver()
+  const targetFolder = folder ?? env.cloudinary.uploadFolder
+
+  if (driver === 'cloudinary') {
+    if (!credentialsConfigured()) {
+      const isVercel = isVercelRuntime()
+      const errorMsg = isVercel
+        ? 'Video upload is not configured. Since this backend runs on Vercel Serverless, persistent video storage requires Cloudinary. Please add CLOUDINARY_CLOUD_NAME, CLOUDINARY_API_KEY, and CLOUDINARY_API_SECRET (or CLOUDINARY_URL) to your Vercel Project Settings > Environment Variables.'
+        : 'Video upload is not configured. Add your real Cloudinary credentials to backend/.env (CLOUDINARY_CLOUD_NAME, CLOUDINARY_API_KEY, and CLOUDINARY_API_SECRET, or CLOUDINARY_URL), or set UPLOAD_DRIVER=local for offline local storage.'
+      throw new AppError(errorMsg, 503)
+    }
+
+    const id = crypto.randomBytes(12).toString('hex')
+    const result = await new Promise<UploadApiResponse>((resolve, reject) => {
+      const stream = cloudinary.uploader.upload_stream(
+        {
+          folder: targetFolder,
+          public_id: id,
+          resource_type: 'video',
+          transformation: [{ width: 1280, crop: 'limit', quality: 'auto' }],
+        },
+        (error, uploadResult) => {
+          if (error) reject(error)
+          else if (uploadResult) resolve(uploadResult)
+          else reject(new Error('Cloudinary returned no result'))
+        },
+      )
+      stream.end(buffer)
+    })
+    // Cloudinary renders a JPG from the first frame when the video URL extension is swapped.
+    const poster = result.secure_url.replace(/\.[a-z0-9]+$/i, '.jpg')
+    return { url: result.secure_url, publicId: result.public_id, thumbnailUrl: poster }
+  }
+
+  // Default: local disk — works fully offline.
+  return saveLocalVideo(buffer, folder ?? 'gallery/videos', mimetype)
 }

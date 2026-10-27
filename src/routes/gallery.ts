@@ -8,7 +8,7 @@ import {
 } from '../controllers/galleryController'
 import { requireAdmin } from '../middleware/auth'
 import { validate } from '../middleware/validate'
-import { upload } from '../utils/upload'
+import { galleryUpload } from '../utils/upload'
 import {
   createGallerySchema,
   updateGallerySchema,
@@ -84,7 +84,10 @@ galleryRouter.get('/', validate(listGalleryQuerySchema, 'query'), listGalleryHan
 galleryRouter.post(
   '/',
   requireAdmin,
-  upload.single('image'),
+  galleryUpload.fields([
+    { name: 'image', maxCount: 1 },
+    { name: 'video', maxCount: 1 },
+  ]),
   validate(createGallerySchema),
   createGalleryHandler,
 )
@@ -144,7 +147,10 @@ galleryRouter.get('/:id', validate(idParamsSchema, 'params'), getGalleryByIdHand
 galleryRouter.put(
   '/:id',
   requireAdmin,
-  upload.single('image'),
+  galleryUpload.fields([
+    { name: 'image', maxCount: 1 },
+    { name: 'video', maxCount: 1 },
+  ]),
   validate(idParamsSchema, 'params'),
   validate(updateGallerySchema),
   updateGalleryHandler,

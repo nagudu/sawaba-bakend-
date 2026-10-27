@@ -1,8 +1,11 @@
 import { Router } from 'express'
 import {
   confirmCashHandler,
+  exportPaymentsHandler,
   getPaymentByIdHandler,
+  getPaymentSummaryHandler,
   listPaymentsHandler,
+  refundPaymentHandler,
   rejectPaymentHandler,
   verifyPaymentHandler,
 } from '../controllers/paymentController'
@@ -12,6 +15,7 @@ import {
   cashConfirmSchema,
   listPaymentsQuerySchema,
   paymentIdParamsSchema,
+  refundPaymentSchema,
   rejectPaymentSchema,
 } from '../validators/payment'
 
@@ -33,6 +37,39 @@ adminPaymentsRouter.get(
   '/',
   validate(listPaymentsQuerySchema, 'query'),
   listPaymentsHandler,
+)
+
+/**
+ * @swagger
+ * /api/admin/payments/summary:
+ *   get:
+ *     tags: [Payments]
+ *     summary: Aggregated transaction totals (admin)
+ *     description: Successful / pending / today revenue totals. Revenue counts verified PAID payments only. Optional from, to and method scope the figures.
+ *     security:
+ *       - bearerAuth: []
+ */
+// Mounted before /:id so "summary" is never captured as a payment id.
+adminPaymentsRouter.get(
+  '/summary',
+  validate(listPaymentsQuerySchema, 'query'),
+  getPaymentSummaryHandler,
+)
+
+/**
+ * @swagger
+ * /api/admin/payments/export:
+ *   get:
+ *     tags: [Payments]
+ *     summary: Export transactions as CSV (admin)
+ *     description: Uses the same filters as the list endpoint; returns a CSV attachment for accounting.
+ *     security:
+ *       - bearerAuth: []
+ */
+adminPaymentsRouter.get(
+  '/export',
+  validate(listPaymentsQuerySchema, 'query'),
+  exportPaymentsHandler,
 )
 
 /**
@@ -77,6 +114,23 @@ adminPaymentsRouter.post(
   validate(paymentIdParamsSchema, 'params'),
   validate(rejectPaymentSchema),
   rejectPaymentHandler,
+)
+
+/**
+ * @swagger
+ * /api/admin/payments/{id}/refund:
+ *   post:
+ *     tags: [Payments]
+ *     summary: Mark a verified payment as refunded (admin)
+ *     description: Only PAID payments can be refunded. Requires a reason. Unsettled barber commission is unwound.
+ *     security:
+ *       - bearerAuth: []
+ */
+adminPaymentsRouter.post(
+  '/:id/refund',
+  validate(paymentIdParamsSchema, 'params'),
+  validate(refundPaymentSchema),
+  refundPaymentHandler,
 )
 
 /**

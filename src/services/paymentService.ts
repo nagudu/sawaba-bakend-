@@ -48,6 +48,10 @@ export interface PaymentPublic {
   status: PaymentStatus
   rejectionReason: string | null
   verifiedAt: Date | null
+  verifiedBy: number | null
+  /** Admin display name for verifiedBy — resolved only on single-payment reads. */
+  verifiedByName?: string | null
+  providerRef: string | null
   createdAt: Date
   updatedAt: Date
   accessToken: string
@@ -69,7 +73,8 @@ export async function applyProviderVerification(
     throw new NotFoundError('Payment record not found for this appointment.')
   }
 
-  if (payment.status !== 'PAID') {
+  const justPaid = payment.status !== 'PAID'
+  if (justPaid) {
     await prisma.payment.update({
       where: { id: payment.id },
       data: {
@@ -111,7 +116,44 @@ export async function applyProviderVerification(
   // Money is now confirmed — re-evaluate the commission ledger (#19).
   await syncEarningForAppointment(appointmentId)
 
+  if (justPaid) {
+    await notifyBarberPaymentVerified(appointmentId)
+  }
+
   return getPublicPaymentByAppointmentId(appointmentId)
+}
+
+/**
+ * Tells the assigned barber (falling back to the originally booked barber) that
+ * the money for an appointment is confirmed. Best-effort: a notification failure
+ * must never roll back a verified payment.
+ */
+async function notifyBarberPaymentVerified(appointmentId: number): Promise<void> {
+  try {
+    const appointment = await prisma.appointment.findUnique({
+      where: { id: appointmentId },
+      select: {
+        referenceCode: true,
+        appointmentDate: true,
+        appointmentTime: true,
+        assignedBarberId: true,
+        barberId: true,
+      },
+    })
+    if (!appointment) return
+    const barberId = appointment.assignedBarberId ?? appointment.barberId
+    if (!barberId) return
+    await prisma.barberNotification.create({
+      data: {
+        barberId,
+        type: 'APPOINTMENT',
+        title: 'Payment confirmed',
+        message: `Payment for ${appointment.referenceCode ?? 'a booking'} on ${appointment.appointmentDate} at ${appointment.appointmentTime} has been verified. The customer is cleared for check-in.`,
+      },
+    })
+  } catch {
+    // best-effort only
+  }
 }
 
 async function getPublicPaymentByAppointmentId(appointmentId: number): Promise<PublicPaymentBundle> {
@@ -145,6 +187,8 @@ function serializePayment(payment: PaymentWithAppointment): PaymentPublic {
     status: payment.status,
     rejectionReason: payment.rejectionReason,
     verifiedAt: payment.verifiedAt,
+    verifiedBy: payment.verifiedBy,
+    providerRef: payment.providerRef,
     createdAt: payment.createdAt,
     updatedAt: payment.updatedAt,
     accessToken: payment.accessToken,
@@ -367,31 +411,69 @@ export interface ListPaymentsQuery {
   perPage?: number
 }
 
-export async function listPayments(query: ListPaymentsQuery): Promise<Paged<PaymentPublic>> {
-  const { page, perPage, offset, limit } = getPagination(query as Record<string, unknown>)
-
+/**
+ * Builds the Prisma filter shared by the list, summary and CSV export so all
+ * three always agree on what a "transaction matching this query" is.
+ * Status and search are only applied when present — the summary intentionally
+ * omits them so it can total every status at once.
+ */
+function buildPaymentWhere(query: ListPaymentsQuery): Prisma.PaymentWhereInput {
   const where: Prisma.PaymentWhereInput = {}
   if (query.status) where.status = query.status
   if (query.method) where.paymentMethod = query.method
+
+  const and: Prisma.PaymentWhereInput[] = []
+
   if (query.from || query.to) {
-    where.paymentDate = {
-      ...(query.from ? { gte: query.from } : {}),
-      ...(query.to ? { lte: query.to } : {}),
-    }
+    // paymentDate is the YYYY-MM-DD the customer declared; rows without one
+    // are dated by when the record was created so they stay in range.
+    and.push({
+      OR: [
+        {
+          paymentDate: {
+            ...(query.from ? { gte: query.from } : {}),
+            ...(query.to ? { lte: query.to } : {}),
+          },
+        },
+        {
+          paymentDate: null,
+          createdAt: {
+            ...(query.from ? { gte: new Date(`${query.from}T00:00:00.000Z`) } : {}),
+            ...(query.to ? { lte: new Date(`${query.to}T23:59:59.999Z`) } : {}),
+          },
+        },
+      ],
+    })
   }
 
   const search = query.search?.trim()
   if (search) {
     const isNum = /^\d+$/.test(search)
-    where.appointment = {
+    and.push({
       OR: [
-        { referenceCode: { contains: search } },
-        { customerName: { contains: search } },
-        { customerPhone: { contains: search } },
-        ...(isNum ? [{ id: Number(search) }] : []),
+        { transactionReference: { contains: search } },
+        {
+          appointment: {
+            OR: [
+              { referenceCode: { contains: search } },
+              { customerName: { contains: search } },
+              { customerPhone: { contains: search } },
+              ...(isNum ? [{ id: Number(search) }] : []),
+            ],
+          },
+        },
       ],
-    }
+    })
   }
+
+  if (and.length > 0) where.AND = and
+  return where
+}
+
+export async function listPayments(query: ListPaymentsQuery): Promise<Paged<PaymentPublic>> {
+  const { page, perPage, offset, limit } = getPagination(query as Record<string, unknown>)
+
+  const where = buildPaymentWhere(query)
 
   const [rows, total] = await Promise.all([
     prisma.payment.findMany({
@@ -420,7 +502,15 @@ export async function getPaymentById(id: number): Promise<PaymentPublic> {
   if (!payment) {
     throw new NotFoundError('Payment not found.')
   }
-  return serializePayment(payment)
+  const serialized = serializePayment(payment)
+  if (payment.verifiedBy) {
+    const admin = await prisma.admin.findUnique({
+      where: { id: payment.verifiedBy },
+      select: { name: true },
+    })
+    serialized.verifiedByName = admin?.name ?? null
+  }
+  return serialized
 }
 
 export async function verifyPayment(id: number, adminId: number): Promise<PaymentPublic> {
@@ -460,6 +550,7 @@ export async function verifyPayment(id: number, adminId: number): Promise<Paymen
     providerRef: null,
     adminId,
   })
+  await notifyBarberPaymentVerified(payment.appointmentId)
   return getPaymentById(id)
 }
 
@@ -508,6 +599,7 @@ export async function confirmCashPayment(
     providerRef: null,
     adminId,
   })
+  await notifyBarberPaymentVerified(payment.appointmentId)
   return getPaymentById(id)
 }
 
@@ -556,4 +648,186 @@ export async function markPaymentCancelled(appointmentId: number): Promise<void>
       data: { status: 'CANCELLED' },
     })
   }
+}
+
+export interface PaymentSummaryStats {
+  totalTransactions: number
+  successfulCount: number
+  successfulTotal: number
+  pendingCount: number
+  pendingTotal: number
+  todayCount: number
+  todayTotal: number
+  failedCount: number
+  failedTotal: number
+  refundedCount: number
+  refundedTotal: number
+  unpaidCount: number
+}
+
+/**
+ * Aggregated revenue figures for the admin transaction dashboard.
+ * Revenue is only ever counted from PAID (verified) payments — pending,
+ * rejected or unverified money never contributes to a total.
+ */
+export async function getPaymentSummary(
+  query: Pick<ListPaymentsQuery, 'from' | 'to' | 'method'>,
+): Promise<PaymentSummaryStats> {
+  const where = buildPaymentWhere(query)
+
+  const [byStatus, total] = await Promise.all([
+    prisma.payment.groupBy({
+      by: ['status'],
+      where,
+      _count: { _all: true },
+      _sum: { amount: true },
+    }),
+    prisma.payment.count({ where }),
+  ])
+
+  const stat = (status: PaymentStatus) => {
+    const row = byStatus.find((entry) => entry.status === status)
+    return { count: row?._count._all ?? 0, total: Number(row?._sum.amount ?? 0) }
+  }
+
+  const successful = stat('PAID')
+  const pending = stat('PENDING_VERIFICATION')
+  const failed = stat('REJECTED')
+  const refunded = stat('REFUNDED')
+  const unpaid = stat('UNPAID')
+
+  // Today's revenue = money confirmed today (UTC day, the same clock the
+  // backend stamps records with).
+  const startOfToday = new Date()
+  startOfToday.setUTCHours(0, 0, 0, 0)
+  const todayAggregate = await prisma.payment.aggregate({
+    where: { ...where, status: 'PAID', verifiedAt: { gte: startOfToday } },
+    _sum: { amount: true },
+    _count: { _all: true },
+  })
+
+  return {
+    totalTransactions: total,
+    successfulCount: successful.count,
+    successfulTotal: successful.total,
+    pendingCount: pending.count,
+    pendingTotal: pending.total,
+    todayCount: todayAggregate._count._all,
+    todayTotal: Number(todayAggregate._sum.amount ?? 0),
+    failedCount: failed.count,
+    failedTotal: failed.total,
+    refundedCount: refunded.count,
+    refundedTotal: refunded.total,
+    unpaidCount: unpaid.count,
+  }
+}
+
+/**
+ * Refunds a verified payment — the money went back to the customer. Only a
+ * PAID payment can be refunded, so a pending or rejected payment can never
+ * become a phantom refund. Unsettled commission is unwound; payouts that were
+ * already paid out to a barber are never rewritten.
+ */
+export async function markPaymentRefunded(
+  id: number,
+  reason: string,
+  adminId: number,
+): Promise<PaymentPublic> {
+  const payment = await prisma.payment.findUnique({
+    where: { id },
+    include: paymentInclude,
+  })
+  if (!payment) {
+    throw new NotFoundError('Payment not found.')
+  }
+  if (payment.status !== 'PAID') {
+    throw new UnprocessableError('Only verified payments can be refunded.')
+  }
+
+  await prisma.payment.update({
+    where: { id },
+    data: {
+      status: 'REFUNDED',
+      rejectionReason: reason,
+      verifiedBy: adminId,
+    },
+  })
+
+  // Refunded money is no longer money the studio kept: drop any unsettled
+  // commission back to PENDING so it never pays out on a refunded sale.
+  const earning = await prisma.barberEarning.findUnique({
+    where: { appointmentId: payment.appointmentId },
+  })
+  if (earning && earning.status !== 'PAID') {
+    await prisma.barberEarning.update({
+      where: { id: earning.id },
+      data: { status: 'PENDING', earnedAt: null },
+    })
+  }
+
+  return getPaymentById(id)
+}
+
+const CSV_COLUMNS = [
+  'Transaction Ref',
+  'Booking Ref',
+  'Customer',
+  'Phone',
+  'Email',
+  'Service',
+  'Barber',
+  'Amount (NGN)',
+  'Method',
+  'Status',
+  'Payment Date',
+  'Verified At',
+  'Receipt URL',
+  'Note',
+  'Created At',
+] as const
+
+function csvCell(value: unknown): string {
+  const text = value == null ? '' : String(value)
+  return /[",\n\r]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text
+}
+
+/**
+ * Renders the filtered transactions as CSV (CRLF, UTF-8 BOM) for accounting.
+ * Shares the exact where-clause with the list so the export always matches
+ * what the admin sees on screen.
+ */
+export async function exportPayments(
+  query: Omit<ListPaymentsQuery, 'page' | 'perPage'>,
+): Promise<string> {
+  const rows = await prisma.payment.findMany({
+    where: buildPaymentWhere(query),
+    include: paymentInclude,
+    orderBy: { createdAt: 'desc' },
+    take: 10000,
+  })
+
+  const lines = [CSV_COLUMNS.join(',')]
+  for (const payment of rows) {
+    const appointment = payment.appointment
+    lines.push(
+      [
+        csvCell(payment.transactionReference ?? ''),
+        csvCell(appointment?.referenceCode ?? appointment?.id ?? ''),
+        csvCell(appointment?.customerName ?? ''),
+        csvCell(appointment?.customerPhone ?? ''),
+        csvCell(appointment?.customerEmail ?? ''),
+        csvCell(appointment?.service?.name ?? ''),
+        csvCell(appointment?.barber?.name ?? ''),
+        csvCell(Number(payment.amount).toFixed(2)),
+        csvCell(payment.paymentMethod ?? ''),
+        csvCell(payment.status),
+        csvCell(payment.paymentDate ?? ''),
+        csvCell(payment.verifiedAt ? payment.verifiedAt.toISOString() : ''),
+        csvCell(payment.receiptUrl ?? ''),
+        csvCell(payment.note ?? ''),
+        csvCell(payment.createdAt.toISOString()),
+      ].join(','),
+    )
+  }
+  return lines.join('\r\n')
 }

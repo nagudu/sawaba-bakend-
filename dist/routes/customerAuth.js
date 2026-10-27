@@ -14,7 +14,7 @@ exports.customerAuthRouter = (0, express_1.Router)();
  *   post:
  *     tags: [Account]
  *     summary: Request a login OTP (public)
- *     description: Sends a 6-digit code to the customer's saved email. Only existing accounts receive codes.
+ *     description: Sends a 6-digit code by SMS (when configured) or to the customer's saved email. Only existing accounts receive codes.
  */
 exports.customerAuthRouter.post('/otp/request', rateLimiter_1.otpLimiter, (0, validate_1.validate)(customerAuth_2.customerOtpRequestSchema), customerAuthController_1.requestOtpHandler);
 /**

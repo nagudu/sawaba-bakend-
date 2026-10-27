@@ -1,6 +1,6 @@
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.GALLERY_CATEGORIES = exports.PAYMENT_METHODS = exports.PAYMENT_STATUSES = exports.APPOINTMENT_STATUSES = void 0;
+exports.REVIEW_STATUSES = exports.GALLERY_CATEGORIES = exports.PAYMENT_METHODS = exports.PAYMENT_STATUSES = exports.APPOINTMENT_STATUSES = void 0;
 exports.APPOINTMENT_STATUSES = [
     'PAYMENT_REQUIRED',
     'PAYMENT_SUBMITTED',
@@ -28,4 +28,6 @@ exports.GALLERY_CATEGORIES = [
     'KIDS',
     'SALON',
 ];
+/** Reviews are stored in a VARCHAR(10) column, not a DB enum, so this is the only guard. */
+exports.REVIEW_STATUSES = ['PENDING', 'APPROVED', 'REJECTED'];
 //# sourceMappingURL=index.js.map

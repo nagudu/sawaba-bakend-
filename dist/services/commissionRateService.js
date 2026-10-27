@@ -3,8 +3,7 @@ Object.defineProperty(exports, "__esModule", { value: true });
 exports.listCommissionRates = listCommissionRates;
 exports.getCommissionRateHistory = getCommissionRateHistory;
 exports.updateCommissionRate = updateCommissionRate;
-const sequelize_1 = require("sequelize");
-const models_1 = require("../models");
+const database_1 = require("../config/database");
 const errors_1 = require("../utils/errors");
 const response_1 = require("../utils/response");
 function serializeRateRow(barber) {
@@ -35,42 +34,47 @@ async function listCommissionRates(query) {
     if (query.commissionType)
         where.commissionType = query.commissionType;
     if (query.search) {
-        Object.assign(where, {
-            [sequelize_1.Op.or]: [
-                { name: { [sequelize_1.Op.like]: `%${query.search}%` } },
-                { location: { [sequelize_1.Op.like]: `%${query.search}%` } },
-            ],
-        });
+        const search = query.search;
+        where.OR = [
+            { name: { contains: search } },
+            { location: { contains: search } },
+        ];
     }
-    const { rows, count } = await models_1.Barber.findAndCountAll({
-        where,
-        order: [['name', 'ASC']],
-        offset,
-        limit,
-    });
+    const [rows, count] = await Promise.all([
+        database_1.prisma.barber.findMany({
+            where,
+            orderBy: { name: 'asc' },
+            skip: offset,
+            take: limit,
+        }),
+        database_1.prisma.barber.count({ where }),
+    ]);
     return { items: rows.map(serializeRateRow), total: count, page, perPage };
 }
 async function getCommissionRateHistory(barberId, query) {
-    const barber = await models_1.Barber.findByPk(barberId);
+    const barber = await database_1.prisma.barber.findUnique({ where: { id: barberId } });
     if (!barber)
         throw new errors_1.NotFoundError('Barber not found.');
     const { page, perPage, offset, limit } = (0, response_1.getPagination)(query);
-    const { rows, count } = await models_1.CommissionRateHistory.findAndCountAll({
-        where: { barberId },
-        order: [['effectiveFrom', 'DESC']],
-        offset,
-        limit,
-    });
-    return Promise.all(rows.map(async (row) => serializeHistoryItem(row, await resolveAdminName(row.changedByAdminId)))).then((items) => ({ items, total: count, page, perPage }));
-}
-async function resolveAdminName(adminId) {
-    if (!adminId)
-        return null;
-    const admin = await models_1.Admin.findByPk(adminId, { attributes: ['name'] });
-    return admin?.name ?? null;
+    const [rows, count] = await Promise.all([
+        database_1.prisma.commissionRateHistory.findMany({
+            where: { barberId },
+            include: { changedBy: { select: { name: true } } },
+            orderBy: { effectiveFrom: 'desc' },
+            skip: offset,
+            take: limit,
+        }),
+        database_1.prisma.commissionRateHistory.count({ where: { barberId } }),
+    ]);
+    return {
+        items: rows.map((row) => serializeHistoryItem(row, row.changedBy?.name ?? null)),
+        total: count,
+        page,
+        perPage,
+    };
 }
 async function updateCommissionRate(barberId, changedByAdminId, input) {
-    const barber = await models_1.Barber.findByPk(barberId);
+    const barber = await database_1.prisma.barber.findUnique({ where: { id: barberId } });
     if (!barber)
         throw new errors_1.NotFoundError('Barber not found.');
     const nextType = input.commissionType ?? (barber.commissionType ?? 'PERCENTAGE');
@@ -81,14 +85,21 @@ async function updateCommissionRate(barberId, changedByAdminId, input) {
     if (nextType === 'PERCENTAGE' && nextValue > 100) {
         throw new errors_1.UnprocessableError('Percentage commission must be between 0 and 100.');
     }
-    await barber.update({ commissionType: nextType, commissionValue: nextValue });
-    await models_1.CommissionRateHistory.create({
-        barberId,
-        commissionType: nextType,
-        commissionValue: nextValue,
-        effectiveFrom: input.effectiveFrom ?? new Date(),
-        changedByAdminId,
-    });
-    return serializeRateRow(barber);
+    const [updatedBarber] = await database_1.prisma.$transaction([
+        database_1.prisma.barber.update({
+            where: { id: barberId },
+            data: { commissionType: nextType, commissionValue: nextValue },
+        }),
+        database_1.prisma.commissionRateHistory.create({
+            data: {
+                barberId,
+                commissionType: nextType,
+                commissionValue: nextValue,
+                effectiveFrom: input.effectiveFrom ?? new Date(),
+                changedByAdminId,
+            },
+        }),
+    ]);
+    return serializeRateRow(updatedBarber);
 }
 //# sourceMappingURL=commissionRateService.js.map

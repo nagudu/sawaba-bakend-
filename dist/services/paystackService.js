@@ -10,6 +10,7 @@ exports.verifyPaystack = verifyPaystack;
 exports.isValidPaystackSignature = isValidPaystackSignature;
 exports.handlePaystackWebhook = handlePaystackWebhook;
 const node_crypto_1 = __importDefault(require("node:crypto"));
+const database_1 = require("../config/database");
 const errors_1 = require("../utils/errors");
 const paymentService_1 = require("./paymentService");
 /**
@@ -52,7 +53,7 @@ async function paystackRequest(method, path, body) {
             body: body === undefined ? undefined : JSON.stringify(body),
         });
     }
-    catch (error) {
+    catch {
         throw new errors_1.UnprocessableError('Unable to connect to the payment gateway. Please try again.');
     }
     const json = (await response.json().catch(() => null));
@@ -101,9 +102,12 @@ async function initializePaystack(token) {
             customerName: appointment.customerName,
         },
     });
-    await payment.update({
-        paymentMethod: 'ONLINE',
-        transactionReference: init.reference,
+    await database_1.prisma.payment.update({
+        where: { id: payment.id },
+        data: {
+            paymentMethod: 'ONLINE',
+            transactionReference: init.reference,
+        },
     });
     return {
         authorizationUrl: init.authorization_url,

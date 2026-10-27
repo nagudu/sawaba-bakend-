@@ -8,13 +8,8 @@ exports.attachCustomerIfPresent = attachCustomerIfPresent;
 exports.assertCustomerActive = assertCustomerActive;
 const jsonwebtoken_1 = __importDefault(require("jsonwebtoken"));
 const env_1 = require("../config/env");
-const models_1 = require("../models");
+const database_1 = require("../config/database");
 const errors_1 = require("../utils/errors");
-/**
- * Customer JWT guard. The backend ALWAYS resolves the customer from the
- * signed token — customerId values in the request body/query are ignored for
- * authorization, so one customer can never read or change another's data.
- */
 async function requireCustomer(req, _res, next) {
     try {
         const authHeader = req.headers.authorization;
@@ -31,7 +26,7 @@ async function requireCustomer(req, _res, next) {
         if (payload.role !== 'CUSTOMER') {
             throw new errors_1.UnauthorizedError('This area requires a customer account.');
         }
-        const customer = await models_1.Customer.findByPk(payload.sub);
+        const customer = await database_1.prisma.customer.findUnique({ where: { id: payload.sub } });
         if (!customer || !customer.isActive) {
             throw new errors_1.UnauthorizedError('Account no longer exists or has been deactivated.');
         }
@@ -42,14 +37,13 @@ async function requireCustomer(req, _res, next) {
         next(error);
     }
 }
-/** Optional variant: attaches the customer when a valid token exists, else continues. */
 async function attachCustomerIfPresent(req, _res, next) {
     try {
         const authHeader = req.headers.authorization;
         if (authHeader?.startsWith('Bearer ')) {
             const payload = jsonwebtoken_1.default.verify(authHeader.slice(7), env_1.env.jwtSecret);
             if (payload.role === 'CUSTOMER') {
-                const customer = await models_1.Customer.findByPk(payload.sub);
+                const customer = await database_1.prisma.customer.findUnique({ where: { id: payload.sub } });
                 if (customer?.isActive)
                     req.customer = customer;
             }

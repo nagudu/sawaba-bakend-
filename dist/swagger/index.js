@@ -3,7 +3,7 @@ var __importDefault = (this && this.__importDefault) || function (mod) {
     return (mod && mod.__esModule) ? mod : { "default": mod };
 };
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.swaggerSpec = void 0;
+exports.getSwaggerHtml = exports.swaggerSpec = void 0;
 const swagger_jsdoc_1 = __importDefault(require("swagger-jsdoc"));
 const env_1 = require("../config/env");
 const options = {
@@ -20,6 +20,14 @@ const options = {
             },
         },
         servers: [
+            {
+                url: '/',
+                description: 'Current host (Production / Vercel / Local)',
+            },
+            {
+                url: 'https://sawaba.vercel.app',
+                description: 'Production server (Vercel)',
+            },
             {
                 url: `http://localhost:${env_1.env.port}`,
                 description: 'Local development server',
@@ -51,4 +59,6 @@ const options = {
     apis: ['./src/routes/*.ts', './src/swagger/*.ts'],
 };
 exports.swaggerSpec = (0, swagger_jsdoc_1.default)(options);
+var swaggerHtml_1 = require("./swaggerHtml");
+Object.defineProperty(exports, "getSwaggerHtml", { enumerable: true, get: function () { return swaggerHtml_1.getSwaggerHtml; } });
 //# sourceMappingURL=index.js.map

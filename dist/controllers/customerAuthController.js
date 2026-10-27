@@ -46,8 +46,8 @@ async function registerHandler(req, res, next) {
 }
 async function loginPasswordHandler(req, res, next) {
     try {
-        const { phone, password } = req.body;
-        const { token, customer } = await (0, customerAuthService_1.loginWithPassword)(phone, password);
+        const { identifier, password } = req.body;
+        const { token, customer } = await (0, customerAuthService_1.loginWithPassword)(identifier, password);
         (0, response_1.successRes)(res, 'Welcome back!', { token, customer: (0, customerAuthService_1.serializeCustomer)(customer) }, 200);
     }
     catch (error) {

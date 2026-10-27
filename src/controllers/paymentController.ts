@@ -2,9 +2,12 @@ import type { NextFunction, Request, Response } from 'express'
 import {
   confirmCashPayment,
   declareCashPayment,
+  exportPayments,
+  getPaymentSummary,
   getPublicPayment,
   getPaymentById,
   listPayments,
+  markPaymentRefunded,
   rejectPayment,
   submitPayment,
   trackPayment,
@@ -12,7 +15,13 @@ import {
 } from '../services/paymentService'
 import { getPublicPaymentSettings } from '../services/paymentSettingsService'
 import { successRes } from '../utils/response'
-import type { CashConfirmInput, RejectPaymentInput, SubmitPaymentInput, TrackPaymentInput } from '../validators/payment'
+import type {
+  CashConfirmInput,
+  RefundPaymentInput,
+  RejectPaymentInput,
+  SubmitPaymentInput,
+  TrackPaymentInput,
+} from '../validators/payment'
 
 export async function getPaymentSettingsHandler(_req: Request, res: Response, next: NextFunction): Promise<void> {
   try {
@@ -128,6 +137,41 @@ export async function rejectPaymentHandler(req: Request, res: Response, next: Ne
       payment,
       200,
     )
+  } catch (error) {
+    next(error)
+  }
+}
+
+export async function refundPaymentHandler(req: Request, res: Response, next: NextFunction): Promise<void> {
+  try {
+    const adminId = req.admin?.id
+    const { reason } = req.body as RefundPaymentInput
+    const payment = await markPaymentRefunded(Number(req.params.id), reason, Number(adminId))
+    successRes(res, 'Payment marked as refunded.', payment, 200)
+  } catch (error) {
+    next(error)
+  }
+}
+
+export async function getPaymentSummaryHandler(req: Request, res: Response, next: NextFunction): Promise<void> {
+  try {
+    const query = req.query as Record<string, unknown>
+    const summary = await getPaymentSummary(query)
+    successRes(res, 'Payment summary retrieved.', summary, 200)
+  } catch (error) {
+    next(error)
+  }
+}
+
+export async function exportPaymentsHandler(req: Request, res: Response, next: NextFunction): Promise<void> {
+  try {
+    const query = req.query as Record<string, unknown>
+    const csv = await exportPayments(query)
+    const stamp = new Date().toISOString().slice(0, 10)
+    res.setHeader('Content-Type', 'text/csv; charset=utf-8')
+    res.setHeader('Content-Disposition', `attachment; filename="sawaba-transactions-${stamp}.csv"`)
+    // BOM first so Excel opens the ₦ amounts as UTF-8 instead of mojibake.
+    res.status(200).send(`\uFEFF${csv}`)
   } catch (error) {
     next(error)
   }

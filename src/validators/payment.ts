@@ -31,7 +31,9 @@ export const listPaymentsQuerySchema = z.object({
   status: z
     .enum(['UNPAID', 'PENDING_VERIFICATION', 'PAID', 'REJECTED', 'REFUNDED', 'CANCELLED'])
     .optional(),
-  method: z.enum(PAYMENT_METHODS).optional(),
+  // ONLINE is read-only: Paystack checkouts are stamped with it after init.
+  // It is listed here so admins can filter by it, never submitted by customers.
+  method: z.enum(['OPAY', 'BANK_TRANSFER', 'CASH', 'OTHER', 'ONLINE']).optional(),
   from: z.string().date('Provide a valid from date (YYYY-MM-DD).').optional(),
   to: z.string().date('Provide a valid to date (YYYY-MM-DD).').optional(),
   search: z.string().trim().max(150).optional(),
@@ -51,6 +53,14 @@ export const cashConfirmSchema = z.object({
   note: z.string().trim().max(1000).optional().nullable(),
 })
 
+export const refundPaymentSchema = z.object({
+  reason: z
+    .string()
+    .trim()
+    .min(5, 'Please provide a reason for this refund.')
+    .max(1000),
+})
+
 export const paystackVerifySchema = z.object({
   reference: z.string().trim().min(4).max(191),
 })
@@ -59,4 +69,5 @@ export type SubmitPaymentInput = z.infer<typeof submitPaymentSchema>
 export type TrackPaymentInput = z.infer<typeof trackPaymentSchema>
 export type RejectPaymentInput = z.infer<typeof rejectPaymentSchema>
 export type CashConfirmInput = z.infer<typeof cashConfirmSchema>
+export type RefundPaymentInput = z.infer<typeof refundPaymentSchema>
 export type PaystackVerifyInput = z.infer<typeof paystackVerifySchema>

@@ -38,7 +38,11 @@ exports.customerRegisterSchema = zod_1.z.object({
         .or(zod_1.z.literal('').transform(() => undefined)),
 });
 exports.customerLoginPasswordSchema = zod_1.z.object({
-    phone,
+    identifier: zod_1.z
+        .string({ required_error: 'Email or phone is required.' })
+        .trim()
+        .min(3, 'Provide a valid email or phone number.')
+        .max(255, 'Provide a valid email or phone number.'),
     password: zod_1.z.string({ required_error: 'Password is required.' }).min(1, 'Password is required.'),
 });
 exports.customerProfileUpdateSchema = zod_1.z

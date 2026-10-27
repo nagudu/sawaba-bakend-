@@ -6,12 +6,8 @@ Object.defineProperty(exports, "__esModule", { value: true });
 exports.requireBarber = requireBarber;
 const jsonwebtoken_1 = __importDefault(require("jsonwebtoken"));
 const env_1 = require("../config/env");
-const models_1 = require("../models");
+const database_1 = require("../config/database");
 const errors_1 = require("../utils/errors");
-/**
- * Guards the Barber Portal API. Validates a `BARBER`-role JWT and loads the
- * barber, enforcing that their profile is active AND portal access is enabled.
- */
 async function requireBarber(req, _res, next) {
     try {
         const authHeader = req.headers.authorization;
@@ -30,7 +26,7 @@ async function requireBarber(req, _res, next) {
         if (payload.role !== 'BARBER') {
             throw new errors_1.ForbiddenError('This token is not valid for the barber portal.');
         }
-        const barber = await models_1.Barber.findByPk(payload.sub);
+        const barber = await database_1.prisma.barber.findUnique({ where: { id: payload.sub } });
         if (!barber || !barber.isActive) {
             throw new errors_1.UnauthorizedError('Barber account no longer exists or has been deactivated.');
         }

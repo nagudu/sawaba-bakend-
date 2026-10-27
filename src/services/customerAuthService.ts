@@ -42,6 +42,36 @@ export function signCustomerToken(customer: Customer): string {
   })
 }
 
+/** Case/whitespace-insensitive person-name comparison for identity matching. */
+function normalizeName(value: string): string {
+  return value.trim().replace(/\s+/g, ' ').toLowerCase()
+}
+
+/**
+ * A record is a registered account once it carries credentials or has ever
+ * logged in. Pure guest records (created by bookings with a shared phone
+ * number) are never accounts.
+ */
+function isAccountRecord(record: Customer): boolean {
+  return Boolean(record.passwordHash || record.googleSub || record.lastLoginAt)
+}
+
+/**
+ * Resolves the ACCOUNT that belongs to a phone number. Guest bookings may have
+ * created several customer records on the same number, so login must never
+ * blindly take the first phone match — it could hand someone else's guest
+ * record (or another person's bookings) to the caller. Preference order:
+ * password/Google-backed account, then any record that has logged in before.
+ */
+async function findAccountByPhone(phone: string): Promise<Customer | null> {
+  const records = await prisma.customer.findMany({ where: { phone, isActive: true } })
+  return (
+    records.find((record) => Boolean(record.passwordHash || record.googleSub)) ??
+    records.find((record) => Boolean(record.lastLoginAt)) ??
+    null
+  )
+}
+
 /**
  * Stores a login OTP and delivers it via SMS when SMS is configured, otherwise
  * by email. The code is never returned to the caller; a failed delivery throws
@@ -112,7 +142,7 @@ export async function requestLoginOtp(rawPhone: string): Promise<{
     throw new UnprocessableError('Provide a valid phone number.')
   }
 
-  const customer = await prisma.customer.findFirst({ where: { phone, isActive: true } })
+  const customer = await findAccountByPhone(phone)
   if (!customer) {
     return {
       found: false,
@@ -173,7 +203,7 @@ export async function verifyLoginOtp(
     data: { consumedAt: new Date() },
   })
 
-  const customer = await prisma.customer.findFirst({ where: { phone, isActive: true } })
+  const customer = await findAccountByPhone(phone)
   if (!customer) {
     throw new UnauthorizedError('Account no longer exists or has been deactivated.')
   }
@@ -196,30 +226,43 @@ export async function registerCustomer(input: {
   if (!isPlausiblePhone(phone)) {
     throw new UnprocessableError('Provide a valid phone number.')
   }
-  if (input.email) {
-    const emailTaken = await prisma.customer.findFirst({
-      where: { email: input.email.trim().toLowerCase() },
-    })
-    if (emailTaken) {
+
+  const email = input.email?.trim().toLowerCase() ?? null
+  const wantedName = normalizeName(input.fullName)
+
+  // The number may hold several records: guest bookings from other people who
+  // share this SIM never become the registrant's account.
+  const byPhone = await prisma.customer.findMany({ where: { phone } })
+  const existingAccount = byPhone.find((record) => Boolean(record.passwordHash || record.googleSub))
+  if (existingAccount) {
+    throw new ConflictError(
+      'We found an existing account for this number. Please login with your password or phone code instead.',
+    )
+  }
+
+  // A legacy guest record on this number is only adopted when it clearly
+  // belongs to the same person (matching name) — never merely because it
+  // shares the phone number.
+  const adoptable =
+    byPhone.find((record) => normalizeName(record.fullName) === wantedName) ?? null
+
+  if (email) {
+    const emailOwner = await prisma.customer.findFirst({ where: { email } })
+    // The only record allowed to keep this email is the one being adopted.
+    if (emailOwner && emailOwner.id !== adoptable?.id) {
       throw new ConflictError('This email is already registered to another account.')
     }
   }
 
-  const existing = await prisma.customer.findFirst({ where: { phone } })
-  if (existing) {
-    if (existing.passwordHash || existing.email) {
-      throw new ConflictError(
-        'We found an existing account for this number. Please login with OTP instead.',
-      )
-    }
+  if (adoptable) {
     const data: { email?: string; passwordHash?: string; lastLoginAt: Date } = {
       lastLoginAt: new Date(),
     }
-    if (input.email) data.email = input.email.trim().toLowerCase()
+    if (email) data.email = email
     if (input.password) data.passwordHash = await bcrypt.hash(input.password, 10)
 
     const updated = await prisma.customer.update({
-      where: { id: existing.id },
+      where: { id: adoptable.id },
       data,
     })
     await ensureCustomerCode(updated)
@@ -248,27 +291,34 @@ export async function loginWithPassword(
 
   let customer: Customer | null = null
   if (looksLikeEmail) {
-    customer = await prisma.customer.findFirst({
+    const records = await prisma.customer.findMany({
       where: {
         email: identifier.toLowerCase(),
         isActive: true,
       },
     })
+    // Several records can share an email only in legacy data — always prefer
+    // the one that actually holds the password.
+    customer = records.find((record) => Boolean(record.passwordHash)) ?? records[0] ?? null
   } else {
     try {
       const phone = normalizeNigerianPhone(identifier)
-      customer = await prisma.customer.findFirst({
+      // Multiple records may sit on this number (guest bookings from people
+      // who share the SIM) — only a password-bearing account can log in.
+      const records = await prisma.customer.findMany({
         where: {
           phone,
           isActive: true,
         },
       })
+      customer = records.find((record) => Boolean(record.passwordHash)) ?? null
     } catch {
       // If phone normalization fails, try direct match
       customer = await prisma.customer.findFirst({
         where: {
           phone: identifier,
           isActive: true,
+          passwordHash: { not: null },
         },
       })
     }
@@ -345,8 +395,13 @@ export async function updateCustomerProfile(
     if (!isPlausiblePhone(phone)) {
       throw new UnprocessableError('Provide a valid phone number.')
     }
-    const taken = await prisma.customer.findFirst({ where: { phone } })
-    if (taken && taken.id !== customer.id) {
+    // Guest bookings may already use this number (other people sharing the
+    // SIM) — only a competing ACCOUNT blocks the change, never a guest record.
+    const taken = await prisma.customer.findFirst({
+      where: { phone, id: { not: customer.id } },
+    })
+    const competingAccount = taken && isAccountRecord(taken) ? taken : null
+    if (competingAccount) {
       throw new ConflictError('This phone number is already in use by another account.')
     }
     fields.phone = phone

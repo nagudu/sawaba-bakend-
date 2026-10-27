@@ -1,6 +1,7 @@
 import { app } from './app'
 import { env } from './config/env'
 import { connectDatabase } from './config/database'
+import { startReminderScheduler } from './services/reminderService'
 
 async function startServer(): Promise<void> {
   try {
@@ -25,6 +26,9 @@ async function startServer(): Promise<void> {
       console.log(`[server] running on http://localhost:${env.port}`)
       console.log(`[server] swagger docs: http://localhost:${env.port}/api/docs`)
     })
+
+    // Automatic appointment reminders on long-lived hosts (Vercel uses cron).
+    startReminderScheduler()
 
     server.on('error', (err: NodeJS.ErrnoException) => {
       if (err.code === 'EADDRINUSE') {

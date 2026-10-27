@@ -11,9 +11,7 @@ exports.verifyCheckoutPaystack = verifyCheckoutPaystack;
 exports.handleCheckoutWebhook = handleCheckoutWebhook;
 exports.getCheckoutSession = getCheckoutSession;
 const node_crypto_1 = __importDefault(require("node:crypto"));
-const sequelize_1 = require("sequelize");
 const database_1 = require("../config/database");
-const models_1 = require("../models");
 const errors_1 = require("../utils/errors");
 const availabilityService_1 = require("./availabilityService");
 const customerService_1 = require("./customerService");
@@ -21,36 +19,19 @@ const commissionService_1 = require("./commissionService");
 const upload_1 = require("../utils/upload");
 const paymentSettingsService_1 = require("./paymentSettingsService");
 const appointmentStatuses_1 = require("../config/appointmentStatuses");
-/**
- * Temporary booking checkout sessions.
- *
- * STRICT RULE: no Appointment and no Payment rows exist until the selected
- * payment method's required condition is satisfied. The session alone carries
- * the booking details; abandoning it (Back to Home / closed tab / never
- * finishing payment) leaves ZERO permanent records.
- *
- *   CASH                    → finalizeCheckout() creates Appointment(PENDING* + UNPAID)
- *   BANK_TRANSFER / OPAY    → session stores the receipt, finalizeCheckout() creates
- *                             Appointment + Payment(PENDING_VERIFICATION) atomically
- *   ONLINE                  → Paystack transaction on the SESSION; Appointment +
- *                             Payment are created only after the backend re-verifies
- *                             the charge directly with Paystack (callback/webhook)
- *
- * *Status naming: the existing schema calls the unpaid-awaiting-confirmation
- * state PAYMENT_REQUIRED; the customer-facing flow treats it as "PENDING".
- */
+const qrService_1 = require("./qrService");
 function generateSessionToken() {
     return node_crypto_1.default.randomBytes(24).toString('hex');
 }
 function dateKey(date) {
     return date.replace(/-/g, '');
 }
-async function generateReferenceCode(appointmentDate, t) {
+async function generateReferenceCode(appointmentDate, tx = database_1.prisma) {
     const key = dateKey(appointmentDate);
     for (let attempt = 0; attempt < 5; attempt += 1) {
-        const dayCount = await models_1.Appointment.count({ where: { appointmentDate }, transaction: t });
+        const dayCount = await tx.appointment.count({ where: { appointmentDate } });
         const candidate = `APT-${key}-${String(dayCount + 1 + attempt).padStart(3, '0')}`;
-        const taken = await models_1.Appointment.findOne({ where: { referenceCode: candidate }, transaction: t });
+        const taken = await tx.appointment.findUnique({ where: { referenceCode: candidate } });
         if (!taken)
             return candidate;
     }
@@ -58,26 +39,24 @@ async function generateReferenceCode(appointmentDate, t) {
     return `APT-${key}-${salt}`;
 }
 /** Validates the barber/service/date/time and returns the authoritative price. Returns null when the slot is free. */
-async function assertSessionBookable(barberId, serviceId, date, time, excludeAppointmentId, excludeSessionId) {
-    const barber = await models_1.Barber.findByPk(barberId);
+async function assertSessionBookable(barberId, serviceId, date, time, excludeAppointmentId, excludeSessionId, tx = database_1.prisma) {
+    const barber = await tx.barber.findUnique({ where: { id: barberId } });
     if (!barber || !barber.isActive) {
         throw new errors_1.UnprocessableError('The selected barber is not available.');
     }
-    const service = await models_1.Service.findByPk(serviceId);
+    const service = await tx.service.findUnique({ where: { id: serviceId } });
     if (!service || !service.isActive) {
         throw new errors_1.UnprocessableError('The selected service is not available.');
     }
-    const providerLink = await models_1.BarberService.findOne({ where: { barberId, serviceId } });
-    const hasAnyServices = await models_1.BarberService.findOne({ where: { barberId } });
-    // If the barber has at least one service assignment and this service is not
-    // among them, reject. No assignments yet → single-salon fallback, allow all.
+    const providerLink = await tx.barberService.findFirst({ where: { barberId, serviceId } });
+    const hasAnyServices = await tx.barberService.findFirst({ where: { barberId } });
     if (hasAnyServices && !providerLink) {
         throw new errors_1.UnprocessableError('This barber does not provide the selected service.');
     }
     const dayOfWeek = new Date(`${date}T00:00:00`).getDay();
-    const hasAnyAvailability = await models_1.BarberAvailability.findOne({ where: { barberId } });
+    const hasAnyAvailability = await tx.barberAvailability.findFirst({ where: { barberId } });
     if (hasAnyAvailability) {
-        const availability = await models_1.BarberAvailability.findOne({
+        const availability = await tx.barberAvailability.findFirst({
             where: { barberId, dayOfWeek, isAvailable: true },
         });
         if (!availability) {
@@ -93,28 +72,21 @@ async function assertSessionBookable(barberId, serviceId, date, time, excludeApp
     }
     const start = (0, availabilityService_1.hhmmToMinutes)(time);
     const end = start + service.duration;
-    const existingQuery = {
-        barberId,
-        appointmentDate: date,
-        status: { [sequelize_1.Op.ne]: appointmentStatuses_1.AppointmentStatusValue.CANCELLED },
-    };
-    const existing = excludeAppointmentId
-        ? await models_1.Appointment.findAll({
-            where: { ...existingQuery, id: { [sequelize_1.Op.ne]: excludeAppointmentId } },
-        })
-        : await models_1.Appointment.findAll({ where: existingQuery });
-    // Only a payment genuinely in flight (AWAITING_PAYMENT) holds the slot.
-    // Merely-staged (OPEN) sessions hold NOTHING — availability shown to the
-    // customer always reflects reality, and the transaction-protected finalize
-    // is the single arbiter if two customers race for the same slot. The
-    // caller's own session is excluded so it can never conflict with itself.
-    const openSessions = await models_1.CheckoutSession.findAll({
+    const existing = await tx.appointment.findMany({
+        where: {
+            barberId,
+            appointmentDate: date,
+            status: { not: appointmentStatuses_1.AppointmentStatusValue.CANCELLED },
+            ...(excludeAppointmentId ? { id: { not: excludeAppointmentId } } : {}),
+        },
+    });
+    const openSessions = await tx.checkoutSession.findMany({
         where: {
             barberId,
             appointmentDate: date,
             status: 'AWAITING_PAYMENT',
-            ...(excludeAppointmentId ? { id: { [sequelize_1.Op.ne]: excludeAppointmentId } } : {}),
-            ...(excludeSessionId ? { id: { [sequelize_1.Op.ne]: excludeSessionId } } : {}),
+            ...(excludeAppointmentId ? { id: { not: excludeAppointmentId } } : {}),
+            ...(excludeSessionId ? { id: { not: excludeSessionId } } : {}),
         },
     });
     for (const session of openSessions) {
@@ -125,7 +97,7 @@ async function assertSessionBookable(barberId, serviceId, date, time, excludeApp
         }
     }
     const serviceIds = [...new Set(existing.map((a) => a.serviceId))];
-    const services = await models_1.Service.findAll({ where: { id: serviceIds } });
+    const services = await tx.service.findMany({ where: { id: { in: serviceIds } } });
     const serviceMap = new Map(services.map((s) => [s.id, s.duration]));
     for (const appointment of existing) {
         const existingStart = (0, availabilityService_1.hhmmToMinutes)(appointment.appointmentTime);
@@ -136,6 +108,10 @@ async function assertSessionBookable(barberId, serviceId, date, time, excludeApp
     }
     return { servicePrice: Number(service.price), serviceDuration: service.duration };
 }
+const sessionInclude = {
+    service: { select: { id: true, name: true } },
+    barber: { select: { id: true, name: true } },
+};
 function serializeSession(session) {
     return {
         sessionToken: session.sessionToken,
@@ -149,12 +125,9 @@ function serializeSession(session) {
     };
 }
 async function loadSessionWithRelations(sessionToken) {
-    const session = await models_1.CheckoutSession.findOne({
+    const session = await database_1.prisma.checkoutSession.findUnique({
         where: { sessionToken },
-        include: [
-            { model: models_1.Service, as: 'service', attributes: ['id', 'name'] },
-            { model: models_1.Barber, as: 'barber', attributes: ['id', 'name'] },
-        ],
+        include: sessionInclude,
     });
     if (!session) {
         throw new errors_1.NotFoundError('Booking session not found. Please start your booking again.');
@@ -174,7 +147,6 @@ async function createCheckoutSession(input) {
     if (input.paymentMethod !== 'ONLINE' && enabled.length > 0 && !enabled.includes(input.paymentMethod)) {
         throw new errors_1.UnprocessableError('This payment method is not currently accepted. Please choose another method.');
     }
-    // TRANSFER methods must already carry the receipt at session creation.
     const isCash = input.paymentMethod === 'CASH';
     if (!isCash && input.paymentMethod !== 'ONLINE' && !input.receiptBuffer) {
         throw new errors_1.UnprocessableError('Payment receipt is required before you can submit your appointment.');
@@ -183,8 +155,6 @@ async function createCheckoutSession(input) {
     if (!slot) {
         throw new errors_1.ConflictError('This time slot is no longer available. Please choose another time.');
     }
-    // Upload the receipt only after slot checks pass — failed sessions never
-    // leave orphan files.
     let receiptUrl = null;
     let receiptPublicId = null;
     if (input.receiptBuffer) {
@@ -192,24 +162,20 @@ async function createCheckoutSession(input) {
         receiptUrl = uploaded.url;
         receiptPublicId = uploaded.publicId;
     }
-    // Supersede the customer's own stale in-flight sessions for this exact slot:
-    //  - after Paystack's transaction window an abandoned online checkout can no
-    //    longer be completed, so it must not keep holding the slot;
-    //  - when the customer switches AWAY from online payment (picks cash or a
-    //    transfer method instead), their abandoned Paystack checkout is dead by
-    //    definition — the slot releases immediately.
-    await models_1.CheckoutSession.update({ status: 'EXPIRED' }, {
+    // Supersede stale in-flight sessions
+    await database_1.prisma.checkoutSession.updateMany({
         where: {
             customerPhone: input.customerPhone,
             barberId: input.barberId,
             appointmentDate: input.appointmentDate,
             appointmentTime: input.appointmentTime,
             status: 'AWAITING_PAYMENT',
-            updatedAt: { [sequelize_1.Op.lt]: new Date(Date.now() - 30 * 60 * 1000) },
+            updatedAt: { lt: new Date(Date.now() - 30 * 60 * 1000) },
         },
+        data: { status: 'EXPIRED' },
     });
     if (input.paymentMethod !== 'ONLINE') {
-        await models_1.CheckoutSession.update({ status: 'EXPIRED' }, {
+        await database_1.prisma.checkoutSession.updateMany({
             where: {
                 customerPhone: input.customerPhone,
                 barberId: input.barberId,
@@ -218,12 +184,11 @@ async function createCheckoutSession(input) {
                 status: 'AWAITING_PAYMENT',
                 paymentMethod: 'ONLINE',
             },
+            data: { status: 'EXPIRED' },
         });
     }
     else {
-        // Retrying ONLINE for the same slot RESUMES the customer's own in-flight
-        // session instead of being blocked by it (or piling up a duplicate).
-        const own = await models_1.CheckoutSession.findOne({
+        const own = await database_1.prisma.checkoutSession.findFirst({
             where: {
                 customerPhone: input.customerPhone,
                 barberId: input.barberId,
@@ -231,22 +196,23 @@ async function createCheckoutSession(input) {
                 appointmentTime: input.appointmentTime,
                 status: 'AWAITING_PAYMENT',
             },
-            order: [['updatedAt', 'DESC']],
+            orderBy: { updatedAt: 'desc' },
         });
         if (own) {
-            await own.update({
-                customerName: input.customerName,
-                customerEmail: input.customerEmail,
-                customerLocation: input.customerLocation,
-                serviceId: input.serviceId,
-                notes: input.notes,
+            await database_1.prisma.checkoutSession.update({
+                where: { id: own.id },
+                data: {
+                    customerName: input.customerName,
+                    customerEmail: input.customerEmail,
+                    customerLocation: input.customerLocation,
+                    serviceId: input.serviceId,
+                    notes: input.notes,
+                },
             });
             return serializeSession(await loadSessionWithRelations(own.sessionToken));
         }
     }
-    // One session per (name, phone, slot, method): re-entering the payment step
-    // refreshes the existing session instead of piling up duplicates.
-    const [session] = await models_1.CheckoutSession.findOrCreate({
+    const existingOpen = await database_1.prisma.checkoutSession.findFirst({
         where: {
             customerPhone: input.customerPhone,
             appointmentDate: input.appointmentDate,
@@ -254,56 +220,74 @@ async function createCheckoutSession(input) {
             barberId: input.barberId,
             status: 'OPEN',
         },
-        defaults: {
-            sessionToken: generateSessionToken(),
-            customerName: input.customerName,
-            customerPhone: input.customerPhone,
-            customerEmail: input.customerEmail,
-            customerLocation: input.customerLocation,
-            serviceId: input.serviceId,
-            barberId: input.barberId,
-            appointmentDate: input.appointmentDate,
-            appointmentTime: input.appointmentTime,
-            notes: input.notes,
-            totalAmount: slot.servicePrice,
-            paymentMethod: input.paymentMethod,
-            transactionReference: input.transactionReference,
-            status: 'OPEN',
-            receiptUrl,
-            receiptPublicId,
-        },
     });
-    // Refresh mutable fields if the session already existed (name/email/notes/service/receipt/method).
-    await session.update({
-        customerName: input.customerName,
-        customerEmail: input.customerEmail,
-        customerLocation: input.customerLocation,
-        serviceId: input.serviceId,
-        notes: input.notes,
-        totalAmount: slot.servicePrice,
-        paymentMethod: input.paymentMethod,
-        transactionReference: input.transactionReference,
-        ...(receiptUrl ? { receiptUrl, receiptPublicId } : {}),
-    });
-    return serializeSession(await loadSessionWithRelations(session.sessionToken));
+    let sessionToken;
+    if (existingOpen) {
+        sessionToken = existingOpen.sessionToken;
+        await database_1.prisma.checkoutSession.update({
+            where: { id: existingOpen.id },
+            data: {
+                customerName: input.customerName,
+                customerEmail: input.customerEmail,
+                customerLocation: input.customerLocation,
+                serviceId: input.serviceId,
+                notes: input.notes,
+                totalAmount: slot.servicePrice,
+                paymentMethod: input.paymentMethod,
+                transactionReference: input.transactionReference,
+                ...(receiptUrl ? { receiptUrl, receiptPublicId } : {}),
+            },
+        });
+    }
+    else {
+        sessionToken = generateSessionToken();
+        await database_1.prisma.checkoutSession.create({
+            data: {
+                sessionToken,
+                customerName: input.customerName,
+                customerPhone: input.customerPhone,
+                customerEmail: input.customerEmail,
+                customerLocation: input.customerLocation,
+                serviceId: input.serviceId,
+                barberId: input.barberId,
+                appointmentDate: input.appointmentDate,
+                appointmentTime: input.appointmentTime,
+                notes: input.notes,
+                totalAmount: slot.servicePrice,
+                paymentMethod: input.paymentMethod,
+                transactionReference: input.transactionReference,
+                status: 'OPEN',
+                receiptUrl,
+                receiptPublicId,
+            },
+        });
+    }
+    return serializeSession(await loadSessionWithRelations(sessionToken));
 }
 /**
- * Converts an OPEN/refreshed session into a real Appointment + Payment pair,
- * ATOMICALLY. Cash → Payment UNPAID (pay at studio); transfer methods →
- * Payment PENDING_VERIFICATION with the stored receipt. Re-checks the slot
- * inside the transaction so a session whose slot was lost fails cleanly.
+ * Mints the appointment's check-in QR (idempotent — reuses the existing token)
+ * and folds the payload into a finalize result. Never lets a QR hiccup fail a
+ * booking that was already committed.
  */
+async function withQr(appointmentId, base) {
+    try {
+        const token = await (0, qrService_1.ensureAppointmentQrToken)(appointmentId);
+        return { ...base, qrToken: token, qrPayload: (0, qrService_1.buildQrPayload)(token) };
+    }
+    catch {
+        return { ...base, qrToken: '', qrPayload: '' };
+    }
+}
 async function finalizeCheckout(sessionToken) {
     const session = await loadSessionWithRelations(sessionToken);
     if (session.status === 'CONVERTED') {
-        // Idempotent double-click protection — return the existing booking.
         if (session.convertedAppointmentId) {
-            const existing = await models_1.Appointment.findByPk(session.convertedAppointmentId, {
-                include: ['service', 'barber', { model: models_1.Payment, as: 'payment' }],
+            const existing = await database_1.prisma.appointment.findUnique({
+                where: { id: session.convertedAppointmentId },
+                include: { payment: true },
             });
             if (existing) {
-                const payment = existing.payment;
-                return {
+                return withQr(existing.id, {
                     appointment: {
                         id: existing.id,
                         referenceCode: existing.referenceCode,
@@ -313,13 +297,13 @@ async function finalizeCheckout(sessionToken) {
                         appointmentTime: existing.appointmentTime,
                     },
                     payment: {
-                        id: payment?.id ?? 0,
-                        accessToken: payment?.accessToken ?? '',
-                        amount: Number(payment?.amount ?? existing.totalAmount),
-                        status: payment?.status ?? 'UNPAID',
+                        id: existing.payment?.id ?? 0,
+                        accessToken: existing.payment?.accessToken ?? '',
+                        amount: Number(existing.payment?.amount ?? existing.totalAmount),
+                        status: existing.payment?.status ?? 'UNPAID',
                     },
                     sessionToken,
-                };
+                });
             }
         }
         throw new errors_1.ConflictError('This booking session has already been used.');
@@ -337,11 +321,8 @@ async function finalizeCheckout(sessionToken) {
         throw new errors_1.UnprocessableError('This payment method is not currently accepted. Please choose another method.');
     }
     const isCash = method === 'CASH';
-    const result = await database_1.sequelize.transaction(async (t) => {
-        // Re-verify the slot INSIDE the transaction. The session itself is
-        // excluded — it must never conflict with its own slot — so only REAL
-        // appointments and other customers' in-flight payments can block it.
-        const slot = await assertSessionBookable(session.barberId, session.serviceId, session.appointmentDate, session.appointmentTime, session.convertedAppointmentId ?? undefined, session.id);
+    const result = await database_1.prisma.$transaction(async (tx) => {
+        const slot = await assertSessionBookable(session.barberId, session.serviceId, session.appointmentDate, session.appointmentTime, session.convertedAppointmentId ?? undefined, session.id, tx);
         if (!slot) {
             throw new errors_1.ConflictError('This time slot is no longer available. Your session payment cannot be applied — please book again.');
         }
@@ -349,47 +330,48 @@ async function finalizeCheckout(sessionToken) {
             fullName: session.customerName,
             phone: session.customerPhone,
             email: session.customerEmail,
-        }, t);
-        const appointment = await models_1.Appointment.create({
-            customerName: session.customerName,
-            customerPhone: session.customerPhone,
-            customerEmail: session.customerEmail,
-            customerLocation: session.customerLocation ?? null,
-            customerId: customer.id,
-            serviceId: session.serviceId,
-            barberId: session.barberId,
-            appointmentDate: session.appointmentDate,
-            appointmentTime: session.appointmentTime,
-            totalAmount: Number(session.totalAmount),
-            notes: session.notes,
-            status: appointmentStatuses_1.AppointmentStatusValue.PAYMENT_REQUIRED, // customer-facing: PENDING
-            referenceCode: await generateReferenceCode(session.appointmentDate, t),
-        }, { transaction: t });
-        // Commission snapshot (requirement #9): freeze the barber's CURRENT
-        // commission terms onto this booking — later config changes never
-        // rewrite this row.
-        await (0, commissionService_1.createEarningSnapshot)(appointment.id, session.barberId, Number(session.totalAmount), t);
-        const payment = await models_1.Payment.create({
-            appointmentId: appointment.id,
-            customerId: customer.id,
-            amount: Number(session.totalAmount),
-            paymentMethod: method,
-            transactionReference: session.transactionReference ?? null,
-            paymentDate: isCash ? null : new Date().toISOString().slice(0, 10),
-            receiptUrl: session.receiptUrl,
-            receiptPublicId: session.receiptPublicId,
-            note: null,
-            status: isCash ? 'UNPAID' : 'PENDING_VERIFICATION',
-            accessToken: node_crypto_1.default.randomBytes(24).toString('hex'),
-        }, { transaction: t });
-        if (!isCash) {
-            // Receipt-backed bookings land in the admin verification queue.
-            await appointment.update({ status: appointmentStatuses_1.AppointmentStatusValue.PAYMENT_SUBMITTED }, { transaction: t });
-        }
-        await session.update({ status: 'CONVERTED', convertedAppointmentId: appointment.id }, { transaction: t });
+        }, tx);
+        const referenceCode = await generateReferenceCode(session.appointmentDate, tx);
+        const appointment = await tx.appointment.create({
+            data: {
+                customerName: session.customerName,
+                customerPhone: session.customerPhone,
+                customerEmail: session.customerEmail,
+                customerLocation: session.customerLocation ?? null,
+                customerId: customer.id,
+                serviceId: session.serviceId,
+                barberId: session.barberId,
+                appointmentDate: session.appointmentDate,
+                appointmentTime: session.appointmentTime,
+                totalAmount: Number(session.totalAmount),
+                notes: session.notes,
+                status: !isCash ? appointmentStatuses_1.AppointmentStatusValue.PAYMENT_SUBMITTED : appointmentStatuses_1.AppointmentStatusValue.PAYMENT_REQUIRED,
+                referenceCode,
+            },
+        });
+        await (0, commissionService_1.createEarningSnapshot)(appointment.id, session.barberId, Number(session.totalAmount), tx);
+        const payment = await tx.payment.create({
+            data: {
+                appointmentId: appointment.id,
+                customerId: customer.id,
+                amount: Number(session.totalAmount),
+                paymentMethod: method,
+                transactionReference: session.transactionReference ?? null,
+                paymentDate: isCash ? null : new Date().toISOString().slice(0, 10),
+                receiptUrl: session.receiptUrl,
+                receiptPublicId: session.receiptPublicId,
+                note: null,
+                status: isCash ? 'UNPAID' : 'PENDING_VERIFICATION',
+                accessToken: node_crypto_1.default.randomBytes(24).toString('hex'),
+            },
+        });
+        await tx.checkoutSession.update({
+            where: { id: session.id },
+            data: { status: 'CONVERTED', convertedAppointmentId: appointment.id },
+        });
         return { appointment, payment };
     });
-    return {
+    return withQr(result.appointment.id, {
         appointment: {
             id: result.appointment.id,
             referenceCode: result.appointment.referenceCode,
@@ -405,18 +387,20 @@ async function finalizeCheckout(sessionToken) {
             status: result.payment.status,
         },
         sessionToken,
-    };
+    });
 }
-/** Marks a session EXPIRED (customer abandoned the checkout). Booking data is dropped — nothing was ever saved as an appointment. */
+/** Marks a session EXPIRED (customer abandoned the checkout). */
 async function abandonCheckout(sessionToken) {
-    const session = await models_1.CheckoutSession.findOne({ where: { sessionToken } });
+    const session = await database_1.prisma.checkoutSession.findUnique({ where: { sessionToken } });
     if (!session || session.status === 'CONVERTED') {
         return { abandoned: false };
     }
-    await session.update({ status: 'EXPIRED' });
+    await database_1.prisma.checkoutSession.update({
+        where: { id: session.id },
+        data: { status: 'EXPIRED' },
+    });
     return { abandoned: true };
 }
-// ─── Online (Paystack) checkout on the SESSION ────────────────────────────────
 const PAYSTACK_BASE = 'https://api.paystack.co';
 async function paystackRequest(method, path, body) {
     const key = process.env.PAYSTACK_SECRET_KEY;
@@ -449,14 +433,12 @@ async function initializeCheckoutPaystack(sessionToken) {
     if (session.status === 'EXPIRED') {
         throw new errors_1.ConflictError('This booking session has expired. Please start your booking again.');
     }
-    // Idempotent: a session already awaiting payment resumes the SAME transaction.
     if (session.status === 'AWAITING_PAYMENT' && session.paystackReference) {
         const existing = await paystackRequest('POST', '/transaction/initialize', {
             email: session.customerEmail ?? `${session.customerPhone.replace(/\D/g, '')}@payments.sawabasalon.com`,
             amount: Math.round(Number(session.totalAmount) * 100),
             reference: session.paystackReference,
         }).catch(async () => {
-            // Reference already used → start a fresh one.
             return null;
         });
         if (existing) {
@@ -470,7 +452,10 @@ async function initializeCheckoutPaystack(sessionToken) {
         reference,
         metadata: { checkoutSessionId: session.id, sessionToken: session.sessionToken },
     });
-    await session.update({ status: 'AWAITING_PAYMENT', paystackReference: init.reference });
+    await database_1.prisma.checkoutSession.update({
+        where: { id: session.id },
+        data: { status: 'AWAITING_PAYMENT', paystackReference: init.reference },
+    });
     return {
         authorizationUrl: init.authorization_url,
         accessCode: init.access_code,
@@ -478,14 +463,11 @@ async function initializeCheckoutPaystack(sessionToken) {
     };
 }
 /**
- * Re-verifies the charge directly with Paystack and — only on confirmed
- * success — atomically creates the Appointment + Payment. This is the ONLY
- * path that turns an ONLINE checkout session into a real booking.
+ * Re-verifies the charge directly with Paystack and creates Appointment + Payment.
  */
 async function verifyCheckoutPaystack(sessionToken, reference) {
     const session = await loadSessionWithRelations(sessionToken);
     if (session.status === 'CONVERTED') {
-        // Already finalized (webhook beat the callback) → return current state.
         const result = await finalizeResultForConverted(session);
         if (result)
             return result;
@@ -502,22 +484,23 @@ async function verifyCheckoutPaystack(sessionToken, reference) {
     if (txn.amount !== expectedKobo) {
         throw new errors_1.UnprocessableError('The paid amount does not match the booking price. Please contact support.');
     }
-    // Provider confirmed the money — NOW create the appointment + payment.
     const result = await finalizeCheckout(sessionToken);
-    // Stamp the provider reference on the payment for audit.
-    await models_1.Payment.update({ providerRef: String(txn.id), paymentMethod: 'ONLINE' }, { where: { id: result.payment.id } });
+    await database_1.prisma.payment.update({
+        where: { id: result.payment.id },
+        data: { providerRef: String(txn.id), paymentMethod: 'ONLINE' },
+    });
     return result;
 }
 async function finalizeResultForConverted(session) {
     if (!session.convertedAppointmentId)
         return null;
-    const existing = await models_1.Appointment.findByPk(session.convertedAppointmentId, {
-        include: ['service', 'barber', { model: models_1.Payment, as: 'payment' }],
+    const existing = await database_1.prisma.appointment.findUnique({
+        where: { id: session.convertedAppointmentId },
+        include: { payment: true },
     });
     if (!existing)
         return null;
-    const payment = existing.payment;
-    return {
+    return withQr(existing.id, {
         appointment: {
             id: existing.id,
             referenceCode: existing.referenceCode,
@@ -527,13 +510,13 @@ async function finalizeResultForConverted(session) {
             appointmentTime: existing.appointmentTime,
         },
         payment: {
-            id: payment?.id ?? 0,
-            accessToken: payment?.accessToken ?? '',
-            amount: Number(payment?.amount ?? existing.totalAmount),
-            status: payment?.status ?? 'UNPAID',
+            id: existing.payment?.id ?? 0,
+            accessToken: existing.payment?.accessToken ?? '',
+            amount: Number(existing.payment?.amount ?? existing.totalAmount),
+            status: existing.payment?.status ?? 'UNPAID',
         },
         sessionToken: session.sessionToken,
-    };
+    });
 }
 /** Webhook path: charge.success on a checkout session → verify + finalize. */
 async function handleCheckoutWebhook(payload) {
@@ -542,10 +525,9 @@ async function handleCheckoutWebhook(payload) {
     const sessionToken = payload.data?.metadata?.sessionToken;
     if (!sessionToken)
         return false;
-    const session = await models_1.CheckoutSession.findOne({ where: { sessionToken } });
+    const session = await database_1.prisma.checkoutSession.findUnique({ where: { sessionToken } });
     if (!session || session.status !== 'AWAITING_PAYMENT' || !session.paystackReference)
         return false;
-    // Signature already validated by the controller; verify the charge server-side.
     await verifyCheckoutPaystack(sessionToken, session.paystackReference);
     return true;
 }

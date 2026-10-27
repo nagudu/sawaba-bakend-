@@ -94,6 +94,11 @@ enum GalleryCategory {
   SALON
 }
 
+enum GalleryMediaType {
+  IMAGE
+  VIDEO
+}
+
 enum ReviewStatus {
   PENDING
   APPROVED
@@ -127,6 +132,7 @@ model Admin {
   contactReplies            ContactReply[]
   commissionRateHistories   CommissionRateHistory[]
   barberAssignmentHistories BarberAssignmentHistory[]
+  qrScanLogs                QrScanLog[]
 
   @@index([email])
   @@map("admins")
@@ -243,6 +249,7 @@ model Barber {
   commissionHistory   CommissionRateHistory[]
   notifications       BarberNotification[]
   reviews             Review[]
+  qrScans             QrScanLog[]
 
   @@index([slug])
   @@index([isActive])
@@ -301,6 +308,11 @@ model Appointment {
   cancelledAt        DateTime?                 @map("cancelled_at")
   cancellationReason String?                   @map("cancellation_reason") @db.Text
   cancelledBy        Int?                      @map("cancelled_by")
+  /// In-person check-in QR credentials (see QrScanLog).
+  qrToken            String?                   @unique @map("qr_token") @db.VarChar(64)
+  qrTokenGeneratedAt DateTime?                 @map("qr_token_generated_at")
+  qrRevokedAt        DateTime?                 @map("qr_revoked_at")
+  checkedInAt        DateTime?                 @map("checked_in_at")
   status             AppointmentStatus         @default(PAYMENT_REQUIRED)
   createdAt          DateTime                  @default(now()) @map("created_at")
   updatedAt          DateTime                  @updatedAt @map("updated_at")
@@ -313,11 +325,62 @@ model Appointment {
   payment            Payment?
   earning            BarberEarning?
   assignmentHistory  BarberAssignmentHistory[]
+  reminders          AppointmentReminder[]
+  qrScans            QrScanLog[]
 
   @@index([appointmentDate, appointmentTime])
   @@index([barberId, appointmentDate])
   @@index([status])
   @@map("appointments")
+}
+
+/// Per-appointment QR credential used for in-person check-in. The token is a
+/// high-entropy random string generated lazily and can be revoked (e.g. when the
+/// appointment is cancelled) without touching the booking record itself.
+model QrScanLog {
+  id               Int      @id @default(autoincrement())
+  appointmentId    Int?     @map("appointment_id")
+  barberId         Int?     @map("barber_id")
+  adminId          Int?     @map("admin_id")
+  actorRole        String   @map("actor_role") @db.VarChar(16)
+  outcome          String   @db.VarChar(32)
+  source           String   @default("QR") @db.VarChar(16)
+  tokenFingerprint String?  @map("token_fingerprint") @db.VarChar(32)
+  referenceCode    String?  @map("reference_code") @db.VarChar(30)
+  ip               String?  @db.VarChar(64)
+  userAgent        String?  @map("user_agent") @db.VarChar(300)
+  detail           String?  @db.VarChar(300)
+  createdAt        DateTime @default(now()) @map("created_at")
+
+  appointment      Appointment? @relation(fields: [appointmentId], references: [id], onDelete: SetNull)
+  barber           Barber?      @relation(fields: [barberId], references: [id], onDelete: SetNull)
+  admin            Admin?       @relation(fields: [adminId], references: [id], onDelete: SetNull)
+
+  @@index([appointmentId])
+  @@index([barberId])
+  @@index([outcome])
+  @@index([createdAt])
+  @@map("qr_scan_logs")
+}
+
+/// Automatic pre-appointment reminder log. One row per (appointment, kind)
+/// that was successfully delivered; the unique key guarantees a customer is
+/// never reminded twice for the same window even if the scheduler overlaps.
+model AppointmentReminder {
+  id            Int       @id @default(autoincrement())
+  appointmentId Int       @map("appointment_id")
+  kind          String    @db.VarChar(10)
+  channel       String    @db.VarChar(16)
+  status        String    @default("SENT") @db.VarChar(16)
+  error         String?   @db.VarChar(500)
+  sentAt        DateTime  @default(now()) @map("sent_at")
+  createdAt     DateTime  @default(now()) @map("created_at")
+
+  appointment   Appointment @relation(fields: [appointmentId], references: [id], onDelete: Cascade)
+
+  @@unique([appointmentId, kind])
+  @@index([kind])
+  @@map("appointment_reminders")
 }
 
 model Payment {
@@ -484,18 +547,23 @@ model BarberNotification {
 }
 
 model Gallery {
-  id        Int             @id @default(autoincrement())
-  title     String          @db.VarChar(200)
-  image     String          @db.VarChar(500)
-  category  GalleryCategory @default(HAIRCUT)
-  barberId  Int?            @map("barber_id")
-  createdAt DateTime        @default(now()) @map("created_at")
-  updatedAt DateTime        @updatedAt @map("updated_at")
+  id            Int               @id @default(autoincrement())
+  title         String            @db.VarChar(200)
+  image         String?           @db.VarChar(500)
+  video         String?           @db.VarChar(500)
+  videoPublicId String?           @map("video_public_id") @db.VarChar(300)
+  mediaType     GalleryMediaType  @default(IMAGE) @map("media_type")
+  duration      Int?
+  category      GalleryCategory   @default(HAIRCUT)
+  barberId      Int?              @map("barber_id")
+  createdAt     DateTime          @default(now()) @map("created_at")
+  updatedAt     DateTime          @updatedAt @map("updated_at")
 
-  barber    Barber?         @relation(fields: [barberId], references: [id], onDelete: SetNull)
+  barber        Barber?           @relation(fields: [barberId], references: [id], onDelete: SetNull)
 
   @@index([category])
   @@index([barberId])
+  @@index([mediaType])
   @@map("gallery")
 }
 

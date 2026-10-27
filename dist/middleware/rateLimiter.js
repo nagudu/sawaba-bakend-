@@ -1,6 +1,6 @@
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.submitLimiter = exports.otpLimiter = exports.customerAuthLimiter = exports.authLimiter = exports.apiLimiter = void 0;
+exports.submitLimiter = exports.barberAuthLimiter = exports.passwordResetLimiter = exports.otpLimiter = exports.qrScanLimiter = exports.customerAuthLimiter = exports.authLimiter = exports.apiLimiter = void 0;
 const express_rate_limit_1 = require("express-rate-limit");
 const defaultConfig = {
     standardHeaders: true,
@@ -35,10 +35,36 @@ exports.customerAuthLimiter = (0, express_rate_limit_1.rateLimit)({
     skipSuccessfulRequests: true,
     ...defaultConfig,
 });
-/** OTP request/verify: 10 per 15 min per IP (sends email — costly and abusable). */
+/**
+ * QR scanner validation/check-in: 60 per 15 min per IP. A barber legitimately
+ * scans a handful of customers per shift; this caps automated token probing.
+ */
+exports.qrScanLimiter = (0, express_rate_limit_1.rateLimit)({
+    windowMs: 15 * 60 * 1000,
+    limit: 60,
+    ...defaultConfig,
+});
+/** OTP request/verify: 10 per 15 min per IP (sends email/SMS — costly and abusable). */
 exports.otpLimiter = (0, express_rate_limit_1.rateLimit)({
     windowMs: 15 * 60 * 1000,
     limit: 10,
+    ...defaultConfig,
+});
+/**
+ * Password-reset request/verify/reset: 8 per 15 min per IP. Unlike the login
+ * limiter this counts EVERY attempt (correct or not) — every call either sends
+ * an email/SMS or is a verification oracle, so both are costly and abusable.
+ */
+exports.passwordResetLimiter = (0, express_rate_limit_1.rateLimit)({
+    windowMs: 15 * 60 * 1000,
+    limit: 8,
+    ...defaultConfig,
+});
+/** Barber login: 10 FAILED attempts per 15 min per IP (correct logins skip). */
+exports.barberAuthLimiter = (0, express_rate_limit_1.rateLimit)({
+    windowMs: 15 * 60 * 1000,
+    limit: 10,
+    skipSuccessfulRequests: true,
     ...defaultConfig,
 });
 /** Limiter for public submission endpoints (bookings, contact, reviews). */

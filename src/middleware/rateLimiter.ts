@@ -37,6 +37,16 @@ export const customerAuthLimiter = rateLimit({
   ...defaultConfig,
 })
 
+/**
+ * QR scanner validation/check-in: 60 per 15 min per IP. A barber legitimately
+ * scans a handful of customers per shift; this caps automated token probing.
+ */
+export const qrScanLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  limit: 60,
+  ...defaultConfig,
+})
+
 /** OTP request/verify: 10 per 15 min per IP (sends email/SMS — costly and abusable). */
 export const otpLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,

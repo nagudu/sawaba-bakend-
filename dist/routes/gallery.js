@@ -71,7 +71,10 @@ exports.galleryRouter.get('/', (0, validate_1.validate)(gallery_1.listGalleryQue
  *       201:
  *         description: Gallery item created.
  */
-exports.galleryRouter.post('/', auth_1.requireAdmin, upload_1.upload.single('image'), (0, validate_1.validate)(gallery_1.createGallerySchema), galleryController_1.createGalleryHandler);
+exports.galleryRouter.post('/', auth_1.requireAdmin, upload_1.galleryUpload.fields([
+    { name: 'image', maxCount: 1 },
+    { name: 'video', maxCount: 1 },
+]), (0, validate_1.validate)(gallery_1.createGallerySchema), galleryController_1.createGalleryHandler);
 /**
  * @swagger
  * /api/gallery/{id}:
@@ -123,7 +126,10 @@ exports.galleryRouter.get('/:id', (0, validate_1.validate)(appointment_1.idParam
  *       200:
  *         description: Gallery item updated.
  */
-exports.galleryRouter.put('/:id', auth_1.requireAdmin, upload_1.upload.single('image'), (0, validate_1.validate)(appointment_1.idParamsSchema, 'params'), (0, validate_1.validate)(gallery_1.updateGallerySchema), galleryController_1.updateGalleryHandler);
+exports.galleryRouter.put('/:id', auth_1.requireAdmin, upload_1.galleryUpload.fields([
+    { name: 'image', maxCount: 1 },
+    { name: 'video', maxCount: 1 },
+]), (0, validate_1.validate)(appointment_1.idParamsSchema, 'params'), (0, validate_1.validate)(gallery_1.updateGallerySchema), galleryController_1.updateGalleryHandler);
 /**
  * @swagger
  * /api/gallery/{id}:

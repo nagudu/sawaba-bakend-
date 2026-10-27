@@ -65,6 +65,25 @@ export const env = {
     senderId: process.env.SMS_SENDER_ID ?? '',
     baseUrl: process.env.SMS_BASE_URL ?? '',
   },
+  // Automatic appointment reminders.
+  //   cronSecret            — shared secret that authorises the scheduler
+  //                           endpoint (Vercel sends it as a Bearer token).
+  //   nowHoursBefore        — comma-separated reminder windows, in hours
+  //                           before the appointment (default 24 and 1).
+  //   timezoneOffsetMinutes — offset of the studio's wall clock from UTC
+  //                           (Nigeria / WAT = +60). Used to convert the
+  //                           stored local date+time into a real instant.
+  reminder: {
+    cronSecret: process.env.CRON_SECRET ?? '',
+    hoursBefore: (process.env.REMINDER_HOURS_BEFORE ?? '24,1')
+      .split(',')
+      .map((h) => Number(h.trim()))
+      .filter((h) => Number.isFinite(h) && h > 0)
+      .sort((a, b) => b - a),
+    timezoneOffsetMinutes: Number(process.env.REMINDER_TZ_OFFSET_MINUTES) || 60,
+    // Interval (minutes) for the in-process scheduler on long-lived hosts.
+    schedulerIntervalMinutes: Number(process.env.REMINDER_INTERVAL_MINUTES) || 15,
+  },
 } as const
 
 /** True when Google sign-in is usable end to end. */

@@ -6,8 +6,7 @@ exports.updateReview = updateReview;
 exports.deleteReview = deleteReview;
 exports.approveReview = approveReview;
 exports.rejectReview = rejectReview;
-const sequelize_1 = require("sequelize");
-const models_1 = require("../models");
+const database_1 = require("../config/database");
 const errors_1 = require("../utils/errors");
 const response_1 = require("../utils/response");
 function serializeReview(review) {
@@ -20,7 +19,7 @@ function serializeReview(review) {
         serviceId: review.serviceId ?? null,
         serviceName: review.serviceName ?? null,
         barberId: review.barberId ?? null,
-        rating: Number(review.rating),
+        rating: review.rating,
         comment: review.comment,
         status: review.status,
         isApproved: review.status === 'APPROVED',
@@ -29,18 +28,20 @@ function serializeReview(review) {
     };
 }
 async function createReview(input) {
-    const review = await models_1.Review.create({
-        customerName: input.customerName,
-        customerPhone: input.customerPhone ?? null,
-        customerEmail: input.customerEmail ?? null,
-        customerImage: input.customerImage ?? null,
-        serviceId: input.serviceId ?? null,
-        serviceName: input.serviceName ?? null,
-        barberId: input.barberId ?? null,
-        rating: input.rating,
-        comment: input.comment,
-        status: 'PENDING',
-        isApproved: false,
+    const review = await database_1.prisma.review.create({
+        data: {
+            customerName: input.customerName,
+            customerPhone: input.customerPhone ?? null,
+            customerEmail: input.customerEmail ?? null,
+            customerImage: input.customerImage ?? null,
+            serviceId: input.serviceId ?? null,
+            serviceName: input.serviceName ?? null,
+            barberId: input.barberId ?? null,
+            rating: input.rating,
+            comment: input.comment,
+            status: 'PENDING',
+            isApproved: false,
+        },
     });
     return serializeReview(review);
 }
@@ -57,64 +58,73 @@ async function listReviews(query) {
     else if (query.approved === 'false') {
         where.status = 'PENDING';
     }
-    // Filter by barber when the validated `barberId` query param is present —
-    // used by barber profiles to fetch only their own approved reviews.
     if (query.barberId) {
         where.barberId = query.barberId;
     }
     if (query.search) {
-        where[sequelize_1.Op.or] = [
-            { customerName: { [sequelize_1.Op.like]: `%${query.search}%` } },
-            { comment: { [sequelize_1.Op.like]: `%${query.search}%` } },
-            { customerPhone: { [sequelize_1.Op.like]: `%${query.search}%` } },
-            { customerEmail: { [sequelize_1.Op.like]: `%${query.search}%` } },
-            { serviceName: { [sequelize_1.Op.like]: `%${query.search}%` } },
+        where.OR = [
+            { customerName: { contains: query.search } },
+            { comment: { contains: query.search } },
+            { customerPhone: { contains: query.search } },
+            { customerEmail: { contains: query.search } },
+            { serviceName: { contains: query.search } },
         ];
     }
-    const { rows, count } = await models_1.Review.findAndCountAll({
-        where,
-        order: [['createdAt', 'DESC']],
-        offset,
-        limit,
-    });
-    return { items: rows.map(serializeReview), total: count, page, perPage };
+    const [rows, total] = await database_1.prisma.$transaction([
+        database_1.prisma.review.findMany({
+            where,
+            orderBy: { createdAt: 'desc' },
+            skip: offset,
+            take: limit,
+        }),
+        database_1.prisma.review.count({ where }),
+    ]);
+    return { items: rows.map(serializeReview), total, page, perPage };
 }
 async function updateReview(id, input) {
-    const review = await models_1.Review.findByPk(id);
-    if (!review) {
+    const existing = await database_1.prisma.review.findUnique({ where: { id }, select: { id: true } });
+    if (!existing) {
         throw new errors_1.NotFoundError('Review not found.');
     }
     const patch = { ...input };
     if (input.status !== undefined) {
+        patch.status = input.status;
         patch.isApproved = input.status === 'APPROVED';
     }
     else if (input.isApproved !== undefined) {
         patch.status = input.isApproved ? 'APPROVED' : 'PENDING';
+        patch.isApproved = input.isApproved;
     }
-    await review.update(patch);
-    return serializeReview(review);
+    const updated = await database_1.prisma.review.update({ where: { id }, data: patch });
+    return serializeReview(updated);
 }
 async function deleteReview(id) {
-    const review = await models_1.Review.findByPk(id);
-    if (!review) {
+    const existing = await database_1.prisma.review.findUnique({ where: { id }, select: { id: true } });
+    if (!existing) {
         throw new errors_1.NotFoundError('Review not found.');
     }
-    await review.destroy();
+    await database_1.prisma.review.delete({ where: { id } });
 }
 async function approveReview(id) {
-    const review = await models_1.Review.findByPk(id);
-    if (!review) {
+    const existing = await database_1.prisma.review.findUnique({ where: { id }, select: { id: true } });
+    if (!existing) {
         throw new errors_1.NotFoundError('Review not found.');
     }
-    await review.update({ status: 'APPROVED', isApproved: true });
-    return serializeReview(review);
+    const updated = await database_1.prisma.review.update({
+        where: { id },
+        data: { status: 'APPROVED', isApproved: true },
+    });
+    return serializeReview(updated);
 }
 async function rejectReview(id) {
-    const review = await models_1.Review.findByPk(id);
-    if (!review) {
+    const existing = await database_1.prisma.review.findUnique({ where: { id }, select: { id: true } });
+    if (!existing) {
         throw new errors_1.NotFoundError('Review not found.');
     }
-    await review.update({ status: 'REJECTED', isApproved: false });
-    return serializeReview(review);
+    const updated = await database_1.prisma.review.update({
+        where: { id },
+        data: { status: 'REJECTED', isApproved: false },
+    });
+    return serializeReview(updated);
 }
 //# sourceMappingURL=reviewService.js.map

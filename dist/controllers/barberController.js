@@ -9,9 +9,7 @@ exports.getAvailabilityHandler = getAvailabilityHandler;
 exports.setAvailabilityHandler = setAvailabilityHandler;
 const barberService_1 = require("../services/barberService");
 const response_1 = require("../utils/response");
-const models_1 = require("../models");
 const upload_1 = require("../utils/upload");
-const errors_1 = require("../utils/errors");
 async function withUploadedImage(req, next, fallback) {
     const file = req.file;
     if (!file)
@@ -21,7 +19,7 @@ async function withUploadedImage(req, next, fallback) {
         return uploaded.url;
     }
     catch (error) {
-        next(new errors_1.AppError('Image upload failed. Please try again.', 500));
+        next(error);
         return undefined;
     }
 }
@@ -85,6 +83,9 @@ async function updateBarberHandler(req, res, next) {
             return;
         const input = { ...req.body, image };
         const barber = await (0, barberService_1.updateBarber)(id, input);
+        if (req.file && existing.image && existing.image !== barber.image) {
+            await (0, upload_1.deleteImageByUrl)(existing.image).catch(() => undefined);
+        }
         const message = barber.credentialNotice
             ? `Barber updated successfully. ${barber.credentialNotice}`
             : 'Barber updated successfully.';
@@ -100,12 +101,7 @@ async function deleteBarberHandler(req, res, next) {
         const existing = await (0, barberService_1.getBarberById)(id);
         const appointmentCount = await (0, barberService_1.countBarberAppointments)(id);
         if (appointmentCount > 0) {
-            // The barber keeps old appointments/receipts consistent, so they cannot
-            // be physically removed — deactivate them instead and say so honestly.
-            const [updatedCount] = await models_1.Barber.update({ isActive: false }, { where: { id } });
-            if (updatedCount === 0) {
-                throw new errors_1.NotFoundError('Barber not found.');
-            }
+            await (0, barberService_1.deactivateBarber)(id);
             (0, response_1.successRes)(res, `"${existing.name}" has ${appointmentCount} appointment${appointmentCount === 1 ? '' : 's'} on record, so they were deactivated instead of deleted. Their past bookings and receipts stay intact — remove them from services in Edit if you no longer offer those combinations.`, { deactivated: true, appointmentCount }, 200);
             return;
         }

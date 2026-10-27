@@ -7,7 +7,6 @@ exports.seedDatabase = seedDatabase;
 const bcryptjs_1 = __importDefault(require("bcryptjs"));
 const database_1 = require("../config/database");
 const env_1 = require("../config/env");
-const models_1 = require("../models");
 const paymentSettingsService_1 = require("../services/paymentSettingsService");
 const seedAssets_1 = require("../utils/seedAssets");
 const serviceSeeds = [
@@ -225,28 +224,35 @@ const reviewSeeds = [
 /**
  * One-time data migration: existing records whose images still point at
  * external hosts (Unsplash, Cloudinary, ...) are switched to the local
- * uploads copies created from the committed seed assets. Admin-uploaded
- * images (/uploads/...) are never touched. Idempotent — a second run is a
- * no-op because the records now start with /uploads/.
+ * uploads copies created from the committed seed assets.
  */
 async function migrateLegacyImageUrls() {
     const isLegacy = (url) => Boolean(url) && !String(url).startsWith('/uploads/');
     for (const seed of serviceSeeds) {
-        const service = await models_1.Service.findOne({ where: { slug: seed.slug } });
+        const service = await database_1.prisma.service.findUnique({ where: { slug: seed.slug } });
         if (service && isLegacy(service.image)) {
-            await service.update({ image: (0, seedAssets_1.copySeedAsset)(`${seed.slug}.jpg`) });
+            await database_1.prisma.service.update({
+                where: { id: service.id },
+                data: { image: (0, seedAssets_1.copySeedAsset)(`${seed.slug}.jpg`) },
+            });
         }
     }
     for (const seed of barberSeeds) {
-        const barber = await models_1.Barber.findOne({ where: { slug: seed.slug } });
+        const barber = await database_1.prisma.barber.findUnique({ where: { slug: seed.slug } });
         if (barber && isLegacy(barber.image)) {
-            await barber.update({ image: (0, seedAssets_1.copySeedAsset)(`barber-${seed.slug.split('-')[0]}.jpg`) });
+            await database_1.prisma.barber.update({
+                where: { id: barber.id },
+                data: { image: (0, seedAssets_1.copySeedAsset)(`barber-${seed.slug.split('-')[0]}.jpg`) },
+            });
         }
     }
     for (const item of gallerySeeds) {
-        const gallery = await models_1.Gallery.findOne({ where: { title: item.title } });
+        const gallery = await database_1.prisma.gallery.findFirst({ where: { title: item.title } });
         if (gallery && isLegacy(gallery.image)) {
-            await gallery.update({ image: (0, seedAssets_1.copySeedAsset)(item.file) });
+            await database_1.prisma.gallery.update({
+                where: { id: gallery.id },
+                data: { image: (0, seedAssets_1.copySeedAsset)(item.file) },
+            });
         }
     }
 }
@@ -256,72 +262,100 @@ async function migrateLegacyImageUrls() {
  * customer account. Safe to run on every boot — existing records untouched.
  */
 async function seedDatabase() {
-    await database_1.sequelize.authenticate();
+    await (0, database_1.connectDatabase)();
     console.log('[db:seed] database connection established');
     await migrateLegacyImageUrls();
-    // --- Seed admin (same source as db:sync — keeps parity with local dev) ---
-    const [seedAdmin, adminCreated] = await models_1.Admin.findOrCreate({
+    // --- Seed admin ---
+    const existingAdmin = await database_1.prisma.admin.findUnique({
         where: { email: env_1.env.adminSeed.email.toLowerCase() },
-        defaults: {
-            name: env_1.env.adminSeed.name,
-            email: env_1.env.adminSeed.email.toLowerCase(),
-            password: await bcryptjs_1.default.hash(env_1.env.adminSeed.password, 12),
-            role: 'ADMIN',
-        },
     });
-    console.log(adminCreated
-        ? `[db:seed] seed admin created: ${seedAdmin.email}`
-        : `[db:seed] seed admin already exists: ${seedAdmin.email}`);
-    const serviceBySlug = {};
-    for (const seed of serviceSeeds) {
-        const [service, created] = await models_1.Service.findOrCreate({
-            where: { slug: seed.slug },
-            defaults: {
-                name: seed.name,
-                slug: seed.slug,
-                category: seed.category,
-                description: seed.description,
-                price: seed.price,
-                duration: seed.duration,
-                image: seed.image,
-                isActive: true,
+    let adminCreated = false;
+    if (!existingAdmin) {
+        await database_1.prisma.admin.create({
+            data: {
+                name: env_1.env.adminSeed.name,
+                email: env_1.env.adminSeed.email.toLowerCase(),
+                password: await bcryptjs_1.default.hash(env_1.env.adminSeed.password, 12),
+                role: 'ADMIN',
             },
         });
+        adminCreated = true;
+    }
+    console.log(adminCreated
+        ? `[db:seed] seed admin created: ${env_1.env.adminSeed.email.toLowerCase()}`
+        : `[db:seed] seed admin already exists: ${env_1.env.adminSeed.email.toLowerCase()}`);
+    const serviceBySlug = {};
+    for (const seed of serviceSeeds) {
+        let service = await database_1.prisma.service.findUnique({ where: { slug: seed.slug } });
+        let created = false;
+        if (!service) {
+            service = await database_1.prisma.service.create({
+                data: {
+                    name: seed.name,
+                    slug: seed.slug,
+                    category: seed.category,
+                    description: seed.description,
+                    price: seed.price,
+                    duration: seed.duration,
+                    image: seed.image,
+                    isActive: true,
+                },
+            });
+            created = true;
+        }
         serviceBySlug[seed.slug] = service.id;
         console.log(created
             ? `[db:seed] created service: ${service.name}`
             : `[db:seed] service already exists: ${service.name}`);
     }
     for (const seed of barberSeeds) {
-        const [barber, created] = await models_1.Barber.findOrCreate({
-            where: { slug: seed.slug },
-            defaults: {
-                name: seed.name,
-                slug: seed.slug,
-                specialty: seed.specialty,
-                biography: seed.biography,
-                experience: seed.experience,
-                rating: seed.rating,
-                image: seed.image,
-                isActive: true,
-            },
-        });
-        // Only the services this barber actually performs — the booking flow
-        // filters barbers by the selected service, so this mapping matters.
+        let barber = await database_1.prisma.barber.findUnique({ where: { slug: seed.slug } });
+        let created = false;
+        if (!barber) {
+            barber = await database_1.prisma.barber.create({
+                data: {
+                    name: seed.name,
+                    slug: seed.slug,
+                    specialty: seed.specialty,
+                    biography: seed.biography,
+                    experience: seed.experience,
+                    rating: seed.rating,
+                    image: seed.image,
+                    isActive: true,
+                },
+            });
+            created = true;
+        }
         const serviceIds = (seed.serviceSlugs ?? [])
             .map((slug) => serviceBySlug[slug])
             .filter((id) => Boolean(id));
-        await barber.setServices(serviceIds);
+        // Reconcile barber services
+        await database_1.prisma.barberService.deleteMany({ where: { barberId: barber.id } });
+        if (serviceIds.length > 0) {
+            await database_1.prisma.barberService.createMany({
+                data: serviceIds.map((serviceId) => ({ barberId: barber.id, serviceId })),
+                skipDuplicates: true,
+            });
+        }
         console.log(created
             ? `[db:seed] created barber: ${barber.name} (${serviceIds.length} services)`
             : `[db:seed] reconciled barber services: ${barber.name} (${serviceIds.length} services)`);
         for (const [day, [startTime, endTime]] of Object.entries(weeklySchedule)) {
-            await models_1.BarberAvailability.upsert({
-                barberId: barber.id,
-                dayOfWeek: Number(day),
-                startTime,
-                endTime,
-                isAvailable: true,
+            await database_1.prisma.barberAvailability.upsert({
+                where: {
+                    barberId_dayOfWeek: {
+                        barberId: barber.id,
+                        dayOfWeek: Number(day),
+                    },
+                },
+                update: { startTime, endTime, isAvailable: true },
+                create: {
+                    barberId: barber.id,
+                    dayOfWeek: Number(day),
+                    startTime,
+                    endTime,
+                    isAvailable: true,
+                },
             });
         }
     }
@@ -331,18 +365,23 @@ async function seedDatabase() {
     // --- Gallery (idempotent by title) ---
     let galleryCount = 0;
     for (const item of gallerySeeds) {
-        const [, created] = await models_1.Gallery.findOrCreate({
-            where: { title: item.title },
-            defaults: { title: item.title, image: (0, seedAssets_1.copySeedAsset)(item.file), category: item.category },
-        });
-        if (created)
+        const existing = await database_1.prisma.gallery.findFirst({ where: { title: item.title } });
+        if (!existing) {
+            await database_1.prisma.gallery.create({
+                data: {
+                    title: item.title,
+                    image: (0, seedAssets_1.copySeedAsset)(item.file),
+                    category: item.category,
+                },
+            });
             galleryCount += 1;
+        }
     }
     console.log(`[db:seed] gallery ensured (${galleryCount} new)`);
-    // --- Approved demo reviews (idempotent by customer name + service) ---
+    // --- Approved demo reviews ---
     const barberBySlug = {};
     for (const barberSeed of barberSeeds) {
-        const found = await models_1.Barber.findOne({ where: { slug: barberSeed.slug } });
+        const found = await database_1.prisma.barber.findUnique({ where: { slug: barberSeed.slug } });
         if (found)
             barberBySlug[barberSeed.slug] = found.id;
     }
@@ -350,38 +389,45 @@ async function seedDatabase() {
     for (const seed of reviewSeeds) {
         const service = serviceBySlug[seed.serviceSlug];
         const barberId = seed.barberSlug ? barberBySlug[seed.barberSlug] : undefined;
-        const [, created] = await models_1.Review.findOrCreate({
+        const existing = await database_1.prisma.review.findFirst({
             where: { customerName: seed.customerName, serviceId: service ?? null },
-            defaults: {
-                customerName: seed.customerName,
-                serviceId: service ?? null,
-                serviceName: serviceSeeds.find((s) => s.slug === seed.serviceSlug)?.name ?? null,
-                barberId: barberId ?? null,
-                rating: seed.rating,
-                comment: seed.comment,
-                status: 'APPROVED',
-                isApproved: true,
-            },
         });
-        if (created)
+        if (!existing) {
+            await database_1.prisma.review.create({
+                data: {
+                    customerName: seed.customerName,
+                    serviceId: service ?? null,
+                    serviceName: serviceSeeds.find((s) => s.slug === seed.serviceSlug)?.name ?? null,
+                    barberId: barberId ?? null,
+                    rating: seed.rating,
+                    comment: seed.comment,
+                    status: 'APPROVED',
+                    isApproved: true,
+                },
+            });
             reviewCount += 1;
+        }
     }
     console.log(`[db:seed] demo reviews ensured (${reviewCount} new)`);
-    // --- Client-demo customer account (idempotent by phone) ---
-    const [demoCustomer, customerCreated] = await models_1.Customer.findOrCreate({
+    // --- Client-demo customer account ---
+    let customerCreated = false;
+    const existingCustomer = await database_1.prisma.customer.findFirst({
         where: { phone: '08000000001' },
-        defaults: {
-            fullName: 'Demo Customer',
-            phone: '08000000001',
-            email: 'customer@sawabagrooming.test',
-            passwordHash: await bcryptjs_1.default.hash('TestCustomer123!', 10),
-        },
     });
-    if (customerCreated) {
+    if (!existingCustomer) {
+        await database_1.prisma.customer.create({
+            data: {
+                fullName: 'Demo Customer',
+                phone: '08000000001',
+                email: 'customer@sawabagrooming.test',
+                passwordHash: await bcryptjs_1.default.hash('TestCustomer123!', 10),
+            },
+        });
+        customerCreated = true;
         console.log('[db:seed] demo customer account created: customer@sawabagrooming.test');
     }
     else {
-        console.log(`[db:seed] demo customer already exists: ${demoCustomer.email ?? demoCustomer.phone}`);
+        console.log(`[db:seed] demo customer already exists: ${existingCustomer.email ?? existingCustomer.phone}`);
     }
     return {
         services: Object.keys(serviceBySlug).length,
@@ -402,7 +448,7 @@ async function run() {
         process.exitCode = 1;
     }
     finally {
-        await database_1.sequelize.close();
+        await (0, database_1.closeDatabase)();
     }
 }
 // Only auto-run when executed directly (not when imported by the server).

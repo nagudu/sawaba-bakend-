@@ -8,6 +8,7 @@ import { createEarningSnapshot } from './commissionService'
 import { uploadImageToCloudinary } from '../utils/upload'
 import { getPaymentSettingsRecord } from './paymentSettingsService'
 import { AppointmentStatusValue } from '../config/appointmentStatuses'
+import { buildQrPayload, ensureAppointmentQrToken } from './qrService'
 
 function generateSessionToken(): string {
   return crypto.randomBytes(24).toString('hex')
@@ -344,6 +345,26 @@ export interface FinalizeResult {
   }
   payment: { id: number; accessToken: string; amount: number; status: string }
   sessionToken: string
+  /** Check-in QR minted up front so guests get it immediately (subject to status). */
+  qrPayload: string
+  qrToken: string
+}
+
+/**
+ * Mints the appointment's check-in QR (idempotent — reuses the existing token)
+ * and folds the payload into a finalize result. Never lets a QR hiccup fail a
+ * booking that was already committed.
+ */
+async function withQr(
+  appointmentId: number,
+  base: Omit<FinalizeResult, 'qrPayload' | 'qrToken'>,
+): Promise<FinalizeResult> {
+  try {
+    const token = await ensureAppointmentQrToken(appointmentId)
+    return { ...base, qrToken: token, qrPayload: buildQrPayload(token) }
+  } catch {
+    return { ...base, qrToken: '', qrPayload: '' }
+  }
 }
 
 export async function finalizeCheckout(sessionToken: string): Promise<FinalizeResult> {
@@ -356,7 +377,7 @@ export async function finalizeCheckout(sessionToken: string): Promise<FinalizeRe
         include: { payment: true },
       })
       if (existing) {
-        return {
+        return withQr(existing.id, {
           appointment: {
             id: existing.id,
             referenceCode: existing.referenceCode,
@@ -372,7 +393,7 @@ export async function finalizeCheckout(sessionToken: string): Promise<FinalizeRe
             status: existing.payment?.status ?? 'UNPAID',
           },
           sessionToken,
-        }
+        })
       }
     }
     throw new ConflictError('This booking session has already been used.')
@@ -465,7 +486,7 @@ export async function finalizeCheckout(sessionToken: string): Promise<FinalizeRe
     return { appointment, payment }
   })
 
-  return {
+  return withQr(result.appointment.id, {
     appointment: {
       id: result.appointment.id,
       referenceCode: result.appointment.referenceCode,
@@ -481,7 +502,7 @@ export async function finalizeCheckout(sessionToken: string): Promise<FinalizeRe
       status: result.payment.status,
     },
     sessionToken,
-  }
+  })
 }
 
 /** Marks a session EXPIRED (customer abandoned the checkout). */
@@ -629,7 +650,7 @@ async function finalizeResultForConverted(session: CheckoutSessionWithRelations)
     include: { payment: true },
   })
   if (!existing) return null
-  return {
+  return withQr(existing.id, {
     appointment: {
       id: existing.id,
       referenceCode: existing.referenceCode,
@@ -645,7 +666,7 @@ async function finalizeResultForConverted(session: CheckoutSessionWithRelations)
       status: existing.payment?.status ?? 'UNPAID',
     },
     sessionToken: session.sessionToken,
-  }
+  })
 }
 
 /** Webhook path: charge.success on a checkout session → verify + finalize. */

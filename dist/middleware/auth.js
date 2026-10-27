@@ -7,7 +7,7 @@ exports.requireAdmin = requireAdmin;
 exports.requireRole = requireRole;
 const jsonwebtoken_1 = __importDefault(require("jsonwebtoken"));
 const env_1 = require("../config/env");
-const models_1 = require("../models");
+const database_1 = require("../config/database");
 const errors_1 = require("../utils/errors");
 async function requireAdmin(req, _res, next) {
     try {
@@ -24,7 +24,10 @@ async function requireAdmin(req, _res, next) {
         catch {
             throw new errors_1.UnauthorizedError('Access token is expired or invalid.');
         }
-        const admin = await models_1.Admin.findByPk(payload.sub);
+        if (payload.role !== 'ADMIN') {
+            throw new errors_1.ForbiddenError('This token is not valid for the admin area.');
+        }
+        const admin = await database_1.prisma.admin.findUnique({ where: { id: payload.sub } });
         if (!admin || !admin.isActive) {
             throw new errors_1.UnauthorizedError('Account no longer exists or has been deactivated.');
         }
