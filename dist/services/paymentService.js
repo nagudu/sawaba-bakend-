@@ -12,6 +12,9 @@ exports.verifyPayment = verifyPayment;
 exports.confirmCashPayment = confirmCashPayment;
 exports.rejectPayment = rejectPayment;
 exports.markPaymentCancelled = markPaymentCancelled;
+exports.getPaymentSummary = getPaymentSummary;
+exports.markPaymentRefunded = markPaymentRefunded;
+exports.exportPayments = exportPayments;
 const database_1 = require("../config/database");
 const errors_1 = require("../utils/errors");
 const response_1 = require("../utils/response");
@@ -139,6 +142,8 @@ function serializePayment(payment) {
         status: payment.status,
         rejectionReason: payment.rejectionReason,
         verifiedAt: payment.verifiedAt,
+        verifiedBy: payment.verifiedBy,
+        providerRef: payment.providerRef,
         createdAt: payment.createdAt,
         updatedAt: payment.updatedAt,
         accessToken: payment.accessToken,
@@ -317,31 +322,66 @@ async function trackPayment(input) {
     const settings = await (0, paymentSettingsService_1.getPaymentSettingsRecord)();
     return { payment: serializePayment(payment), settings: (0, paymentSettingsService_1.serializePaymentSetting)(settings) };
 }
-async function listPayments(query) {
-    const { page, perPage, offset, limit } = (0, response_1.getPagination)(query);
+/**
+ * Builds the Prisma filter shared by the list, summary and CSV export so all
+ * three always agree on what a "transaction matching this query" is.
+ * Status and search are only applied when present — the summary intentionally
+ * omits them so it can total every status at once.
+ */
+function buildPaymentWhere(query) {
     const where = {};
     if (query.status)
         where.status = query.status;
     if (query.method)
         where.paymentMethod = query.method;
+    const and = [];
     if (query.from || query.to) {
-        where.paymentDate = {
-            ...(query.from ? { gte: query.from } : {}),
-            ...(query.to ? { lte: query.to } : {}),
-        };
+        // paymentDate is the YYYY-MM-DD the customer declared; rows without one
+        // are dated by when the record was created so they stay in range.
+        and.push({
+            OR: [
+                {
+                    paymentDate: {
+                        ...(query.from ? { gte: query.from } : {}),
+                        ...(query.to ? { lte: query.to } : {}),
+                    },
+                },
+                {
+                    paymentDate: null,
+                    createdAt: {
+                        ...(query.from ? { gte: new Date(`${query.from}T00:00:00.000Z`) } : {}),
+                        ...(query.to ? { lte: new Date(`${query.to}T23:59:59.999Z`) } : {}),
+                    },
+                },
+            ],
+        });
     }
     const search = query.search?.trim();
     if (search) {
         const isNum = /^\d+$/.test(search);
-        where.appointment = {
+        and.push({
             OR: [
-                { referenceCode: { contains: search } },
-                { customerName: { contains: search } },
-                { customerPhone: { contains: search } },
-                ...(isNum ? [{ id: Number(search) }] : []),
+                { transactionReference: { contains: search } },
+                {
+                    appointment: {
+                        OR: [
+                            { referenceCode: { contains: search } },
+                            { customerName: { contains: search } },
+                            { customerPhone: { contains: search } },
+                            ...(isNum ? [{ id: Number(search) }] : []),
+                        ],
+                    },
+                },
             ],
-        };
+        });
     }
+    if (and.length > 0)
+        where.AND = and;
+    return where;
+}
+async function listPayments(query) {
+    const { page, perPage, offset, limit } = (0, response_1.getPagination)(query);
+    const where = buildPaymentWhere(query);
     const [rows, total] = await Promise.all([
         database_1.prisma.payment.findMany({
             where,
@@ -367,7 +407,15 @@ async function getPaymentById(id) {
     if (!payment) {
         throw new errors_1.NotFoundError('Payment not found.');
     }
-    return serializePayment(payment);
+    const serialized = serializePayment(payment);
+    if (payment.verifiedBy) {
+        const admin = await database_1.prisma.admin.findUnique({
+            where: { id: payment.verifiedBy },
+            select: { name: true },
+        });
+        serialized.verifiedByName = admin?.name ?? null;
+    }
+    return serialized;
 }
 async function verifyPayment(id, adminId) {
     const payment = await database_1.prisma.payment.findUnique({
@@ -483,5 +531,148 @@ async function markPaymentCancelled(appointmentId) {
             data: { status: 'CANCELLED' },
         });
     }
+}
+/**
+ * Aggregated revenue figures for the admin transaction dashboard.
+ * Revenue is only ever counted from PAID (verified) payments — pending,
+ * rejected or unverified money never contributes to a total.
+ */
+async function getPaymentSummary(query) {
+    const where = buildPaymentWhere(query);
+    const [byStatus, total] = await Promise.all([
+        database_1.prisma.payment.groupBy({
+            by: ['status'],
+            where,
+            _count: { _all: true },
+            _sum: { amount: true },
+        }),
+        database_1.prisma.payment.count({ where }),
+    ]);
+    const stat = (status) => {
+        const row = byStatus.find((entry) => entry.status === status);
+        return { count: row?._count._all ?? 0, total: Number(row?._sum.amount ?? 0) };
+    };
+    const successful = stat('PAID');
+    const pending = stat('PENDING_VERIFICATION');
+    const failed = stat('REJECTED');
+    const refunded = stat('REFUNDED');
+    const unpaid = stat('UNPAID');
+    // Today's revenue = money confirmed today (UTC day, the same clock the
+    // backend stamps records with).
+    const startOfToday = new Date();
+    startOfToday.setUTCHours(0, 0, 0, 0);
+    const todayAggregate = await database_1.prisma.payment.aggregate({
+        where: { ...where, status: 'PAID', verifiedAt: { gte: startOfToday } },
+        _sum: { amount: true },
+        _count: { _all: true },
+    });
+    return {
+        totalTransactions: total,
+        successfulCount: successful.count,
+        successfulTotal: successful.total,
+        pendingCount: pending.count,
+        pendingTotal: pending.total,
+        todayCount: todayAggregate._count._all,
+        todayTotal: Number(todayAggregate._sum.amount ?? 0),
+        failedCount: failed.count,
+        failedTotal: failed.total,
+        refundedCount: refunded.count,
+        refundedTotal: refunded.total,
+        unpaidCount: unpaid.count,
+    };
+}
+/**
+ * Refunds a verified payment — the money went back to the customer. Only a
+ * PAID payment can be refunded, so a pending or rejected payment can never
+ * become a phantom refund. Unsettled commission is unwound; payouts that were
+ * already paid out to a barber are never rewritten.
+ */
+async function markPaymentRefunded(id, reason, adminId) {
+    const payment = await database_1.prisma.payment.findUnique({
+        where: { id },
+        include: paymentInclude,
+    });
+    if (!payment) {
+        throw new errors_1.NotFoundError('Payment not found.');
+    }
+    if (payment.status !== 'PAID') {
+        throw new errors_1.UnprocessableError('Only verified payments can be refunded.');
+    }
+    await database_1.prisma.payment.update({
+        where: { id },
+        data: {
+            status: 'REFUNDED',
+            rejectionReason: reason,
+            verifiedBy: adminId,
+        },
+    });
+    // Refunded money is no longer money the studio kept: drop any unsettled
+    // commission back to PENDING so it never pays out on a refunded sale.
+    const earning = await database_1.prisma.barberEarning.findUnique({
+        where: { appointmentId: payment.appointmentId },
+    });
+    if (earning && earning.status !== 'PAID') {
+        await database_1.prisma.barberEarning.update({
+            where: { id: earning.id },
+            data: { status: 'PENDING', earnedAt: null },
+        });
+    }
+    return getPaymentById(id);
+}
+const CSV_COLUMNS = [
+    'Transaction Ref',
+    'Booking Ref',
+    'Customer',
+    'Phone',
+    'Email',
+    'Service',
+    'Barber',
+    'Amount (NGN)',
+    'Method',
+    'Status',
+    'Payment Date',
+    'Verified At',
+    'Receipt URL',
+    'Note',
+    'Created At',
+];
+function csvCell(value) {
+    const text = value == null ? '' : String(value);
+    return /[",\n\r]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text;
+}
+/**
+ * Renders the filtered transactions as CSV (CRLF, UTF-8 BOM) for accounting.
+ * Shares the exact where-clause with the list so the export always matches
+ * what the admin sees on screen.
+ */
+async function exportPayments(query) {
+    const rows = await database_1.prisma.payment.findMany({
+        where: buildPaymentWhere(query),
+        include: paymentInclude,
+        orderBy: { createdAt: 'desc' },
+        take: 10000,
+    });
+    const lines = [CSV_COLUMNS.join(',')];
+    for (const payment of rows) {
+        const appointment = payment.appointment;
+        lines.push([
+            csvCell(payment.transactionReference ?? ''),
+            csvCell(appointment?.referenceCode ?? appointment?.id ?? ''),
+            csvCell(appointment?.customerName ?? ''),
+            csvCell(appointment?.customerPhone ?? ''),
+            csvCell(appointment?.customerEmail ?? ''),
+            csvCell(appointment?.service?.name ?? ''),
+            csvCell(appointment?.barber?.name ?? ''),
+            csvCell(Number(payment.amount).toFixed(2)),
+            csvCell(payment.paymentMethod ?? ''),
+            csvCell(payment.status),
+            csvCell(payment.paymentDate ?? ''),
+            csvCell(payment.verifiedAt ? payment.verifiedAt.toISOString() : ''),
+            csvCell(payment.receiptUrl ?? ''),
+            csvCell(payment.note ?? ''),
+            csvCell(payment.createdAt.toISOString()),
+        ].join(','));
+    }
+    return lines.join('\r\n');
 }
 //# sourceMappingURL=paymentService.js.map

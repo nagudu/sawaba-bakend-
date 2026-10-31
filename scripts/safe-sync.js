@@ -12,15 +12,13 @@ const candidates = [
 
 for (const scriptPath of candidates) {
   if (fs.existsSync(scriptPath)) {
-    try {
-      execSync(`node "${scriptPath}"`, { stdio: 'inherit' })
-      process.exit(0)
-    } catch {
-      // ignore and allow build to proceed
-    }
+    execSync(`node "${scriptPath}"`, { stdio: 'inherit' })
+    process.exit(0)
   }
 }
 
-// If no script found, log info and exit cleanly so tsc can run
-console.log('[safe-sync] No external sync script found. Proceeding with standard build.')
-process.exit(0)
+// Isolated backend installs do not have the root sync helper.
+execSync('npx prisma generate --schema prisma/schema.prisma', {
+  cwd: path.resolve(__dirname, '..'),
+  stdio: 'inherit',
+})

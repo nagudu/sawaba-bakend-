@@ -23,6 +23,9 @@ import { barberAuthRouter } from './barberAuth'
 import { barberPortalRouter } from './barberPortal'
 import { adminRemindersRouter, cronRouter } from './reminders'
 import { adminQrRouter, barberQrRouter } from './qr'
+import { shopRouter } from './shop'
+import { vendorPortalRouter } from './vendorPortal'
+import { marketplaceAdminRouter } from './marketplaceAdmin'
 
 export const apiRouter = Router()
 
@@ -54,6 +57,10 @@ apiRouter.use('/payments/paystack', paystackRouter)
 apiRouter.use('/payments', paymentsRouter)
 apiRouter.use('/checkout', checkoutRouter)
 apiRouter.use('/bookings', bookingsRouter)
+// Marketplace — public shop, vendor portal, admin management.
+apiRouter.use('/shop', shopRouter)
+apiRouter.use('/vendor', vendorPortalRouter)
+apiRouter.use('/admin/marketplace', marketplaceAdminRouter)
 apiRouter.use('/admin/qr', adminQrRouter)
 apiRouter.use('/admin/dashboard', dashboardRouter)
 apiRouter.use('/admin/customers', customersRouter)

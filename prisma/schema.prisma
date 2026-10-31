@@ -118,6 +118,14 @@ enum ContactReplyStatus {
   FAILED
 }
 
+enum ProductStatus {
+  DRAFT
+  PENDING_REVIEW
+  ACTIVE
+  REJECTED
+  ARCHIVED
+}
+
 model Admin {
   id                        Int                       @id @default(autoincrement())
   name                      String                    @db.VarChar(100)
@@ -630,4 +638,444 @@ model ContactReply {
 
   @@index([contactMessageId])
   @@map("contact_replies")
+}
+
+model MarketplaceSetting {
+  id                     Int           @id @default(1)
+  defaultCommissionRate  Decimal       @default(10) @map("default_commission_rate") @db.Decimal(5, 2)
+  commissionType         CommissionType @default(PERCENTAGE) @map("commission_type")
+  releaseDelayDays       Int           @default(7) @map("release_delay_days")
+  deliveryFee            Decimal       @default(1000) @map("delivery_fee") @db.Decimal(12, 2)
+  freeDeliveryThreshold  Decimal       @default(50000) @map("free_delivery_threshold") @db.Decimal(12, 2)
+  deliveryLocations      String        @default("") @map("delivery_locations") @db.VarChar(500)
+  requireProductApproval Boolean       @default(true) @map("require_product_approval")
+  allowGuestCheckout     Boolean       @default(true) @map("allow_guest_checkout")
+  vendorRegistrationOpen Boolean       @default(true) @map("vendor_registration_open")
+  updatedAt              DateTime      @updatedAt @map("updated_at")
+
+  @@map("marketplace_settings")
+}
+
+model Vendor {
+  id                 Int           @id @default(autoincrement())
+  businessName       String        @map("business_name") @db.VarChar(150)
+  contactName        String        @map("contact_name") @db.VarChar(150)
+  slug               String        @unique @db.VarChar(160)
+  email              String        @unique @db.VarChar(255)
+  phone              String        @db.VarChar(32)
+  passwordHash       String        @map("password_hash") @db.VarChar(255)
+  logoUrl            String?       @map("logo_url") @db.VarChar(500)
+  address            String?       @db.VarChar(300)
+  location           String?       @db.VarChar(150)
+  bankName           String?       @map("bank_name") @db.VarChar(150)
+  bankAccountName    String?       @map("bank_account_name") @db.VarChar(150)
+  bankAccountNumber  String?       @map("bank_account_number") @db.VarChar(50)
+  businessInfo       String?       @map("business_info") @db.Text
+  status             String        @default("PENDING") @db.VarChar(20)
+  statusReason       String?       @map("status_reason") @db.VarChar(500)
+  commissionRate     Decimal?      @map("commission_rate") @db.Decimal(5, 2)
+  rating             Decimal       @default(0) @db.Decimal(2, 1)
+  isActive           Boolean       @default(true) @map("is_active")
+  isOfficial         Boolean       @default(false) @map("is_official")
+  approvedAt         DateTime?     @map("approved_at")
+  approvedByAdminId  Int?          @map("approved_by_admin_id")
+  suspendedAt        DateTime?     @map("suspended_at")
+  lastLoginAt        DateTime?     @map("last_login_at")
+  createdAt          DateTime      @default(now()) @map("created_at")
+  updatedAt          DateTime      @updatedAt @map("updated_at")
+
+  products           Product[]
+  orderItems         ShopOrderItem[]
+  commissionLedger   CommissionLedger[]
+  payouts            VendorPayout[]
+  productReviews     ProductReview[]
+
+  @@index([status])
+  @@map("vendors")
+}
+
+model ProductCategory {
+  id             Int       @id @default(autoincrement())
+  name           String    @db.VarChar(120)
+  slug           String    @db.VarChar(140)
+  description    String?   @db.Text
+  imageUrl       String?   @map("image_url") @db.VarChar(500)
+  commissionRate Decimal?  @map("commission_rate") @db.Decimal(5, 2)
+  isActive       Boolean   @default(true) @map("is_active")
+  sortOrder      Int       @default(0) @map("sort_order")
+  createdAt      DateTime  @default(now()) @map("created_at")
+  updatedAt      DateTime  @updatedAt @map("updated_at")
+
+  products       Product[]
+
+  @@map("product_categories")
+}
+
+model Product {
+  id                Int                 @id @default(autoincrement())
+  vendorId          Int                 @map("vendor_id")
+  categoryId        Int?                @map("category_id")
+  name              String              @db.VarChar(200)
+  slug              String              @unique @db.VarChar(220)
+  sku               String?             @unique @db.VarChar(100)
+  description       String              @db.Text
+  brand             String?             @db.VarChar(150)
+  price             Decimal             @db.Decimal(12, 2)
+  compareAtPrice    Decimal?            @map("compare_at_price") @db.Decimal(12, 2)
+  stock             Int                 @default(0)
+  lowStockThreshold Int                 @default(5) @map("low_stock_threshold")
+  status            ProductStatus      @default(DRAFT)
+  isActive          Boolean             @default(true) @map("is_active")
+  rating            Float               @default(0)
+  reviewCount       Int                 @default(0) @map("review_count")
+  salesCount        Int                 @default(0) @map("sales_count")
+  rejectionReason   String?             @map("rejection_reason") @db.VarChar(500)
+  approvedAt        DateTime?           @map("approved_at")
+  createdAt         DateTime            @default(now()) @map("created_at")
+  updatedAt         DateTime            @updatedAt @map("updated_at")
+
+  vendor            Vendor              @relation(fields: [vendorId], references: [id])
+  category          ProductCategory?    @relation(fields: [categoryId], references: [id])
+  images            ProductImage[]
+  variations        ProductVariation[]
+  orderItems        ShopOrderItem[]
+  cartItems         ShopCartItem[]
+  reviews           ProductReview[]
+  commissionLedger  CommissionLedger[]
+
+  @@index([createdAt])
+  @@index([categoryId])
+  @@index([isActive])
+  @@index([price])
+  @@index([status])
+  @@index([vendorId])
+  @@map("products")
+}
+
+model ProductImage {
+  id        Int      @id @default(autoincrement())
+  productId Int      @map("product_id")
+  url       String   @db.VarChar(500)
+  alt       String?  @db.VarChar(200)
+  sortOrder Int      @default(0) @map("sort_order")
+
+  product   Product  @relation(fields: [productId], references: [id], onDelete: Cascade)
+
+  @@index([productId])
+  @@map("product_images")
+}
+
+model ProductVariation {
+  id        Int      @id @default(autoincrement())
+  productId Int      @map("product_id")
+  name      String   @db.VarChar(80)
+  value     String   @db.VarChar(80)
+  priceDelta Decimal @default(0) @map("price_delta") @db.Decimal(12, 2)
+  stock     Int      @default(0)
+  isActive  Boolean  @default(true) @map("is_active")
+  createdAt DateTime @default(now()) @map("created_at")
+
+  product   Product  @relation(fields: [productId], references: [id], onDelete: Cascade)
+  cartItems ShopCartItem[]
+
+  @@index([productId])
+  @@map("product_variations")
+}
+
+model StockMovement {
+  id        Int      @id @default(autoincrement())
+  productId Int      @map("product_id")
+  vendorId  Int?     @map("vendor_id")
+  change    Int
+  reason    String   @db.VarChar(40)
+  reference String?  @db.VarChar(40)
+  note      String?  @db.VarChar(300)
+  actorRole String?  @map("actor_role") @db.VarChar(30)
+  actorId   Int?     @map("actor_id")
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@index([productId])
+  @@index([vendorId])
+  @@map("stock_movements")
+}
+
+model ShopCart {
+  id         Int           @id @default(autoincrement())
+  token      String        @unique @db.VarChar(64)
+  customerId Int?          @map("customer_id")
+  createdAt  DateTime      @default(now()) @map("created_at")
+  updatedAt  DateTime      @updatedAt @map("updated_at")
+
+  items      ShopCartItem[]
+
+  @@index([customerId])
+  @@map("shop_carts")
+}
+
+model ShopCartItem {
+  id          Int              @id @default(autoincrement())
+  cartId      Int              @map("cart_id")
+  productId   Int              @map("product_id")
+  variationId Int?             @map("variation_id")
+  quantity    Int              @default(1)
+  createdAt   DateTime         @default(now()) @map("created_at")
+  updatedAt   DateTime         @updatedAt @map("updated_at")
+
+  cart        ShopCart         @relation(fields: [cartId], references: [id], onDelete: Cascade)
+  product     Product          @relation(fields: [productId], references: [id], onDelete: Cascade)
+  variation   ProductVariation? @relation(fields: [variationId], references: [id])
+
+  @@index([cartId])
+  @@index([productId], map: "shop_cart_items_product_id_fkey")
+  @@index([variationId], map: "shop_cart_items_variation_id_fkey")
+  @@map("shop_cart_items")
+}
+
+model ShopOrder {
+  id                 Int                 @id @default(autoincrement())
+  referenceCode      String              @unique @map("reference_code") @db.VarChar(40)
+  customerId         Int?                @map("customer_id")
+  customerName       String              @map("customer_name") @db.VarChar(150)
+  customerPhone      String              @map("customer_phone") @db.VarChar(32)
+  customerEmail      String?             @map("customer_email") @db.VarChar(255)
+  deliveryAddress    String              @map("delivery_address") @db.VarChar(500)
+  deliveryLocation   String?             @map("delivery_location") @db.VarChar(200)
+  notes              String?             @db.Text
+  subtotal           Decimal             @db.Decimal(12, 2)
+  deliveryFee        Decimal             @default(0) @map("delivery_fee") @db.Decimal(12, 2)
+  discount           Decimal             @default(0) @db.Decimal(12, 2)
+  totalAmount        Decimal             @map("total_amount") @db.Decimal(12, 2)
+  status             String              @default("AWAITING_PAYMENT") @db.VarChar(30)
+  paymentMethod      String              @map("payment_method") @db.VarChar(30)
+  paymentStatus      String              @default("UNPAID") @map("payment_status") @db.VarChar(30)
+  transactionRef     String?             @map("transaction_ref")
+  receiptUrl         String?             @map("receipt_url") @db.VarChar(500)
+  receiptPublicId    String?             @map("receipt_public_id") @db.VarChar(300)
+  paymentNote        String?             @map("payment_note") @db.VarChar(500)
+  paymentVerifiedAt  DateTime?           @map("payment_verified_at")
+  paymentVerifiedBy  Int?                @map("payment_verified_by")
+  cancelledAt        DateTime?           @map("cancelled_at")
+  cancelReason       String?             @map("cancel_reason") @db.VarChar(500)
+  deliveredAt        DateTime?           @map("delivered_at")
+  refundedAmount     Decimal             @default(0) @map("refunded_amount") @db.Decimal(12, 2)
+  refundedAt         DateTime?           @map("refunded_at")
+  createdAt          DateTime            @default(now()) @map("created_at")
+  updatedAt          DateTime            @updatedAt @map("updated_at")
+
+  items              ShopOrderItem[]
+  payment            ShopPayment?
+  events             ShopPaymentEvent[]
+  refunds            ShopRefund[]
+  ledger             CommissionLedger[]
+
+  @@index([createdAt])
+  @@index([customerId])
+  @@index([paymentStatus])
+  @@index([status])
+  @@map("shop_orders")
+}
+
+model ShopOrderItem {
+  id               Int                 @id @default(autoincrement())
+  orderId           Int                 @map("order_id")
+  vendorId          Int                 @map("vendor_id")
+  productId         Int                 @map("product_id")
+  variationId       Int?                @map("variation_id")
+  productName       String              @map("product_name") @db.VarChar(200)
+  productImage      String?             @map("product_image") @db.VarChar(500)
+  variationLabel    String?             @map("variation_label") @db.VarChar(150)
+  unitPrice         Decimal             @map("unit_price") @db.Decimal(12, 2)
+  quantity          Int
+  lineTotal         Decimal             @map("line_total") @db.Decimal(12, 2)
+  commissionRate    Decimal             @map("commission_rate") @db.Decimal(12, 2)
+  commissionAmount  Decimal             @map("commission_amount") @db.Decimal(12, 2)
+  vendorNet         Decimal             @map("vendor_net") @db.Decimal(12, 2)
+  status            String              @default("PENDING") @db.VarChar(20)
+  trackingInfo      String?             @map("tracking_info") @db.VarChar(300)
+  confirmedAt       DateTime?           @map("confirmed_at")
+  shippedAt         DateTime?           @map("shipped_at")
+  deliveredAt       DateTime?           @map("delivered_at")
+  cancelReason      String?             @map("cancel_reason") @db.VarChar(300)
+  createdAt         DateTime            @default(now()) @map("created_at")
+  updatedAt         DateTime            @updatedAt @map("updated_at")
+
+  order             ShopOrder           @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  vendor            Vendor              @relation(fields: [vendorId], references: [id])
+  product           Product             @relation(fields: [productId], references: [id])
+  ledger            CommissionLedger?
+
+  @@index([productId])
+  @@index([orderId])
+  @@index([status])
+  @@index([vendorId])
+  @@map("shop_order_items")
+}
+
+model ShopPayment {
+  id                 Int               @id @default(autoincrement())
+  orderId            Int               @unique @map("order_id")
+  amount             Decimal           @db.Decimal(12, 2)
+  paymentMethod      String            @map("payment_method") @db.VarChar(30)
+  status             String            @default("UNPAID") @db.VarChar(30)
+  transactionRef     String?           @map("transaction_ref")
+  providerRef        String?           @map("provider_ref")
+  rejectionReason    String?           @map("rejection_reason") @db.VarChar(500)
+  verifiedAt         DateTime?         @map("verified_at")
+  verifiedByAdminId  Int?              @map("verified_by_admin_id")
+  createdAt          DateTime          @default(now()) @map("created_at")
+  updatedAt          DateTime          @updatedAt @map("updated_at")
+
+  order              ShopOrder         @relation(fields: [orderId], references: [id], onDelete: Cascade)
+
+  @@map("shop_payments")
+}
+
+model ShopPaymentEvent {
+  id             Int      @id @default(autoincrement())
+  orderId        Int      @map("order_id")
+  type           String   @db.VarChar(50)
+  status         String   @db.VarChar(30)
+  provider       String?  @db.VarChar(30)
+  providerRef    String?  @map("provider_ref")
+  amount         Decimal? @db.Decimal(12, 2)
+  actorRole      String?  @map("actor_role") @db.VarChar(30)
+  actorId        Int?     @map("actor_id")
+  detail         String?  @db.Text
+  payload        String?  @db.LongText
+  createdAt      DateTime @default(now()) @map("created_at")
+
+  order          ShopOrder @relation(fields: [orderId], references: [id], onDelete: Cascade)
+
+  @@index([orderId])
+  @@map("shop_payment_events")
+}
+
+model ShopRefund {
+  id          Int             @id @default(autoincrement())
+  orderId     Int             @map("order_id")
+  vendorId    Int?            @map("vendor_id")
+  reason      String          @db.Text
+  amount      Decimal         @db.Decimal(12, 2)
+  status      String          @default("PENDING") @db.VarChar(20)
+  requestedBy String          @map("requested_by") @db.VarChar(150)
+  resolution  String?         @db.Text
+  resolvedBy  Int?            @map("resolved_by")
+  resolvedAt  DateTime?       @map("resolved_at")
+  createdAt   DateTime        @default(now()) @map("created_at")
+  updatedAt   DateTime        @updatedAt @map("updated_at")
+
+  order       ShopOrder       @relation(fields: [orderId], references: [id], onDelete: Cascade)
+
+  @@index([orderId])
+  @@index([status])
+  @@map("shop_refunds")
+}
+
+model CommissionLedger {
+  id                Int                        @id @default(autoincrement())
+  orderId           Int                        @map("order_id")
+  orderItemId       Int                        @unique @map("order_item_id")
+  vendorId          Int                        @map("vendor_id")
+  productId         Int                        @map("product_id")
+  quantity          Int
+  salePrice         Decimal                    @map("sale_price") @db.Decimal(12, 2)
+  commissionRate    Decimal                    @map("commission_rate") @db.Decimal(12, 2)
+  commissionAmount  Decimal                    @map("commission_amount") @db.Decimal(12, 2)
+  vendorNet         Decimal                    @map("vendor_net") @db.Decimal(12, 2)
+  reversedAmount    Decimal                    @default(0) @map("reversed_amount") @db.Decimal(12, 2)
+  settlementStatus  String                     @default("PENDING") @map("settlement_status") @db.VarChar(20)
+  payoutId          Int?                       @map("payout_id")
+  releasedAt        DateTime?                  @map("released_at")
+  paidAt            DateTime?                  @map("paid_at")
+  createdAt         DateTime                   @default(now()) @map("created_at")
+
+  order             ShopOrder                  @relation(fields: [orderId], references: [id])
+  orderItem         ShopOrderItem              @relation(fields: [orderItemId], references: [id])
+  vendor            Vendor                     @relation(fields: [vendorId], references: [id])
+  product           Product                    @relation(fields: [productId], references: [id])
+
+  @@index([orderId])
+  @@index([payoutId])
+  @@index([productId], map: "commission_ledger_product_id_fkey")
+  @@index([settlementStatus])
+  @@index([vendorId])
+  @@map("commission_ledger")
+}
+
+model VendorPayout {
+  id                 Int               @id @default(autoincrement())
+  referenceCode      String            @unique @map("reference_code") @db.VarChar(40)
+  vendorId           Int               @map("vendor_id")
+  amount             Decimal           @db.Decimal(12, 2)
+  status             String            @default("REQUESTED") @db.VarChar(20)
+  note               String?           @db.VarChar(500)
+  transactionRef     String?            @map("transaction_ref")
+  processedByAdminId Int?               @map("processed_by_admin_id")
+  requestedAt        DateTime           @default(now()) @map("requested_at")
+  processedAt        DateTime?          @map("processed_at")
+  createdAt          DateTime           @default(now()) @map("created_at")
+  updatedAt          DateTime           @updatedAt @map("updated_at")
+
+  vendor             Vendor              @relation(fields: [vendorId], references: [id])
+
+  @@index([status])
+  @@index([vendorId])
+  @@map("vendor_payouts")
+}
+
+model VendorNotification {
+  id        Int      @id @default(autoincrement())
+  vendorId  Int      @map("vendor_id")
+  type      String   @db.VarChar(40)
+  title     String   @db.VarChar(200)
+  message   String   @db.Text
+  readAt    DateTime? @map("read_at")
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@index([readAt])
+  @@index([vendorId])
+  @@map("vendor_notifications")
+}
+
+model ProductReview {
+  id           Int          @id @default(autoincrement())
+  productId    Int          @map("product_id")
+  vendorId     Int          @map("vendor_id")
+  orderId      Int          @map("order_id")
+  customerId   Int?         @map("customer_id")
+  customerName String       @map("customer_name") @db.VarChar(150)
+  rating       Float        @default(5)
+  comment      String       @db.Text
+  status       String       @default("PENDING") @db.VarChar(20)
+  isApproved   Boolean      @default(false) @map("is_approved")
+  reply        String?      @db.Text
+  createdAt    DateTime     @default(now()) @map("created_at")
+  updatedAt    DateTime     @updatedAt @map("updated_at")
+
+  product      Product      @relation(fields: [productId], references: [id])
+  vendor       Vendor       @relation(fields: [vendorId], references: [id])
+
+  @@unique([orderId, productId])
+  @@index([orderId])
+  @@index([productId])
+  @@index([status])
+  @@index([vendorId])
+  @@map("product_reviews")
+}
+
+model MarketplaceAuditLog {
+  id         Int      @id @default(autoincrement())
+  actorRole  String   @map("actor_role") @db.VarChar(30)
+  actorId    Int?     @map("actor_id")
+  actorName  String?  @map("actor_name") @db.VarChar(150)
+  action     String   @db.VarChar(60)
+  entityType String   @map("entity_type") @db.VarChar(60)
+  entityId   Int?     @map("entity_id")
+  detail     String?  @db.Text
+  createdAt  DateTime @default(now()) @map("created_at")
+
+  @@index([action])
+  @@index([createdAt])
+  @@map("marketplace_audit_logs")
 }

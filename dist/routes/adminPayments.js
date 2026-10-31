@@ -21,6 +21,29 @@ exports.adminPaymentsRouter.use(auth_1.requireAdmin);
 exports.adminPaymentsRouter.get('/', (0, validate_1.validate)(payment_1.listPaymentsQuerySchema, 'query'), paymentController_1.listPaymentsHandler);
 /**
  * @swagger
+ * /api/admin/payments/summary:
+ *   get:
+ *     tags: [Payments]
+ *     summary: Aggregated transaction totals (admin)
+ *     description: Successful / pending / today revenue totals. Revenue counts verified PAID payments only. Optional from, to and method scope the figures.
+ *     security:
+ *       - bearerAuth: []
+ */
+// Mounted before /:id so "summary" is never captured as a payment id.
+exports.adminPaymentsRouter.get('/summary', (0, validate_1.validate)(payment_1.listPaymentsQuerySchema, 'query'), paymentController_1.getPaymentSummaryHandler);
+/**
+ * @swagger
+ * /api/admin/payments/export:
+ *   get:
+ *     tags: [Payments]
+ *     summary: Export transactions as CSV (admin)
+ *     description: Uses the same filters as the list endpoint; returns a CSV attachment for accounting.
+ *     security:
+ *       - bearerAuth: []
+ */
+exports.adminPaymentsRouter.get('/export', (0, validate_1.validate)(payment_1.listPaymentsQuerySchema, 'query'), paymentController_1.exportPaymentsHandler);
+/**
+ * @swagger
  * /api/admin/payments/{id}:
  *   get:
  *     tags: [Payments]
@@ -51,6 +74,17 @@ exports.adminPaymentsRouter.post('/:id/verify', (0, validate_1.validate)(payment
  *       - bearerAuth: []
  */
 exports.adminPaymentsRouter.post('/:id/reject', (0, validate_1.validate)(payment_1.paymentIdParamsSchema, 'params'), (0, validate_1.validate)(payment_1.rejectPaymentSchema), paymentController_1.rejectPaymentHandler);
+/**
+ * @swagger
+ * /api/admin/payments/{id}/refund:
+ *   post:
+ *     tags: [Payments]
+ *     summary: Mark a verified payment as refunded (admin)
+ *     description: Only PAID payments can be refunded. Requires a reason. Unsettled barber commission is unwound.
+ *     security:
+ *       - bearerAuth: []
+ */
+exports.adminPaymentsRouter.post('/:id/refund', (0, validate_1.validate)(payment_1.paymentIdParamsSchema, 'params'), (0, validate_1.validate)(payment_1.refundPaymentSchema), paymentController_1.refundPaymentHandler);
 /**
  * @swagger
  * /api/admin/payments/{id}/confirm-cash:

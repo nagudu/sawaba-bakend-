@@ -5,6 +5,7 @@ exports.verifyPaystackHandler = verifyPaystackHandler;
 exports.paystackWebhookHandler = paystackWebhookHandler;
 const paystackService_1 = require("../services/paystackService");
 const checkoutService_1 = require("../services/checkoutService");
+const shopPaymentService_1 = require("../services/shopPaymentService");
 const response_1 = require("../utils/response");
 async function initializePaystackHandler(req, res, next) {
     try {
@@ -35,8 +36,11 @@ async function paystackWebhookHandler(req, res) {
     }
     try {
         const payload = JSON.parse(rawBody);
-        // Checkout-session payments first, then legacy appointment payments.
-        let applied = await (0, checkoutService_1.handleCheckoutWebhook)(payload);
+        // Marketplace shop orders, checkout sessions, then appointment payments.
+        let applied = await (0, shopPaymentService_1.handleShopOrderWebhook)(payload);
+        if (!applied) {
+            applied = await (0, checkoutService_1.handleCheckoutWebhook)(payload);
+        }
         if (!applied) {
             applied = await (0, paystackService_1.handlePaystackWebhook)(payload);
         }

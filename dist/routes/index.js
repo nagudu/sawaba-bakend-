@@ -26,6 +26,9 @@ const barberAuth_1 = require("./barberAuth");
 const barberPortal_1 = require("./barberPortal");
 const reminders_1 = require("./reminders");
 const qr_1 = require("./qr");
+const shop_1 = require("./shop");
+const vendorPortal_1 = require("./vendorPortal");
+const marketplaceAdmin_1 = require("./marketplaceAdmin");
 exports.apiRouter = (0, express_1.Router)();
 exports.apiRouter.get('/', (_req, res) => {
     res.json({
@@ -54,6 +57,10 @@ exports.apiRouter.use('/payments/paystack', paystack_1.paystackRouter);
 exports.apiRouter.use('/payments', payments_1.paymentsRouter);
 exports.apiRouter.use('/checkout', checkout_1.checkoutRouter);
 exports.apiRouter.use('/bookings', bookings_1.bookingsRouter);
+// Marketplace — public shop, vendor portal, admin management.
+exports.apiRouter.use('/shop', shop_1.shopRouter);
+exports.apiRouter.use('/vendor', vendorPortal_1.vendorPortalRouter);
+exports.apiRouter.use('/admin/marketplace', marketplaceAdmin_1.marketplaceAdminRouter);
 exports.apiRouter.use('/admin/qr', qr_1.adminQrRouter);
 exports.apiRouter.use('/admin/dashboard', dashboard_1.dashboardRouter);
 exports.apiRouter.use('/admin/customers', customers_1.customersRouter);

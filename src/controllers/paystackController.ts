@@ -7,6 +7,7 @@ import {
   type PaystackWebhookEvent,
 } from '../services/paystackService'
 import { handleCheckoutWebhook } from '../services/checkoutService'
+import { handleShopOrderWebhook } from '../services/shopPaymentService'
 import { successRes } from '../utils/response'
 
 export async function initializePaystackHandler(req: Request, res: Response, next: NextFunction): Promise<void> {
@@ -39,9 +40,12 @@ export async function paystackWebhookHandler(req: Request, res: Response): Promi
   }
 
   try {
-    const payload = JSON.parse(rawBody) as PaystackWebhookEvent
-    // Checkout-session payments first, then legacy appointment payments.
-    let applied = await handleCheckoutWebhook(payload)
+const payload = JSON.parse(rawBody) as PaystackWebhookEvent
+    // Marketplace shop orders, checkout sessions, then appointment payments.
+    let applied = await handleShopOrderWebhook(payload)
+    if (!applied) {
+      applied = await handleCheckoutWebhook(payload)
+    }
     if (!applied) {
       applied = await handlePaystackWebhook(payload)
     }

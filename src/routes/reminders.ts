@@ -20,7 +20,10 @@ export const cronRouter = Router()
  *   get:
  *     tags: [Cron]
  *     summary: Send due appointment reminders (scheduler)
- *     description: Emails or texts every customer whose appointment is within a configured reminder window (default 24h and 1h). Authorised with `Authorization: Bearer <CRON_SECRET>`.
+ *     description: >-
+ *       Emails or texts every customer whose appointment is within a configured
+ *       reminder window (default 24h and 1h). Authorised with the CRON_SECRET
+ *       bearer token in the Authorization header.
  *     responses:
  *       200:
  *         description: Reminder run summary.

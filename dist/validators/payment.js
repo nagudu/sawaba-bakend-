@@ -1,6 +1,6 @@
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.paystackVerifySchema = exports.cashConfirmSchema = exports.rejectPaymentSchema = exports.listPaymentsQuerySchema = exports.trackPaymentSchema = exports.submitPaymentSchema = exports.paymentIdParamsSchema = exports.paymentTokenParamsSchema = exports.PAYMENT_METHODS = void 0;
+exports.paystackVerifySchema = exports.refundPaymentSchema = exports.cashConfirmSchema = exports.rejectPaymentSchema = exports.listPaymentsQuerySchema = exports.trackPaymentSchema = exports.submitPaymentSchema = exports.paymentIdParamsSchema = exports.paymentTokenParamsSchema = exports.PAYMENT_METHODS = void 0;
 const zod_1 = require("zod");
 exports.PAYMENT_METHODS = ['OPAY', 'BANK_TRANSFER', 'CASH', 'OTHER'];
 exports.paymentTokenParamsSchema = zod_1.z.object({
@@ -28,7 +28,9 @@ exports.listPaymentsQuerySchema = zod_1.z.object({
     status: zod_1.z
         .enum(['UNPAID', 'PENDING_VERIFICATION', 'PAID', 'REJECTED', 'REFUNDED', 'CANCELLED'])
         .optional(),
-    method: zod_1.z.enum(exports.PAYMENT_METHODS).optional(),
+    // ONLINE is read-only: Paystack checkouts are stamped with it after init.
+    // It is listed here so admins can filter by it, never submitted by customers.
+    method: zod_1.z.enum(['OPAY', 'BANK_TRANSFER', 'CASH', 'OTHER', 'ONLINE']).optional(),
     from: zod_1.z.string().date('Provide a valid from date (YYYY-MM-DD).').optional(),
     to: zod_1.z.string().date('Provide a valid to date (YYYY-MM-DD).').optional(),
     search: zod_1.z.string().trim().max(150).optional(),
@@ -44,6 +46,13 @@ exports.rejectPaymentSchema = zod_1.z.object({
 });
 exports.cashConfirmSchema = zod_1.z.object({
     note: zod_1.z.string().trim().max(1000).optional().nullable(),
+});
+exports.refundPaymentSchema = zod_1.z.object({
+    reason: zod_1.z
+        .string()
+        .trim()
+        .min(5, 'Please provide a reason for this refund.')
+        .max(1000),
 });
 exports.paystackVerifySchema = zod_1.z.object({
     reference: zod_1.z.string().trim().min(4).max(191),

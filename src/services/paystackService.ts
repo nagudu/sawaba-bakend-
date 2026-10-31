@@ -208,7 +208,7 @@ export interface PaystackWebhookEvent {
     amount?: number
     id?: number
     reference?: string
-    metadata?: { appointmentId?: number }
+    metadata?: { appointmentId?: number; shopOrderId?: number }
   }
 }
 

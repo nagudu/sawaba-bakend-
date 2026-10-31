@@ -9,19 +9,45 @@ exports.listCustomers = listCustomers;
 const database_1 = require("../config/database");
 const phone_1 = require("../utils/phone");
 const errors_1 = require("../utils/errors");
+/** Case/whitespace-insensitive person-name comparison for identity matching. */
+function normalizeName(value) {
+    return value.trim().replace(/\s+/g, ' ').toLowerCase();
+}
+/**
+ * Resolves the customer record a booking should be linked to.
+ *
+ * A phone number is only a shared contact point — two different people (e.g.
+ * Halifa Shuaibu and Sani Isah) can legitimately use the same SIM, so the
+ * number alone must never decide identity. A record is reused only when the
+ * name also matches AND the email addresses are compatible (at least one side
+ * empty, or the same address). Otherwise a brand-new record is created, so
+ * guest bookings never merge just because they share a phone number.
+ */
 async function findOrCreateCustomer(input, tx) {
     const db = tx ?? database_1.prisma;
     const phone = (0, phone_1.normalizeNigerianPhone)(input.phone);
     if (!(0, phone_1.isPlausiblePhone)(phone)) {
         throw new errors_1.UnprocessableError('Provide a valid phone number.');
     }
-    const existing = await db.customer.findFirst({ where: { phone } });
+    const wantedName = normalizeName(input.fullName);
+    const wantedEmail = input.email?.trim().toLowerCase() || null;
+    const candidates = await db.customer.findMany({ where: { phone } });
+    const existing = candidates.find((record) => {
+        if (normalizeName(record.fullName) !== wantedName)
+            return false;
+        const recordEmail = record.email?.trim().toLowerCase() || null;
+        // Same name but both sides carry different addresses → treat as distinct.
+        if (recordEmail && wantedEmail && recordEmail !== wantedEmail)
+            return false;
+        return true;
+    });
     if (existing) {
         const patch = {};
-        if (input.fullName && input.fullName !== existing.fullName)
-            patch.fullName = input.fullName;
-        if (input.email && !existing.email)
-            patch.email = input.email;
+        const trimmedName = input.fullName.trim();
+        if (trimmedName && trimmedName !== existing.fullName)
+            patch.fullName = trimmedName;
+        if (!existing.email && wantedEmail)
+            patch.email = wantedEmail;
         if (Object.keys(patch).length > 0) {
             return db.customer.update({
                 where: { id: existing.id },
@@ -30,11 +56,12 @@ async function findOrCreateCustomer(input, tx) {
         }
         return existing;
     }
+    // Different person sharing this phone number — give them their own record.
     return db.customer.create({
         data: {
-            fullName: input.fullName,
+            fullName: input.fullName.trim(),
             phone,
-            email: input.email ?? null,
+            email: wantedEmail,
         },
     });
 }
@@ -73,31 +100,34 @@ async function backfillCustomerCodes() {
 }
 async function backfillCustomerLinks() {
     const customers = await database_1.prisma.customer.findMany();
+    // Keyed by full identity (phone + name + email), NOT phone alone: a shared
+    // phone number must never collapse two different people into one record.
     const seen = new Map();
     let merged = 0;
     for (const customer of customers) {
         const phone = (0, phone_1.normalizeNigerianPhone)(customer.phone);
-        if (phone !== customer.phone || seen.has(phone)) {
-            const dup = seen.get(phone);
-            if (dup) {
-                await database_1.prisma.appointment.updateMany({
-                    where: { customerId: customer.id },
-                    data: { customerId: dup },
-                });
-                await database_1.prisma.payment.updateMany({
-                    where: { customerId: customer.id },
-                    data: { customerId: dup },
-                });
-                await database_1.prisma.customer.delete({ where: { id: customer.id } });
-                merged += 1;
-                continue;
-            }
+        const identityKey = `${phone}|${normalizeName(customer.fullName)}|${customer.email?.trim().toLowerCase() ?? ''}`;
+        const dup = seen.get(identityKey);
+        if (dup) {
+            await database_1.prisma.appointment.updateMany({
+                where: { customerId: customer.id },
+                data: { customerId: dup },
+            });
+            await database_1.prisma.payment.updateMany({
+                where: { customerId: customer.id },
+                data: { customerId: dup },
+            });
+            await database_1.prisma.customer.delete({ where: { id: customer.id } });
+            merged += 1;
+            continue;
+        }
+        if (phone !== customer.phone) {
             await database_1.prisma.customer.update({
                 where: { id: customer.id },
                 data: { phone },
             });
         }
-        seen.set(phone, customer.id);
+        seen.set(identityKey, customer.id);
     }
     const unlinked = await database_1.prisma.appointment.findMany({
         where: { customerId: null },
@@ -105,16 +135,12 @@ async function backfillCustomerLinks() {
     });
     for (const appointment of unlinked) {
         const phone = (0, phone_1.normalizeNigerianPhone)(appointment.customerPhone);
-        let customer = await database_1.prisma.customer.findFirst({ where: { phone } });
-        if (!customer) {
-            customer = await database_1.prisma.customer.create({
-                data: {
-                    fullName: appointment.customerName,
-                    phone,
-                    email: appointment.customerEmail ?? null,
-                },
-            });
-        }
+        // Same identity rule as booking time — never phone-only matching.
+        const customer = await findOrCreateCustomer({
+            fullName: appointment.customerName,
+            phone,
+            email: appointment.customerEmail ?? null,
+        });
         await database_1.prisma.appointment.update({
             where: { id: appointment.id },
             data: {

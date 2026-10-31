@@ -10,6 +10,9 @@ exports.getPaymentByIdHandler = getPaymentByIdHandler;
 exports.verifyPaymentHandler = verifyPaymentHandler;
 exports.confirmCashHandler = confirmCashHandler;
 exports.rejectPaymentHandler = rejectPaymentHandler;
+exports.refundPaymentHandler = refundPaymentHandler;
+exports.getPaymentSummaryHandler = getPaymentSummaryHandler;
+exports.exportPaymentsHandler = exportPaymentsHandler;
 const paymentService_1 = require("../services/paymentService");
 const paymentSettingsService_1 = require("../services/paymentSettingsService");
 const response_1 = require("../utils/response");
@@ -107,6 +110,41 @@ async function rejectPaymentHandler(req, res, next) {
         const { reason } = req.body;
         const payment = await (0, paymentService_1.rejectPayment)(Number(req.params.id), reason, Number(adminId));
         (0, response_1.successRes)(res, 'Payment rejected. The customer has been moved back to the payment step.', payment, 200);
+    }
+    catch (error) {
+        next(error);
+    }
+}
+async function refundPaymentHandler(req, res, next) {
+    try {
+        const adminId = req.admin?.id;
+        const { reason } = req.body;
+        const payment = await (0, paymentService_1.markPaymentRefunded)(Number(req.params.id), reason, Number(adminId));
+        (0, response_1.successRes)(res, 'Payment marked as refunded.', payment, 200);
+    }
+    catch (error) {
+        next(error);
+    }
+}
+async function getPaymentSummaryHandler(req, res, next) {
+    try {
+        const query = req.query;
+        const summary = await (0, paymentService_1.getPaymentSummary)(query);
+        (0, response_1.successRes)(res, 'Payment summary retrieved.', summary, 200);
+    }
+    catch (error) {
+        next(error);
+    }
+}
+async function exportPaymentsHandler(req, res, next) {
+    try {
+        const query = req.query;
+        const csv = await (0, paymentService_1.exportPayments)(query);
+        const stamp = new Date().toISOString().slice(0, 10);
+        res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+        res.setHeader('Content-Disposition', `attachment; filename="sawaba-transactions-${stamp}.csv"`);
+        // BOM first so Excel opens the ₦ amounts as UTF-8 instead of mojibake.
+        res.status(200).send(`\uFEFF${csv}`);
     }
     catch (error) {
         next(error);
