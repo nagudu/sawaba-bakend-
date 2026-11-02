@@ -1,17 +1,19 @@
 import { Resend } from 'resend'
 import nodemailer, { type Transporter, type SentMessageInfo } from 'nodemailer'
+import { loadNotificationConfig, getNotificationConfigSync, type SmtpConfig } from './notificationConfigService'
 
 /**
- * Email delivery with two providers, configured exclusively from environment
- * variables (never hard-coded, never logged):
+ * Email delivery with two providers, resolved at send time from the admin
+ * `notification_settings` row with environment fallback (see
+ * notificationConfigService) — never hard-coded, never logged:
  *
- *  1. Resend HTTP API   — used when RESEND_API_KEY is set (recommended: no SMTP
- *                         ports to fight, accepts JSON, returns a message id).
- *  2. SMTP / Nodemailer — fallback when SMTP_HOST/SMTP_USER/SMTP_PASSWORD are set.
+ *  1. Resend HTTP API   — used when a Resend API key is configured (recommended:
+ *                         no SMTP ports to fight, accepts JSON, returns a message id).
+ *  2. SMTP / Nodemailer — used when SMTP host/user/password are configured.
  *
  * Either way this module NEVER pretends to succeed: without configuration (or
- * when the provider rejects a send) it throws EmailDeliveryError, which the
- * contact reply flow turns into a failed API response and a FAILED reply record.
+ * when the provider rejects a send) it throws EmailDeliveryError, which callers
+ * surface to the user / record as a FAILED delivery.
  */
 
 export interface OutgoingEmail {
@@ -42,67 +44,79 @@ export class EmailDeliveryError extends Error {
   }
 }
 
-// ── Resend ───────────────────────────────────────────────────────────────────
+// ── Cached clients (rebuilt when the underlying credentials change) ───────────
 
-let resendClient: Resend | null | undefined
+let resendClient: Resend | null = null
+let resendKey: string | null = null
 
-function getResend(): Resend | null {
-  if (resendClient === undefined) {
-    const apiKey = process.env.RESEND_API_KEY
-    resendClient = apiKey ? new Resend(apiKey) : null
-  }
+function getResend(apiKey: string | null): Resend | null {
+  if (!apiKey) return null
+  if (resendClient && resendKey === apiKey) return resendClient
+  resendClient = new Resend(apiKey)
+  resendKey = apiKey
   return resendClient
 }
 
-// ── SMTP ─────────────────────────────────────────────────────────────────────
-
 let transporter: Transporter | null = null
+let transportSig: string | null = null
 
-function buildTransport(): Transporter | null {
-  const host = process.env.SMTP_HOST
-  const user = process.env.SMTP_USER
-  const password = process.env.SMTP_PASSWORD
-  const port = Number(process.env.SMTP_PORT ?? 587)
-
-  if (!host || !user || !password) return null
-
-  return nodemailer.createTransport({
-    host,
-    port,
-    secure: port === 465,
-    auth: { user, pass: password },
+function getTransport(smtp: SmtpConfig | null): Transporter | null {
+  if (!smtp) return null
+  const sig = `${smtp.host}|${smtp.port}|${smtp.user}|${smtp.secure}|${smtp.password}`
+  if (transporter && transportSig === sig) return transporter
+  transporter = nodemailer.createTransport({
+    host: smtp.host,
+    port: smtp.port,
+    secure: smtp.secure || smtp.port === 465,
+    auth: { user: smtp.user, pass: smtp.password },
     connectionTimeout: 10_000,
     greetingTimeout: 10_000,
     socketTimeout: 20_000,
   })
-}
-
-function getTransport(): Transporter | null {
-  if (!transporter) transporter = buildTransport()
+  transportSig = sig
   return transporter
 }
 
 // ── Shared helpers ───────────────────────────────────────────────────────────
 
+function composeFrom(raw: string): string {
+  const trimmed = raw.trim()
+  // Already composed as "Name <email>" — use exactly as provided (never re-wrap,
+  // double-wrapping makes providers reject the from field).
+  if (/<[^<>\s]+@[^<>\s]+\.[^<>\s]+>$/.test(trimmed)) return trimmed
+  const fromName = process.env.SMTP_FROM_NAME ?? 'SAWABA Grooming Studio'
+  return `${fromName} <${trimmed}>`
+}
+
+function defaultFrom(): string {
+  const raw = (process.env.SMTP_FROM_EMAIL ?? process.env.RESEND_FROM ?? 'onboarding@resend.dev').trim()
+  return composeFrom(raw)
+}
+
+function resolveProvider(cfg: {
+  provider: 'resend' | 'smtp'
+  resendApiKey: string | null
+  smtp: SmtpConfig | null
+}): 'resend' | 'smtp' | 'none' {
+  if (cfg.provider === 'resend') {
+    if (cfg.resendApiKey) return 'resend'
+    return cfg.smtp ? 'smtp' : 'none'
+  }
+  if (cfg.smtp) return 'smtp'
+  return cfg.resendApiKey ? 'resend' : 'none'
+}
+
 export function isEmailConfigured(): boolean {
-  return getResend() !== null || getTransport() !== null
+  return activeProvider() !== 'none'
 }
 
 export function activeProvider(): 'resend' | 'smtp' | 'none' {
-  if (getResend()) return 'resend'
-  if (getTransport()) return 'smtp'
-  return 'none'
+  return resolveProvider(getNotificationConfigSync().email)
 }
 
 export function getFromAddress(): string {
-  const raw = (
-    process.env.SMTP_FROM_EMAIL ?? process.env.RESEND_FROM ?? 'onboarding@resend.dev'
-  ).trim()
-  // Already composed as "Name <email>" — use exactly as provided (never re-wrap,
-  // double-wrapping makes providers reject the from field).
-  if (/<[^<>\s]+@[^<>\s]+\.[^<>\s]+>$/.test(raw)) return raw
-  const fromName = process.env.SMTP_FROM_NAME ?? 'SAWABA Grooming Studio'
-  return `${fromName} <${raw}>`
+  const cfg = getNotificationConfigSync().email
+  return cfg.fromEmail ? composeFrom(cfg.fromEmail) : defaultFrom()
 }
 
 /** Maps a raw SMTP failure to a clean, user-safe explanation. */
@@ -127,7 +141,7 @@ function smtpDeliveryError(error: unknown): EmailDeliveryError {
     return new EmailDeliveryError('Unable to connect to the email server.', error)
   }
   return new EmailDeliveryError(
-    'The email service failed to send this reply. Please try again or contact the administrator.',
+    'The email service failed to send this message. Please try again or contact the administrator.',
     error,
   )
 }
@@ -142,20 +156,20 @@ function resendDeliveryError(status: number, message: string, cause?: unknown): 
     const ownerMatch = message.match(/your own email address \(([^)]+)\)/i)
     if (ownerMatch) {
       return new EmailDeliveryError(
-        `Email is in provider test mode — replies can only be delivered to ${ownerMatch[1]} until a sending domain is verified or SMTP is configured. The reply was not sent.`,
+        `Email is in provider test mode — messages can only be delivered to ${ownerMatch[1]} until a sending domain is verified or SMTP is configured. The message was not sent.`,
         cause,
       )
     }
     const domainMatch = message.match(/The ([^\s]+) domain is not verified/i)
     if (domainMatch) {
       return new EmailDeliveryError(
-        `The sending domain "${domainMatch[1]}" is not verified with the email provider — verify it at resend.com/domains or configure SMTP. The reply was not sent.`,
+        `The sending domain "${domainMatch[1]}" is not verified with the email provider — verify it at resend.com/domains or configure SMTP. The message was not sent.`,
         cause,
       )
     }
     if (/domain|verif|testing emails|allowed to send/i.test(message)) {
       return new EmailDeliveryError(
-        'The email service cannot send from this sender yet — the sender domain must be verified with the provider first. The reply was not sent.',
+        'The email service cannot send from this sender yet — the sender domain must be verified with the provider first. The message was not sent.',
         cause,
       )
     }
@@ -182,7 +196,7 @@ function resendDeliveryError(status: number, message: string, cause?: unknown): 
     )
   }
   return new EmailDeliveryError(
-    'The email service failed to send this reply. Please try again or contact the administrator.',
+    'The email service failed to send this message. Please try again or contact the administrator.',
     cause,
   )
 }
@@ -192,8 +206,7 @@ export function isValidRecipient(email: string): boolean {
   return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)
 }
 
-async function sendViaResend(email: OutgoingEmail, from: string): Promise<EmailSendReceipt> {
-  const client = getResend()!
+async function sendViaResend(client: Resend, email: OutgoingEmail, from: string): Promise<EmailSendReceipt> {
   try {
     const { data, error } = await client.emails.send({
       from,
@@ -207,9 +220,7 @@ async function sendViaResend(email: OutgoingEmail, from: string): Promise<EmailS
       console.error('[mailer] resend rejected:', error.name, error.message)
       throw resendDeliveryError(error.statusCode ?? 500, error.message)
     }
-    console.log(
-      `[mailer] delivered via resend to ${email.to} | messageId=${data?.id ?? 'n/a'}`,
-    )
+    console.log(`[mailer] delivered via resend to ${email.to} | messageId=${data?.id ?? 'n/a'}`)
     return {
       provider: 'resend',
       messageId: data?.id,
@@ -224,8 +235,11 @@ async function sendViaResend(email: OutgoingEmail, from: string): Promise<EmailS
   }
 }
 
-async function sendViaSmtp(email: OutgoingEmail, from: string): Promise<EmailSendReceipt> {
-  const transport = getTransport()!
+async function sendViaSmtp(
+  transport: Transporter,
+  email: OutgoingEmail,
+  from: string,
+): Promise<EmailSendReceipt> {
   let info: SentMessageInfo
   try {
     info = await transport.sendMail({
@@ -256,7 +270,7 @@ async function sendViaSmtp(email: OutgoingEmail, from: string): Promise<EmailSen
   }
   if (receipt.accepted.length === 0) {
     console.error(`[mailer] provider accepted nobody for ${email.to}: ${receipt.response}`)
-    throw new EmailDeliveryError('The email provider did not accept this reply for delivery.')
+    throw new EmailDeliveryError('The email provider did not accept this message for delivery.')
   }
 
   console.log(
@@ -270,24 +284,27 @@ export async function sendEmail(email: OutgoingEmail): Promise<EmailSendReceipt>
     throw new EmailDeliveryError('Invalid customer email address.')
   }
 
-  const from = getFromAddress()
-  const provider = activeProvider()
+  const cfg = (await loadNotificationConfig()).email
+  const from = cfg.fromEmail ? composeFrom(cfg.fromEmail) : defaultFrom()
+  const provider = resolveProvider(cfg)
+
   if (provider === 'resend') {
     try {
-      return await sendViaResend(email, from)
+      return await sendViaResend(getResend(cfg.resendApiKey)!, email, from)
     } catch (error) {
       // A configured SMTP transport is a real fallback: sandbox limits,
-      // unverified domains or a Resend outage must not block replies when
+      // unverified domains or a Resend outage must not block messaging when
       // working SMTP credentials exist. If SMTP is absent (or also fails),
       // the original failure surfaces unchanged.
-      if (getTransport()) {
+      const transport = getTransport(cfg.smtp)
+      if (transport) {
         console.warn('[mailer] resend rejected — trying SMTP fallback:', (error as Error).message)
-        return sendViaSmtp(email, from)
+        return sendViaSmtp(transport, email, from)
       }
       throw error
     }
   }
-  if (provider === 'smtp') return sendViaSmtp(email, from)
+  if (provider === 'smtp') return sendViaSmtp(getTransport(cfg.smtp)!, email, from)
 
   throw new EmailDeliveryError(
     'Email service is not configured. Please contact the administrator.',
@@ -296,9 +313,11 @@ export async function sendEmail(email: OutgoingEmail): Promise<EmailSendReceipt>
 
 /** Verifies credentials/connectivity without sending anything. Used by `npm run smtp:verify`. */
 export async function verifyEmailProvider(): Promise<void> {
-  const provider = activeProvider()
+  const cfg = (await loadNotificationConfig()).email
+  const provider = resolveProvider(cfg)
+
   if (provider === 'resend') {
-    const client = getResend()!
+    const client = getResend(cfg.resendApiKey)!
     // Light authenticated read: listing the single most recent email proves the API key works.
     const { error } = await client.emails.list({ limit: 1 })
     if (error) {
@@ -306,8 +325,8 @@ export async function verifyEmailProvider(): Promise<void> {
       // confirms the key is valid AND allowed to send — which is all we need.
       if ((error as { name?: string }).name === 'restricted_api_key') {
         console.log('[mailer] key is send-only (restricted_api_key) — sending is permitted')
-        // If SMTP is also configured, it is the fallback path — verify it too.
-        if (getTransport()) await getTransport()!.verify()
+        const transport = getTransport(cfg.smtp)
+        if (transport) await transport.verify()
         return
       }
       throw new EmailDeliveryError(
@@ -319,7 +338,7 @@ export async function verifyEmailProvider(): Promise<void> {
     return
   }
   if (provider === 'smtp') {
-    await getTransport()!.verify()
+    await getTransport(cfg.smtp)!.verify()
     return
   }
   throw new EmailDeliveryError(

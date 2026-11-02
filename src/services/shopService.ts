@@ -15,6 +15,13 @@ import type {
   CheckoutInput,
   ProductListQuery,
 } from '../validators/shop'
+import { assertShopPaymentMethodAllowed } from './paymentSettingsService'
+import { notifyOrderConfirmation, notifyOrderCancelled } from './notificationEvents'
+import {
+  buildOrderTrackingUrl,
+  signOrderTrackingToken,
+  verifyOrderTrackingToken,
+} from '../utils/orderTrackingToken'
 
 /**
  * Public shop — catalog, guest carts, checkout and order payments.
@@ -95,6 +102,7 @@ export interface ProductDetail extends ProductListItem {
     name: string
     value: string
     priceDelta: number
+    stock: number
   }>
   images: Array<{ id: number; url: string; alt: string | null }>
 }
@@ -110,6 +118,7 @@ export function serializeProductDetail(product: ProductWithRelations): ProductDe
       name: variation.name,
       value: variation.value,
       priceDelta: Number(variation.priceDelta),
+      stock: variation.stock,
     })),
     images: product.images.map((image) => ({
       id: image.id,
@@ -465,8 +474,28 @@ export interface OrderView {
   paymentStatus: string
   transactionRef: string | null
   receiptUrl: string | null
+    /** Admin's reason when a payment proof was rejected. */
+    paymentNote: string | null
+    paymentVerifiedAt: string | null
   refundedAmount: number
   createdAt: string
+  /** DELIVERY (courier) or PICKUP (collect at the studio). */
+  fulfillmentType: string
+  deliveryInstructions: string | null
+  estimatedDeliveryAt: string | null
+  paymentAttempts: number
+  /** Pickup snapshot — null for delivery orders. */
+  pickup: {
+    code: string | null
+    shopName: string | null
+    address: string | null
+    phone: string | null
+    hours: string | null
+    instructions: string | null
+    mapUrl: string | null
+    readyAt: string | null
+    collectedAt: string | null
+  } | null
   items: OrderItemView[]
   history?: Array<{
     id: number
@@ -521,8 +550,28 @@ export function serializeOrder(
     paymentStatus: order.paymentStatus,
     transactionRef: order.transactionRef,
     receiptUrl: order.receiptUrl,
+    paymentNote: order.paymentNote,
+    paymentVerifiedAt: order.paymentVerifiedAt?.toISOString() ?? null,
     refundedAmount: Number(order.refundedAmount),
     createdAt: order.createdAt.toISOString(),
+    fulfillmentType: order.fulfillmentType,
+    deliveryInstructions: order.deliveryInstructions,
+    estimatedDeliveryAt: order.estimatedDeliveryAt?.toISOString() ?? null,
+    paymentAttempts: order.paymentAttempts,
+    pickup:
+      order.fulfillmentType === 'PICKUP' || order.pickupCode
+        ? {
+            code: order.pickupCode,
+            shopName: order.pickupShopName,
+            address: order.pickupAddress,
+            phone: order.pickupPhone,
+            hours: order.pickupHours,
+            instructions: order.pickupInstructions,
+            mapUrl: order.pickupMapUrl,
+            readyAt: order.pickupReadyAt?.toISOString() ?? null,
+            collectedAt: order.collectedAt?.toISOString() ?? null,
+          }
+        : null,
     items: order.items.map((item) => ({
       id: item.id,
       vendorId: item.vendorId,
@@ -590,8 +639,20 @@ export async function recordPaymentEvent(
   })
 }
 
+/** Account handed back to the browser so a guest buyer is signed in at once. */
+export interface CheckoutAccount {
+  created: boolean
+  signedIn: boolean
+  token: string | null
+  customer: Record<string, unknown>
+}
+
 export interface CheckoutResult {
   order: OrderView
+  /** Always null now — guests no longer get an account created at checkout. */
+  account: CheckoutAccount | null
+  /** Signed, expiring order-tracking link handed to the buyer. */
+  tracking: { token: string; trackingUrl: string }
 }
 
 /**
@@ -604,6 +665,8 @@ export async function createShopOrder(input: CheckoutInput, customerId?: number 
   if (!settings.allowGuestCheckout && !customerId) {
     throw new ForbiddenError('Please sign in to place an order.')
   }
+  // Never accept a method the studio disabled or never configured.
+  await assertShopPaymentMethodAllowed(input.paymentMethod)
 
   // Resolve the lines: explicit items win; otherwise read the cart server-side.
   let lines: Array<{ productId: number; variationId: number | null; quantity: number }> = []
@@ -636,6 +699,28 @@ export async function createShopOrder(input: CheckoutInput, customerId?: number 
   if (input.paymentMethod === 'ONLINE' && !email) {
     throw new UnprocessableError('An email address is required for online card payments.')
   }
+
+  // ── Fulfillment: home delivery or studio pickup ────────────────────────
+  const fulfillmentType = input.fulfillmentType ?? 'DELIVERY'
+  if (fulfillmentType === 'PICKUP' && !settings.storePickupEnabled) {
+    throw new UnprocessableError(
+      'Store pickup is currently unavailable. Please choose home delivery.',
+    )
+  }
+  if (fulfillmentType === 'DELIVERY' && !(input.deliveryAddress ?? '').trim()) {
+    throw new UnprocessableError('Please provide a delivery address for home delivery.')
+  }
+
+  // Pickup details are snapped onto the order so later settings edits never
+  // rewrite the instructions an existing customer already received.
+  const shopProfile = await prisma.paymentSetting.findFirst({
+    select: { shopName: true, shopAddress: true, shopPhone: true },
+  })
+  const pickupShopName =
+    settings.pickupShopName?.trim() || shopProfile?.shopName || 'SAWABA Grooming Studio'
+  const pickupAddress =
+    settings.pickupAddress?.trim() || shopProfile?.shopAddress || 'SAWABA Grooming Studio'
+  const pickupPhone = settings.pickupPhone?.trim() || shopProfile?.shopPhone || ''
 
   const order = await prisma.$transaction(async (tx) => {
     // 1. Load every product FOR UPDATE-equivalent: conditional stock update below.
@@ -735,12 +820,22 @@ export async function createShopOrder(input: CheckoutInput, customerId?: number 
       })
     }
 
-    // 3. Delivery fee from marketplace settings (free above threshold).
+    // 3. Delivery fee — store pickup is always free (free delivery above threshold).
     const deliveryFee =
-      subtotal > 0 && Number(settings.freeDeliveryThreshold) > 0 && subtotal >= Number(settings.freeDeliveryThreshold)
+      fulfillmentType === 'PICKUP'
         ? 0
-        : Number(settings.deliveryFee)
+        : subtotal > 0 &&
+            Number(settings.freeDeliveryThreshold) > 0 &&
+            subtotal >= Number(settings.freeDeliveryThreshold)
+          ? 0
+          : Number(settings.deliveryFee)
     const totalAmount = round2(subtotal + deliveryFee)
+
+    const estimatedDeliveryAt =
+      fulfillmentType === 'DELIVERY'
+        ? new Date(Date.now() + Math.max(1, settings.deliveryEstimateDays) * 24 * 60 * 60 * 1000)
+        : null
+    const pickupCode = fulfillmentType === 'PICKUP' ? await reservePickupCode(tx) : null
 
     // 4. Create the order + lines + payment row.
     const created = await tx.shopOrder.create({
@@ -750,8 +845,24 @@ export async function createShopOrder(input: CheckoutInput, customerId?: number 
         customerName: input.customerName,
         customerPhone: input.customerPhone,
         customerEmail: email,
-        deliveryAddress: input.deliveryAddress,
-        deliveryLocation: input.deliveryLocation?.trim() || null,
+        deliveryAddress:
+          fulfillmentType === 'PICKUP' ? pickupAddress : (input.deliveryAddress ?? '').trim(),
+        deliveryLocation:
+          fulfillmentType === 'PICKUP' ? 'Store pickup' : input.deliveryLocation?.trim() || null,
+        fulfillmentType,
+        deliveryInstructions: input.deliveryInstructions?.trim() || null,
+        estimatedDeliveryAt,
+        pickupCode,
+        ...(fulfillmentType === 'PICKUP'
+          ? {
+              pickupShopName,
+              pickupAddress,
+              pickupPhone,
+              pickupHours: settings.pickupHours,
+              pickupInstructions: settings.pickupInstructions,
+              pickupMapUrl: settings.pickupMapUrl,
+            }
+          : {}),
         notes: input.notes?.trim() || null,
         subtotal,
         deliveryFee,
@@ -797,6 +908,20 @@ export async function createShopOrder(input: CheckoutInput, customerId?: number 
       tx,
     )
 
+    await recordPaymentEvent(
+      created.id,
+      {
+        type: 'FULFILLMENT_SELECTED',
+        status: created.status,
+        actorRole: customerId ? 'CUSTOMER' : 'GUEST',
+        detail:
+          fulfillmentType === 'PICKUP'
+            ? `Store pickup selected — collection code ${pickupCode}`
+            : `Home delivery selected${input.deliveryLocation ? ` — ${input.deliveryLocation}` : ''}`,
+      },
+      tx,
+    )
+
     // 6. Notify each vendor.
     const vendorIds = [...new Set(orderItemsData.map((item) => item.vendorId))]
     for (const vendorId of vendorIds) {
@@ -820,7 +945,21 @@ export async function createShopOrder(input: CheckoutInput, customerId?: number 
     return created
   })
 
-  return { order: serializeOrder(order) }
+  // Guest-first: a buyer is NOT given an account at checkout. The order stays a
+  // true guest order (customerId = null unless the buyer is signed in) and is
+  // tracked with a signed, expiring link. This keeps "never force an account"
+  // true and prevents duplicate customer records.
+  await notifyOrderConfirmation(order, customerId ?? null)
+
+  const trackingClaims = { orderId: order.id, referenceCode: order.referenceCode }
+  return {
+    order: serializeOrder(order),
+    account: null,
+    tracking: {
+      token: signOrderTrackingToken(trackingClaims),
+      trackingUrl: buildOrderTrackingUrl(trackingClaims),
+    },
+  }
 }
 
 async function loadOrder(reference: string): Promise<OrderWithItems> {
@@ -854,7 +993,126 @@ export async function getOrderByReference(reference: string, phone: string): Pro
   }
 }
 
-// ─── Order payment ───────────────────────────────────────────────────────────
+/** Digits only, last 10 — tolerates +234 / 0 prefixes and spacing. */
+function phoneTail(value: string | null | undefined): string {
+  return (value ?? '').replace(/\D/g, '').slice(-10)
+}
+
+/**
+ * Guest order lookup: order number + the phone OR email recorded on the order.
+ * Two factors are always required — an order number alone never reveals data.
+ * Returns a fresh signed tracking link so the buyer can bookmark/share it.
+ */
+export async function lookupOrderForTracking(
+  reference: string,
+  contact: string,
+): Promise<{ token: string; trackingUrl: string; order: OrderView }> {
+  const order = await loadOrder(reference)
+  const trimmed = contact.trim()
+  const isEmail = trimmed.includes('@')
+  const matches = isEmail
+    ? Boolean(order.customerEmail) && order.customerEmail!.toLowerCase() === trimmed.toLowerCase()
+    : trimmed.replace(/\D/g, '').length >= 7 && phoneTail(order.customerPhone) === phoneTail(trimmed)
+
+  if (!matches) {
+    // Generic message: never confirm whether the order number exists.
+    throw new NotFoundError('Order not found. Please check the order number and contact details.')
+  }
+
+  const claims = { orderId: order.id, referenceCode: order.referenceCode }
+  return {
+    token: signOrderTrackingToken(claims),
+    trackingUrl: buildOrderTrackingUrl(claims),
+    order: await buildOrderView(order),
+  }
+}
+
+/** Read-only order view from a signed tracking token (no login, no OTP). */
+export async function getOrderByTrackingToken(token: string): Promise<OrderView> {
+  const claims = verifyOrderTrackingToken(token)
+  const order = await prisma.shopOrder.findUnique({
+    where: { id: claims.orderId },
+    include: orderInclude,
+  })
+  if (!order || order.referenceCode !== claims.referenceCode) {
+    throw new NotFoundError('Order not found.')
+  }
+  return buildOrderView(order)
+}
+
+/**
+ * Attaches past GUEST orders (customerId null) to the signed-in customer when
+ * the order's phone or email matches the account's. Idempotent and bounded — it
+ * only ever updates unclaimed orders, never creates/duplicates records.
+ */
+export async function linkGuestOrders(customerId: number): Promise<{ linked: number }> {
+  const customer = await prisma.customer.findUnique({ where: { id: customerId } })
+  if (!customer) throw new NotFoundError('Account not found.')
+
+  const email = customer.email?.trim().toLowerCase() ?? null
+  const tail = phoneTail(customer.phone)
+
+  const candidates = await prisma.shopOrder.findMany({
+    where: { customerId: null },
+    select: { id: true, customerPhone: true, customerEmail: true },
+    orderBy: { createdAt: 'desc' },
+    take: 1000,
+  })
+
+  const ids = candidates
+    .filter((order) => {
+      const phoneMatch = tail.length >= 7 && phoneTail(order.customerPhone) === tail
+      const emailMatch =
+        Boolean(email) && Boolean(order.customerEmail) && order.customerEmail!.toLowerCase() === email
+      return phoneMatch || emailMatch
+    })
+    .map((order) => order.id)
+
+  if (ids.length === 0) return { linked: 0 }
+
+  const result = await prisma.shopOrder.updateMany({
+    where: { id: { in: ids }, customerId: null },
+    data: { customerId },
+  })
+  return { linked: result.count }
+}
+
+/**
+ * Signed-in tracking: resolves one order by number for the current customer.
+ *  - Already theirs → returned as-is.
+ *  - Unclaimed guest order whose phone/email matches their account → claimed to
+ *    the existing account (never a new customer), then returned.
+ *  - Owned by someone else → not found (never revealed or reassigned).
+ */
+export async function trackMyOrder(
+  customerId: number,
+  reference: string,
+): Promise<{ order: OrderView; linked: boolean }> {
+  const customer = await prisma.customer.findUnique({ where: { id: customerId } })
+  if (!customer) throw new NotFoundError('Account not found.')
+
+  const order = await loadOrder(reference)
+
+  if (order.customerId === customerId) {
+    return { order: await buildOrderView(order), linked: false }
+  }
+  if (order.customerId !== null) {
+    throw new NotFoundError('Order not found. Please check the order number.')
+  }
+
+  const email = customer.email?.trim().toLowerCase() ?? null
+  const tail = phoneTail(customer.phone)
+  const phoneMatch = tail.length >= 7 && phoneTail(order.customerPhone) === tail
+  const emailMatch =
+    Boolean(email) && Boolean(order.customerEmail) && order.customerEmail!.toLowerCase() === email
+
+  if (!phoneMatch && !emailMatch) {
+    throw new NotFoundError('Order not found. Please check the order number.')
+  }
+
+  await prisma.shopOrder.update({ where: { id: order.id }, data: { customerId } })
+  return { order: await buildOrderView(order), linked: true }
+}
 
 /**
  * Attaches a transfer receipt to an order. The order becomes
@@ -866,6 +1124,11 @@ export async function submitOrderReceipt(
   transactionReference?: string,
 ): Promise<OrderView> {
   const order = await loadOrder(reference)
+  if (!['BANK_TRANSFER', 'OPAY'].includes(order.paymentMethod ?? '')) {
+    throw new UnprocessableError(
+      'Receipts are only accepted for bank transfer and OPay payments. Use the Paystack button for card payments.',
+    )
+  }
   if (order.paymentStatus === 'PAID') {
     throw new UnprocessableError('This order has already been paid.')
   }
@@ -884,12 +1147,17 @@ export async function submitOrderReceipt(
         receiptUrl: receipt.url,
         receiptPublicId: receipt.publicId,
         transactionRef: transactionReference?.trim() || order.transactionRef,
+        paymentNote: null,
       },
       include: orderInclude,
     })
     await tx.shopPayment.update({
       where: { orderId: order.id },
-      data: { status: 'PENDING_VERIFICATION', transactionRef: transactionReference?.trim() || null },
+      data: {
+        status: 'PENDING_VERIFICATION',
+        transactionRef: transactionReference?.trim() || null,
+        rejectionReason: null,
+      },
     })
     // MUST pass `tx`: the event insert has an FK to this order row, which the
     // transaction above already locked — using the global client here makes
@@ -965,7 +1233,7 @@ export async function cancelShopOrder(reference: string, phone: string): Promise
       'This order has already been paid. Please contact support for a refund instead.',
     )
   }
-  if (['CANCELLED', 'DELIVERED', 'SHIPPED', 'REFUNDED', 'RETURNED'].includes(order.status)) {
+  if (['CANCELLED', 'DELIVERED', 'COLLECTED', 'SHIPPED', 'REFUNDED', 'RETURNED'].includes(order.status)) {
     throw new UnprocessableError(`This order cannot be cancelled (${order.status.toLowerCase()}).`)
   }
 
@@ -1024,6 +1292,9 @@ export async function cancelShopOrder(reference: string, phone: string): Promise
     }
     return result
   })
+
+  await notifyOrderCancelled(updated, 'Cancelled by customer')
+
   return serializeOrder(updated)
 }
 
@@ -1177,6 +1448,100 @@ export async function listCustomerOrders(
     page,
     perPage,
   }
+}
+
+// ─── Store pickup + authenticated order lookup ───────────────────────────────
+
+/** Human-friendly, unambiguous collection code (no 0/O/1/I). */
+function randomPickupCode(): string {
+  const alphabet = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'
+  let code = ''
+  for (let index = 0; index < 8; index += 1) {
+    code += alphabet[crypto.randomInt(alphabet.length)]
+  }
+  return code
+}
+
+/** Reserves a unique `PK-XXXXXXXX` pickup code (11 chars, fits VarChar(12)). */
+async function reservePickupCode(tx: Prisma.TransactionClient): Promise<string> {
+  for (let attempt = 0; attempt < 8; attempt += 1) {
+    const code = `PK-${randomPickupCode()}`
+    const clash = await tx.shopOrder.findUnique({
+      where: { pickupCode: code },
+      select: { id: true },
+    })
+    if (!clash) return code
+  }
+  throw new UnprocessableError('Could not reserve a collection code. Please try again.')
+}
+
+export interface ShopPickupInfo {
+  enabled: boolean
+  shopName: string
+  address: string
+  phone: string
+  hours: string
+  instructions: string
+  mapUrl: string
+  deliveryFee: number
+  freeDeliveryThreshold: number
+  deliveryEstimateDays: number
+  deliveryLocations: string[]
+}
+
+/** Public studio pickup + delivery configuration shown on checkout. */
+export async function getShopPickupInfo(): Promise<ShopPickupInfo> {
+  const [settings, profile] = await Promise.all([
+    getMarketplaceSettings(),
+    prisma.paymentSetting.findFirst({
+      select: { shopName: true, shopAddress: true, shopPhone: true },
+    }),
+  ])
+  return {
+    enabled: settings.storePickupEnabled,
+    shopName: settings.pickupShopName?.trim() || profile?.shopName || 'SAWABA Grooming Studio',
+    address:
+      settings.pickupAddress?.trim() || profile?.shopAddress || 'SAWABA Grooming Studio, Kano',
+    phone: settings.pickupPhone?.trim() || profile?.shopPhone || '',
+    hours: settings.pickupHours || 'Mon – Sat, 9:00am – 7:00pm',
+    instructions:
+      settings.pickupInstructions?.trim() ||
+      'Bring your order number and pickup code. A staff member will confirm them and hand over your items.',
+    mapUrl: settings.pickupMapUrl?.trim() || '',
+    deliveryFee: Number(settings.deliveryFee),
+    freeDeliveryThreshold: Number(settings.freeDeliveryThreshold),
+    deliveryEstimateDays: settings.deliveryEstimateDays,
+    deliveryLocations: settings.deliveryLocations
+      .split(',')
+      .map((location) => location.trim())
+      .filter(Boolean),
+  }
+}
+
+/** One shared order payload (payment instructions + timeline). */
+async function buildOrderView(order: OrderWithItems): Promise<OrderView> {
+  const details = ['BANK_TRANSFER', 'OPAY'].includes(order.paymentMethod ?? '')
+    ? await paymentDetailsFromSettings()
+    : undefined
+  const history = await prisma.shopPaymentEvent.findMany({
+    where: { orderId: order.id },
+    orderBy: { createdAt: 'desc' },
+    take: 40,
+    select: { id: true, type: true, status: true, detail: true, actorRole: true, createdAt: true },
+  })
+  return {
+    ...serializeOrder(order, details),
+    history: history.map((event) => ({ ...event, createdAt: event.createdAt.toISOString() })),
+  }
+}
+
+/** Authenticated customer lookup — ownership is enforced on the server. */
+export async function getCustomerOrder(reference: string, customerId: number): Promise<OrderView> {
+  const order = await loadOrder(reference)
+  if (order.customerId !== customerId) {
+    throw new NotFoundError('Order not found.')
+  }
+  return buildOrderView(order)
 }
 
 export { generateReference }

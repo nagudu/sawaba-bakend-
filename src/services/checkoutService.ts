@@ -9,6 +9,7 @@ import { uploadImageToCloudinary } from '../utils/upload'
 import { getPaymentSettingsRecord } from './paymentSettingsService'
 import { AppointmentStatusValue } from '../config/appointmentStatuses'
 import { buildQrPayload, ensureAppointmentQrToken } from './qrService'
+import { notifyBookingConfirmation } from './notificationEvents'
 
 function generateSessionToken(): string {
   return crypto.randomBytes(24).toString('hex')
@@ -485,6 +486,24 @@ export async function finalizeCheckout(sessionToken: string): Promise<FinalizeRe
 
     return { appointment, payment }
   })
+
+  await notifyBookingConfirmation(
+    {
+      id: result.appointment.id,
+      referenceCode: result.appointment.referenceCode,
+      customerId: result.appointment.customerId,
+      customerName: result.appointment.customerName,
+      customerPhone: result.appointment.customerPhone,
+      customerEmail: result.appointment.customerEmail,
+      appointmentDate: result.appointment.appointmentDate,
+      appointmentTime: result.appointment.appointmentTime,
+      totalAmount: Number(result.appointment.totalAmount),
+      status: result.appointment.status,
+      service: session.service ? { name: session.service.name } : null,
+      barber: session.barber ? { name: session.barber.name } : null,
+    },
+    result.payment,
+  )
 
   return withQr(result.appointment.id, {
     appointment: {

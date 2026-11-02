@@ -6,6 +6,11 @@ import { getPagination } from '../utils/response'
 import { hhmmToMinutes } from './availabilityService'
 import { findOrCreateCustomer } from './customerService'
 import { markPaymentCancelled } from './paymentService'
+import {
+  notifyBookingConfirmation,
+  notifyBookingStatus,
+  notifyBookingCancelled,
+} from './notificationEvents'
 import { ensureAppointmentQrToken, revokeAppointmentQr } from './qrService'
 import { createEarningSnapshot, syncEarningForAppointment } from './commissionService'
 import { uploadImageToCloudinary } from '../utils/upload'
@@ -398,6 +403,10 @@ export async function createAppointment(
     include: customerAppointmentInclude,
   })
 
+  if (fresh) {
+    await notifyBookingConfirmation(fresh, payment)
+  }
+
   return {
     appointment: serializeAppointment(fresh!),
     payment: {
@@ -642,9 +651,11 @@ export async function updateAppointmentStatus(
     await markPaymentCancelled(id)
     await revokeAppointmentQr(id)
     await syncEarningForAppointment(id)
+    await notifyBookingCancelled(appointment, options.cancellationReason ?? null)
   } else {
     await syncPaymentForStatus(id, status, options.updatedByAdminId)
     await syncEarningForAppointment(id)
+    await notifyBookingStatus(appointment, status)
   }
 
   return getAppointmentById(id)
@@ -680,6 +691,8 @@ export async function reactivateAppointment(id: number): Promise<AppointmentPubl
       data: { status: 'UNPAID' },
     })
   }
+
+  await notifyBookingStatus({ ...appointment, status: nextStatus }, nextStatus)
 
   return getAppointmentById(id)
 }

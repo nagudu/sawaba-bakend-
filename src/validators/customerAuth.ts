@@ -63,6 +63,9 @@ export const customerProfileUpdateSchema = z
     preferredBarberId: z.number().int().positive().nullable().optional(),
     favoriteServiceId: z.number().int().positive().nullable().optional(),
     reminderOptIn: z.boolean().optional(),
+    emailOptIn: z.boolean().optional(),
+    smsOptIn: z.boolean().optional(),
+    whatsappOptIn: z.boolean().optional(),
   })
   .refine((value) => Object.keys(value).length > 0, { message: 'Nothing to update.' })
 

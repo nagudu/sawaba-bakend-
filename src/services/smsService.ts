@@ -1,15 +1,18 @@
+import { getNotificationConfigSync, loadNotificationConfig } from './notificationConfigService'
+
 /**
- * SMS delivery adapter (Termii-compatible Send Message API), configured
- * exclusively from environment variables:
+ * SMS delivery adapter (Termii-compatible Send Message API). Credentials are
+ * resolved at send time from the admin `notification_settings` row with
+ * environment fallback (see notificationConfigService):
  *
- *   SMS_API_KEY     — Termii (or compatible) API key.  Required to enable SMS.
- *   SMS_SENDER_ID   — alphanumeric sender id shown to recipients.
- *   SMS_BASE_URL    — override the default Termii base URL (optional).
+ *   apiKey   — Termii (or compatible) API key.  Required to enable SMS.
+ *   senderId — alphanumeric sender id shown to recipients.
+ *   baseUrl  — override the default Termii base URL (optional).
  *
  * Like the mailer, this module NEVER pretends to succeed: nothing configured
  * (or a rejected/unsendable request) throws SmsDeliveryError whose user-safe
- * message the OTP flows surface to the caller. The SMS body (which contains
- * the one-time code) is never written to logs.
+ * message the caller surfaces. The SMS body (which may contain a one-time code)
+ * is never written to logs.
  */
 
 const DEFAULT_SMS_BASE_URL = 'https://api.ng.termii.com'
@@ -28,11 +31,12 @@ export class SmsDeliveryError extends Error {
 
 /** True when SMS delivery is fully configured (key + sender id). */
 export function isSmsConfigured(): boolean {
-  return Boolean(process.env.SMS_API_KEY && process.env.SMS_SENDER_ID)
+  const sms = getNotificationConfigSync().sms
+  return Boolean(sms.apiKey && sms.senderId)
 }
 
-function smsBase(): string {
-  return (process.env.SMS_BASE_URL || DEFAULT_SMS_BASE_URL).replace(/\/+$/, '')
+function smsBase(baseUrl: string | null): string {
+  return (baseUrl || DEFAULT_SMS_BASE_URL).replace(/\/+$/, '')
 }
 
 export interface SmsSendReceipt {
@@ -42,19 +46,20 @@ export interface SmsSendReceipt {
 }
 
 /**
- * Sends an OTP message to a phone number in E.164 form (e.g. +2348012345678).
+ * Sends an SMS to a phone number in E.164 form (e.g. +2348012345678).
  * The message body is intentionally NOT logged.
  */
 export async function sendSms(toE164: string, message: string): Promise<SmsSendReceipt> {
-  if (!isSmsConfigured()) {
+  const sms = (await loadNotificationConfig()).sms
+  if (!sms.apiKey || !sms.senderId) {
     throw new SmsDeliveryError('SMS service is not configured. Please contact the administrator.')
   }
 
   const to = toE164.replace(/[^\d]/g, '').replace(/^234/, '').replace(/^0/, '')
   const payload = {
-    api_key: process.env.SMS_API_KEY!,
+    api_key: sms.apiKey,
     to: `234${to}`,
-    from: process.env.SMS_SENDER_ID!,
+    from: sms.senderId,
     sms: message,
     channel: 'generic',
     type: 'plain',
@@ -62,7 +67,7 @@ export async function sendSms(toE164: string, message: string): Promise<SmsSendR
 
   let response: Response
   try {
-    response = await fetch(`${smsBase()}/api/sms/send`, {
+    response = await fetch(`${smsBase(sms.baseUrl)}/api/sms/send`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload),

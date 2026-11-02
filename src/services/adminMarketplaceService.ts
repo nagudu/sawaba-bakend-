@@ -8,6 +8,7 @@ import type { Paged } from '../types'
 import { getMarketplaceSettings, naira } from './marketplaceService'
 import { recordPaymentEvent, serializeOrder, type OrderView } from './shopService'
 import { releaseMaturedEarnings } from './vendorService'
+import { notifyOrderStatus, notifyOrderCancelled, notifyRefundUpdate } from './notificationEvents'
 import type { VendorPublic } from './vendorService'
 import type {
   AdminLedgerQuery,
@@ -703,7 +704,12 @@ export interface AdminOrderRow extends OrderView {
   >
   vendorIds: number[]
   vendorNames: string[]
+  /** null means a guest order (no account linked). */
+  customerId: number | null
+  isGuest: boolean
   paymentVerifiedAt: string | null
+  paymentVerifiedBy: number | null
+  paymentVerifiedByName: string | null
   paymentNote: string | null
   cancelledAt: string | null
   deliveredAt: string | null
@@ -728,12 +734,37 @@ function serializeAdminOrder(
     }),
     vendorIds: [...new Set(order.items.map((item) => item.vendorId))],
     vendorNames: [...new Set(order.items.map((item) => item.vendor.businessName))],
+    customerId: order.customerId ?? null,
+    isGuest: order.customerId === null,
     paymentVerifiedAt: order.paymentVerifiedAt?.toISOString() ?? null,
+    paymentVerifiedBy: order.paymentVerifiedBy ?? null,
+    paymentVerifiedByName: null,
     paymentNote: order.paymentNote,
     cancelledAt: order.cancelledAt?.toISOString() ?? null,
     deliveredAt: order.deliveredAt?.toISOString() ?? null,
     refundedAt: order.refundedAt?.toISOString() ?? null,
   }
+}
+
+/** Resolves the admin name behind each payment verification for the audit trail. */
+async function attachVerifierNames(rows: AdminOrderRow[]): Promise<AdminOrderRow[]> {
+  const ids = [
+    ...new Set(
+      rows
+        .map((row) => row.paymentVerifiedBy)
+        .filter((id): id is number => typeof id === 'number'),
+    ),
+  ]
+  if (ids.length === 0) return rows
+  const admins = await prisma.admin.findMany({
+    where: { id: { in: ids } },
+    select: { id: true, name: true },
+  })
+  const names = new Map(admins.map((admin) => [admin.id, admin.name]))
+  return rows.map((row) => ({
+    ...row,
+    paymentVerifiedByName: row.paymentVerifiedBy ? names.get(row.paymentVerifiedBy) ?? null : null,
+  }))
 }
 
 export async function adminListOrders(
@@ -743,6 +774,11 @@ export async function adminListOrders(
   const where: Prisma.ShopOrderWhereInput = {
     ...(query.status ? { status: query.status } : {}),
     ...(query.paymentStatus ? { paymentStatus: query.paymentStatus } : {}),
+    ...(query.customerType === 'GUEST'
+      ? { customerId: null }
+      : query.customerType === 'REGISTERED'
+        ? { customerId: { not: null } }
+        : {}),
     ...(query.vendorId ? { items: { some: { vendorId: query.vendorId } } } : {}),
     ...(query.from || query.to
       ? {
@@ -777,7 +813,8 @@ export async function adminListOrders(
     prisma.shopOrder.count({ where }),
   ])
 
-  return { items: rows.map(serializeAdminOrder), total, page: query.page, perPage: query.perPage }
+  const items = await attachVerifierNames(rows.map(serializeAdminOrder))
+  return { items, total, page: query.page, perPage: query.perPage }
 }
 
 export async function adminGetOrder(reference: string): Promise<AdminOrderRow & {
@@ -795,8 +832,9 @@ export async function adminGetOrder(reference: string): Promise<AdminOrderRow & 
     },
   })
   if (!order) return null
+  const base = (await attachVerifierNames([serializeAdminOrder(order)]))[0]
   return {
-    ...serializeAdminOrder(order),
+    ...base,
     events: order.events.map((event) => ({
       id: event.id,
       type: event.type,
@@ -837,21 +875,35 @@ export async function adminUpdateOrderStatus(
     throw new UnprocessableError('Only paid orders can move through fulfillment.')
   }
   const allowedTransitions: Record<string, string[]> = {
-    PAYMENT_CONFIRMED: ['PROCESSING', 'READY_FOR_DISPATCH', 'SHIPPED', 'DELIVERED', 'CANCELLED'],
-    PROCESSING: ['READY_FOR_DISPATCH', 'SHIPPED', 'DELIVERED', 'CANCELLED'],
-    READY_FOR_DISPATCH: ['SHIPPED', 'DELIVERED', 'CANCELLED'],
+    PAYMENT_CONFIRMED: [
+      'PROCESSING',
+      'READY_FOR_DISPATCH',
+      'READY_FOR_PICKUP',
+      'SHIPPED',
+      'DELIVERED',
+      'COLLECTED',
+      'CANCELLED',
+    ],
+    PROCESSING: ['READY_FOR_DISPATCH', 'READY_FOR_PICKUP', 'SHIPPED', 'DELIVERED', 'COLLECTED', 'CANCELLED'],
+    READY_FOR_DISPATCH: ['READY_FOR_PICKUP', 'SHIPPED', 'DELIVERED', 'CANCELLED'],
+    READY_FOR_PICKUP: ['COLLECTED', 'CANCELLED'],
     SHIPPED: ['DELIVERED', 'CANCELLED'],
   }
   if (input.status !== 'CANCELLED' && !allowedTransitions[order.status]?.includes(input.status)) {
     throw new UnprocessableError(`Cannot move this order from ${order.status} to ${input.status}.`)
   }
-  if (['CANCELLED', 'DELIVERED', 'REFUNDED', 'RETURNED'].includes(order.status)) {
+  if (['CANCELLED', 'DELIVERED', 'COLLECTED', 'REFUNDED', 'RETURNED'].includes(order.status)) {
     throw new UnprocessableError(`This order is already ${order.status.toLowerCase()}.`)
   }
 
   const updated = await prisma.$transaction(async (tx) => {
     const data: Prisma.ShopOrderUpdateInput = { status: input.status as never }
     if (input.status === 'DELIVERED') data.deliveredAt = new Date()
+    if (input.status === 'READY_FOR_PICKUP') data.pickupReadyAt = new Date()
+    if (input.status === 'COLLECTED') {
+      data.collectedAt = new Date()
+      data.deliveredAt = new Date()
+    }
     if (input.status === 'CANCELLED') {
       data.cancelledAt = new Date()
       data.cancelReason = input.reason || 'Cancelled by admin'
@@ -998,6 +1050,22 @@ export async function adminUpdateOrderStatus(
     detail: `${order.referenceCode}: ${order.status} → ${input.status}`,
   })
 
+  if (input.status === 'CANCELLED') {
+    await notifyOrderCancelled(updated, input.reason ?? 'Cancelled by admin')
+    if (order.paymentStatus === 'PAID') {
+      await notifyRefundUpdate(updated, Number(order.totalAmount), {
+        reason: input.reason ?? null,
+        status: 'REFUNDED',
+      })
+    }
+  } else {
+    const tracking = updated.items
+      .map((item) => item.trackingInfo)
+      .filter(Boolean)
+      .join(', ')
+    await notifyOrderStatus(updated, input.status, tracking || null)
+  }
+
   return serializeAdminOrder(updated)
 }
 
@@ -1042,6 +1110,21 @@ export async function adminCreateRefund(
     detail: `${order.referenceCode}: ${naira(amount)}`,
   })
 
+  await notifyRefundUpdate(
+    {
+      id: order.id,
+      referenceCode: order.referenceCode,
+      customerId: order.customerId,
+      customerName: order.customerName,
+      customerPhone: order.customerPhone,
+      customerEmail: order.customerEmail,
+      totalAmount: order.totalAmount,
+      status: order.status,
+    },
+    amount,
+    { reason: input.reason, status: 'REQUESTED' },
+  )
+
   return { id: refund.id, status: refund.status }
 }
 
@@ -1083,6 +1166,11 @@ export async function adminResolveRefund(
     entityId: refundId,
     detail: `Order ${refund.order.referenceCode}: ${naira(Number(refund.amount))}`,
   })
+
+  await notifyRefundUpdate(refund.order, Number(refund.amount), {
+    reason: input.resolution ?? refund.reason,
+    status: input.action === 'APPROVED' ? 'COMPLETED' : 'REJECTED',
+  })
 }
 
 // ─── Settings ────────────────────────────────────────────────────────────────
@@ -1096,6 +1184,14 @@ export async function adminGetMarketplaceSettings() {
     deliveryFee: Number(settings.deliveryFee),
     freeDeliveryThreshold: Number(settings.freeDeliveryThreshold),
     deliveryLocations: settings.deliveryLocations,
+    deliveryEstimateDays: settings.deliveryEstimateDays,
+    storePickupEnabled: settings.storePickupEnabled,
+    pickupShopName: settings.pickupShopName,
+    pickupAddress: settings.pickupAddress,
+    pickupPhone: settings.pickupPhone,
+    pickupHours: settings.pickupHours,
+    pickupInstructions: settings.pickupInstructions,
+    pickupMapUrl: settings.pickupMapUrl,
     requireProductApproval: settings.requireProductApproval,
     allowGuestCheckout: settings.allowGuestCheckout,
     vendorRegistrationOpen: settings.vendorRegistrationOpen,
@@ -1111,6 +1207,14 @@ export async function adminUpdateMarketplaceSettings(
     deliveryFee: number
     freeDeliveryThreshold: number
     deliveryLocations?: string
+    deliveryEstimateDays?: number
+    storePickupEnabled?: boolean
+    pickupShopName?: string
+    pickupAddress?: string
+    pickupPhone?: string
+    pickupHours?: string
+    pickupInstructions?: string
+    pickupMapUrl?: string
     requireProductApproval: boolean
     allowGuestCheckout: boolean
     vendorRegistrationOpen: boolean
@@ -1127,6 +1231,14 @@ export async function adminUpdateMarketplaceSettings(
       deliveryFee: input.deliveryFee,
       freeDeliveryThreshold: input.freeDeliveryThreshold,
       deliveryLocations: input.deliveryLocations ?? '',
+      deliveryEstimateDays: input.deliveryEstimateDays ?? 3,
+      storePickupEnabled: input.storePickupEnabled ?? true,
+      pickupShopName: input.pickupShopName || 'SAWABA Grooming Studio',
+      pickupAddress: input.pickupAddress ?? '',
+      pickupPhone: input.pickupPhone ?? '',
+      pickupHours: input.pickupHours || 'Mon – Sat, 9:00am – 7:00pm',
+      pickupInstructions: input.pickupInstructions ?? '',
+      pickupMapUrl: input.pickupMapUrl ?? '',
       requireProductApproval: input.requireProductApproval,
       allowGuestCheckout: input.allowGuestCheckout,
       vendorRegistrationOpen: input.vendorRegistrationOpen,

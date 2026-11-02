@@ -1,30 +1,25 @@
 import { prisma } from '../config/database'
 import { env } from '../config/env'
-import { sendEmail, isEmailConfigured, isValidRecipient } from './mailer'
-import { isSmsConfigured, sendSms } from './smsService'
+import { sendCustomerNotification } from './notificationService'
 
 /**
  * Automatic appointment reminders.
  *
  * Every appointment that has a reachable contact (email and/or phone) gets a
- * reminder a configured number of hours before it starts (default: 24h and 1h).
- * Delivery prefers email and falls back to SMS — the only channels that are
- * actually integrated. Nothing here requires admin action.
+ * reminder a configured number of hours before it starts (default: 24h and 1h),
+ * delivered through the shared notification orchestrator across all enabled
+ * channels (Email / SMS / WhatsApp). Nothing here requires admin action.
  *
  * The job is invoked two ways:
  *   1. A Vercel Cron (serverless) hitting POST/GET /api/cron/appointment-reminders.
  *   2. An in-process interval scheduler on long-lived hosts (Railway / local),
  *      started from server.ts.
  *
- * Dedupe: a row in `appointment_reminders` is written only after a successful
- * send. The unique (appointmentId, kind) key stops double-reminding even when
- * the scheduler overlaps or the endpoint is retried.
+ * Dedupe: a row in `appointment_reminders` is written after each dispatch so the
+ * unique (appointmentId, kind) key stops the scheduler re-reminding the same
+ * window. The orchestrator additionally dedupes per channel via
+ * `customer_notifications.dedupeKey`.
  */
-
-const REMINDER_LABELS: Record<string, string> = {
-  '24H': 'tomorrow',
-  '1H': 'in about an hour',
-}
 
 function kindForHours(hours: number): string {
   // 24 -> "24H", 1 -> "1H", 2 -> "2H"
@@ -56,6 +51,7 @@ export function selectDueReminder(
 interface AppointmentForReminder {
   id: number
   referenceCode: string | null
+  customerId: number | null
   customerName: string
   customerPhone: string
   customerEmail: string | null
@@ -75,109 +71,6 @@ export function appointmentInstant(
   const [hh, mm] = appointmentTime.split(':').map(Number)
   const asUtc = Date.UTC(y, (m ?? 1) - 1, d ?? 1, hh ?? 0, mm ?? 0, 0)
   return new Date(asUtc - offsetMinutes * 60_000)
-}
-
-function formatDateLong(appointmentDate: string): string {
-  const [y, m, d] = appointmentDate.split('-').map(Number)
-  // Format the wall-clock date without letting the server's timezone shift it.
-  return new Date(Date.UTC(y, (m ?? 1) - 1, d ?? 1)).toLocaleDateString('en-GB', {
-    weekday: 'long',
-    day: 'numeric',
-    month: 'long',
-    year: 'numeric',
-    timeZone: 'UTC',
-  })
-}
-
-function formatTime12h(appointmentTime: string): string {
-  const [hh, mm] = appointmentTime.split(':').map(Number)
-  const hour = hh ?? 0
-  const suffix = hour < 12 ? 'AM' : 'PM'
-  const displayHour = hour % 12 === 0 ? 12 : hour % 12
-  return `${displayHour}:${String(mm ?? 0).padStart(2, '0')} ${suffix}`
-}
-
-function buildEmail(
-  appointment: AppointmentForReminder,
-  hoursBefore: number,
-): { subject: string; text: string; html: string } {
-  const firstName = appointment.customerName.split(' ')[0] || appointment.customerName
-  const when = REMINDER_LABELS[kindForHours(hoursBefore)] ?? `in ${hoursBefore} hours`
-  const dateLabel = formatDateLong(appointment.appointmentDate)
-  const timeLabel = formatTime12h(appointment.appointmentTime)
-  const service = appointment.service?.name ?? 'your appointment'
-  const barber = appointment.barber?.name
-  const ref = appointment.referenceCode ?? `APT-${appointment.id}`
-
-  const subject = `Reminder: your SAWABA appointment is ${when} (${dateLabel}, ${timeLabel})`
-  const text = [
-    `Hello ${firstName},`,
-    '',
-    `This is a friendly reminder that your SAWABA Grooming Studio appointment is approaching — ${when}.`,
-    '',
-    `Service:   ${service}`,
-    barber ? `Barber:    ${barber}` : '',
-    `Date:      ${dateLabel}`,
-    `Time:      ${timeLabel}`,
-    `Reference: ${ref}`,
-    '',
-    'If you need to reschedule or cancel, please contact the studio as soon as possible.',
-    '',
-    'See you soon,',
-    'SAWABA Grooming Studio',
-  ]
-    .filter((line) => line !== '')
-    .join('\n')
-
-  const html = `
-    <p>Hello ${firstName},</p>
-    <p>This is a friendly reminder that your <strong>SAWABA Grooming Studio</strong> appointment is approaching — <strong>${when}</strong>.</p>
-    <table style="border-collapse:collapse;margin:16px 0">
-      <tr><td style="padding:4px 12px 4px 0;color:#888">Service</td><td><strong>${service}</strong></td></tr>
-      ${barber ? `<tr><td style="padding:4px 12px 4px 0;color:#888">Barber</td><td><strong>${barber}</strong></td></tr>` : ''}
-      <tr><td style="padding:4px 12px 4px 0;color:#888">Date</td><td><strong>${dateLabel}</strong></td></tr>
-      <tr><td style="padding:4px 12px 4px 0;color:#888">Time</td><td><strong>${timeLabel}</strong></td></tr>
-      <tr><td style="padding:4px 12px 4px 0;color:#888">Reference</td><td><strong>${ref}</strong></td></tr>
-    </table>
-    <p>If you need to reschedule or cancel, please contact the studio as soon as possible.</p>
-    <p style="color:#888;font-size:12px">See you soon — SAWABA Grooming Studio</p>
-  `.trim()
-
-  return { subject, text, html }
-}
-
-function buildSms(appointment: AppointmentForReminder, hoursBefore: number): string {
-  const firstName = appointment.customerName.split(' ')[0] || appointment.customerName
-  const when = REMINDER_LABELS[kindForHours(hoursBefore)] ?? `in ${hoursBefore} hours`
-  const dateLabel = formatDateLong(appointment.appointmentDate)
-  const timeLabel = formatTime12h(appointment.appointmentTime)
-  return `Hi ${firstName}, reminder: your SAWABA appointment is ${when} — ${dateLabel} at ${timeLabel}. Ref ${appointment.referenceCode ?? `APT-${appointment.id}`}. Reply to reschedule.`
-}
-
-/**
- * Deliver one reminder through the best available channel.
- * Returns the channel used, or null when the customer is unreachable / no
- * provider is configured (nothing is sent, nothing is recorded).
- */
-async function deliverReminder(
-  appointment: AppointmentForReminder,
-  hoursBefore: number,
-): Promise<'EMAIL' | 'SMS' | null> {
-  const email = appointment.customerEmail?.trim()
-
-  if (email && isValidRecipient(email) && isEmailConfigured()) {
-    const { subject, text, html } = buildEmail(appointment, hoursBefore)
-    await sendEmail({ to: email, subject, text, html })
-    return 'EMAIL'
-  }
-
-  const phone = appointment.customerPhone?.trim()
-  if (phone && isSmsConfigured()) {
-    await sendSms(phone, buildSms(appointment, hoursBefore))
-    return 'SMS'
-  }
-
-  return null
 }
 
 export interface ReminderRunResult {
@@ -271,34 +164,48 @@ export async function sendAppointmentReminders(options: {
     }
 
     try {
-      const channel = await deliverReminder(appointment, dueWindow)
-      if (!channel) {
-        result.skipped += 1
-        result.details.push({
+      const outcome = await sendCustomerNotification({
+        event: 'BOOKING_REMINDER',
+        customer: {
+          id: appointment.customerId,
+          fullName: appointment.customerName,
+          phone: appointment.customerPhone,
+          email: appointment.customerEmail,
+        },
+        context: {
           appointmentId: appointment.id,
-          kind,
-          channel: null,
-          status: 'SKIPPED',
-          error: 'no deliverable channel',
-        })
-        continue
-      }
+          appointmentRef: appointment.referenceCode,
+          serviceName: appointment.service?.name ?? null,
+          barberName: appointment.barber?.name ?? null,
+          appointmentDate: appointment.appointmentDate,
+          appointmentTime: appointment.appointmentTime,
+        },
+        dedupeKey: `reminder:${appointment.id}:${kind}`,
+      })
+
+      const sentChannels = outcome.deliveries.filter((d) => d.status === 'SENT').map((d) => d.channel)
+      const channelLabel = sentChannels.length > 1 ? 'MULTI' : sentChannels[0] ?? null
+      const reminderStatus: 'SENT' | 'FAILED' = outcome.status === 'FAILED' ? 'FAILED' : 'SENT'
 
       await prisma.appointmentReminder.create({
         data: {
           appointmentId: appointment.id,
           kind,
-          channel,
-          status: 'SENT',
+          channel: channelLabel ?? 'NONE',
+          status: reminderStatus,
           sentAt: new Date(),
         },
       })
-      result.sent += 1
+
+      if (outcome.status === 'SENT') result.sent += 1
+      else if (outcome.status === 'FAILED') result.failed += 1
+      else result.skipped += 1
+
       result.details.push({
         appointmentId: appointment.id,
         kind,
-        channel,
-        status: 'SENT',
+        channel: channelLabel,
+        status: reminderStatus,
       })
     } catch (error) {
       result.failed += 1

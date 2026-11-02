@@ -65,6 +65,14 @@ export const env = {
     senderId: process.env.SMS_SENDER_ID ?? '',
     baseUrl: process.env.SMS_BASE_URL ?? '',
   },
+  // WhatsApp Business API delivery (Meta Cloud API). Deliberately OPTIONAL:
+  // when the phone-number-id / token are missing, WhatsApp notifications are off.
+  whatsapp: {
+    phoneNumberId: process.env.WHATSAPP_PHONE_NUMBER_ID ?? '',
+    token: process.env.WHATSAPP_TOKEN ?? '',
+    displayNumber: process.env.WHATSAPP_DISPLAY_NUMBER ?? '',
+    apiVersion: process.env.WHATSAPP_API_VERSION ?? 'v19.0',
+  },
   // Automatic appointment reminders.
   //   cronSecret            — shared secret that authorises the scheduler
   //                           endpoint (Vercel sends it as a Bearer token).
@@ -83,6 +91,16 @@ export const env = {
     timezoneOffsetMinutes: Number(process.env.REMINDER_TZ_OFFSET_MINUTES) || 60,
     // Interval (minutes) for the in-process scheduler on long-lived hosts.
     schedulerIntervalMinutes: Number(process.env.REMINDER_INTERVAL_MINUTES) || 15,
+  },
+  // At-rest encryption for provider credentials stored in notification_settings.
+  // 64-char hex (32 bytes) or a passphrase (derived with scrypt). Optional so
+  // the server still boots, but production must set it to encrypt secrets.
+  security: {
+    encryptionKey: process.env.ENCRYPTION_KEY ?? '',
+  },
+  // Guest order tracking links (signed, expiring). Default lifetime: 30 days.
+  orderTracking: {
+    linkTtlDays: Number(process.env.ORDER_TRACKING_LINK_DAYS) || 30,
   },
 } as const
 

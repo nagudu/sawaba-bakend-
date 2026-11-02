@@ -85,6 +85,35 @@ enum BarberNotificationType {
   SYSTEM
 }
 
+/// Customer-facing notification events that drive SMS / WhatsApp / Email sends.
+enum NotificationType {
+  TEST
+  WELCOME
+  BOOKING_CONFIRMATION
+  BOOKING_STATUS
+  BOOKING_REMINDER
+  BOOKING_CANCELLED
+  ORDER_CONFIRMATION
+  ORDER_STATUS
+  PAYMENT_SUCCESS
+  PAYMENT_FAILED
+  ORDER_CANCELLED
+  REFUND_UPDATE
+}
+
+enum NotificationChannel {
+  EMAIL
+  SMS
+  WHATSAPP
+}
+
+enum NotificationStatus {
+  PENDING
+  SENT
+  FAILED
+  SKIPPED
+}
+
 enum GalleryCategory {
   HAIRCUT
   FADE
@@ -159,6 +188,10 @@ model Customer {
   googleSub          String?       @unique @map("google_sub") @db.VarChar(255)
   phoneVerified      Boolean       @default(true) @map("phone_verified")
   reminderOptIn      Boolean       @default(true) @map("reminder_opt_in")
+  // Independent opt-in flags per notification channel (defaults: opted in).
+  emailOptIn          Boolean       @default(true) @map("email_opt_in")
+  smsOptIn            Boolean       @default(true) @map("sms_opt_in")
+  whatsappOptIn       Boolean       @default(true) @map("whatsapp_opt_in")
   isActive           Boolean       @default(true) @map("is_active")
   lastLoginAt        DateTime?     @map("last_login_at")
   createdAt          DateTime      @default(now()) @map("created_at")
@@ -166,6 +199,7 @@ model Customer {
 
   appointments       Appointment[]
   payments           Payment[]
+  notifications      CustomerNotification[]
 
   @@index([phone])
   @@index([email])
@@ -554,6 +588,79 @@ model BarberNotification {
   @@map("barber_notifications")
 }
 
+// ─── Customer notification centre (SMS / WhatsApp / Email history + delivery) ─
+
+model CustomerNotification {
+  id              Int                 @id @default(autoincrement())
+  customerId      Int?                @map("customer_id")
+  appointmentId  Int?                @map("appointment_id")
+  orderId         Int?                @map("order_id")
+  type            NotificationType   @default(WELCOME)
+  channel         NotificationChannel
+  title           String              @db.VarChar(160)
+  message         String              @db.Text
+  status          NotificationStatus @default(PENDING)
+  provider        String?             @db.VarChar(40)
+  providerMessageId String?          @map("provider_message_id") @db.VarChar(120)
+  error           String?             @db.VarChar(500)
+  dedupeKey       String              @unique @db.VarChar(220)
+  sentAt          DateTime?           @map("sent_at")
+  createdAt       DateTime            @default(now()) @map("created_at")
+  updatedAt       DateTime            @updatedAt @map("updated_at")
+
+  customer        Customer?           @relation(fields: [customerId], references: [id], onDelete: SetNull)
+
+  @@index([customerId, createdAt])
+  @@index([orderId])
+  @@index([appointmentId])
+  @@index([status, createdAt])
+  @@map("customer_notifications")
+}
+
+// Singleton admin configuration for the customer notification channels.
+model NotificationSetting {
+  id                     Int      @id @default(1)
+  emailEnabled          Boolean  @default(true) @map("email_enabled")
+  smsEnabled            Boolean  @default(false) @map("sms_enabled")
+  whatsappEnabled       Boolean  @default(false) @map("whatsapp_enabled")
+  smsProvider           String   @default("termii") @map("sms_provider") @db.VarChar(40)
+  smsApiKey             String?  @map("sms_api_key") @db.VarChar(1024)
+  smsSenderId           String?  @map("sms_sender_id") @db.VarChar(40)
+  smsBaseUrl            String?  @map("sms_base_url") @db.VarChar(255)
+  whatsappPhoneNumberId String?  @map("whatsapp_phone_number_id") @db.VarChar(64)
+  whatsappToken         String?  @map("whatsapp_token") @db.VarChar(1024)
+  whatsappDisplayNumber String?  @map("whatsapp_display_number") @db.VarChar(30)
+  whatsappApiVersion    String?  @map("whatsapp_api_version") @db.VarChar(16)
+  emailProvider         String   @default("resend") @map("email_provider") @db.VarChar(40)
+  emailApiKey           String?  @map("email_api_key") @db.VarChar(1024)
+  fromEmail             String?  @map("from_email") @db.VarChar(255)
+  smtpHost              String?  @map("smtp_host") @db.VarChar(255)
+  smtpPort              Int?     @map("smtp_port")
+  smtpUser              String?  @map("smtp_user") @db.VarChar(255)
+  smtpPassword          String?  @map("smtp_password") @db.VarChar(1024)
+  smtpSecure            Boolean  @default(false) @map("smtp_secure")
+  /// Per-event / per-channel enable map. null means every event uses all enabled channels.
+  eventChannels         Json?    @map("event_channels")
+  createdAt             DateTime @default(now()) @map("created_at")
+  updatedAt             DateTime @updatedAt @map("updated_at")
+}
+
+// Editable per-event / per-channel notification copy.
+model NotificationTemplate {
+  id        Int                @id @default(autoincrement())
+  name     String             @unique @db.VarChar(80)
+  event     NotificationType
+  channel  NotificationChannel
+  subject  String             @db.VarChar(200)
+  body     String             @db.Text
+  isActive Boolean             @default(true)
+  createdAt DateTime           @default(now()) @map("created_at")
+  updatedAt DateTime          @updatedAt @map("updated_at")
+
+  @@index([event, channel])
+  @@map("notification_templates")
+}
+
 model Gallery {
   id            Int               @id @default(autoincrement())
   title         String            @db.VarChar(200)
@@ -648,6 +755,14 @@ model MarketplaceSetting {
   deliveryFee            Decimal       @default(1000) @map("delivery_fee") @db.Decimal(12, 2)
   freeDeliveryThreshold  Decimal       @default(50000) @map("free_delivery_threshold") @db.Decimal(12, 2)
   deliveryLocations      String        @default("") @map("delivery_locations") @db.VarChar(500)
+  deliveryEstimateDays   Int           @default(3) @map("delivery_estimate_days")
+  storePickupEnabled     Boolean       @default(true) @map("store_pickup_enabled")
+  pickupShopName         String        @default("SAWABA Grooming Studio") @map("pickup_shop_name") @db.VarChar(150)
+  pickupAddress          String        @default("") @map("pickup_address") @db.VarChar(400)
+  pickupPhone            String        @default("") @map("pickup_phone") @db.VarChar(32)
+  pickupHours            String        @default("Mon – Sat, 9:00am – 7:00pm") @map("pickup_hours") @db.VarChar(150)
+  pickupInstructions     String        @default("") @map("pickup_instructions") @db.Text
+  pickupMapUrl           String        @default("") @map("pickup_map_url") @db.VarChar(500)
   requireProductApproval Boolean       @default(true) @map("require_product_approval")
   allowGuestCheckout     Boolean       @default(true) @map("allow_guest_checkout")
   vendorRegistrationOpen Boolean       @default(true) @map("vendor_registration_open")
@@ -840,6 +955,24 @@ model ShopOrder {
   customerEmail      String?             @map("customer_email") @db.VarChar(255)
   deliveryAddress    String              @map("delivery_address") @db.VarChar(500)
   deliveryLocation   String?             @map("delivery_location") @db.VarChar(200)
+  /// DELIVERY = courier to the customer, PICKUP = collect at the studio.
+  fulfillmentType    String              @default("DELIVERY") @map("fulfillment_type") @db.VarChar(20)
+  deliveryInstructions String?           @map("delivery_instructions") @db.VarChar(500)
+  estimatedDeliveryAt DateTime?          @map("estimated_delivery_at")
+  /// Store-pickup snapshot + collection code, captured at order time so later
+  /// settings edits never rewrite an existing order's instructions.
+  pickupCode         String?             @unique @map("pickup_code") @db.VarChar(12)
+  pickupShopName     String?             @map("pickup_shop_name") @db.VarChar(150)
+  pickupAddress      String?             @map("pickup_address") @db.VarChar(400)
+  pickupPhone        String?             @map("pickup_phone") @db.VarChar(32)
+  pickupHours        String?             @map("pickup_hours") @db.VarChar(150)
+  pickupInstructions String?             @map("pickup_instructions") @db.Text
+  pickupMapUrl       String?             @map("pickup_map_url") @db.VarChar(500)
+  pickupReadyAt      DateTime?           @map("pickup_ready_at")
+  collectedAt        DateTime?           @map("collected_at")
+  /// Paystack initialisations for this order — lets admins audit repeated
+  /// attempts without ever creating a second order.
+  paymentAttempts    Int                 @default(0) @map("payment_attempts")
   notes              String?             @db.Text
   subtotal           Decimal             @db.Decimal(12, 2)
   deliveryFee        Decimal             @default(0) @map("delivery_fee") @db.Decimal(12, 2)

@@ -1,6 +1,6 @@
 import { z } from 'zod'
 
-export const PAYMENT_METHODS = ['OPAY', 'BANK_TRANSFER', 'CASH', 'OTHER'] as const
+export const PAYMENT_METHODS = ['ONLINE', 'OPAY', 'BANK_TRANSFER', 'CASH', 'OTHER'] as const
 
 export const paymentTokenParamsSchema = z.object({
   token: z.string().trim().min(16).max(64),

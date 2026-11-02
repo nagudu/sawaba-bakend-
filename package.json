@@ -18,7 +18,9 @@
     "db:pull": "prisma db pull --force",
     "db:parity": "tsx src/scripts/prismaParity.ts",
     "postinstall": "node scripts/prepare-prisma.js && node scripts/safe-sync.js",
-    "db:field-types": "tsx src/scripts/genPrismaFieldTypes.ts"
+    "db:field-types": "tsx src/scripts/genPrismaFieldTypes.ts",
+    "notifications:test": "tsx src/scripts/notificationHarness.ts",
+    "tracking:test": "tsx src/scripts/orderTrackingHarness.ts"
   },
   "prisma": {
     "schema": "prisma/schema.prisma"

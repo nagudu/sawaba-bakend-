@@ -3,6 +3,7 @@ import { UnprocessableError, NotFoundError } from '../utils/errors'
 import { serializeAppointment } from './appointmentService'
 import { getCustomerStats } from './customerService'
 import { markPaymentCancelled } from './paymentService'
+import { notifyBookingCancelled } from './notificationEvents'
 import { AppointmentStatusValue } from '../config/appointmentStatuses'
 import type { Customer as CustomerModel } from '@prisma/client'
 
@@ -111,6 +112,9 @@ export async function getCustomerSummary(customer: CustomerModel): Promise<Recor
       preferredBarberId: customer.preferredBarberId,
       favoriteServiceId: customer.favoriteServiceId,
       reminderOptIn: customer.reminderOptIn,
+      emailOptIn: customer.emailOptIn,
+      smsOptIn: customer.smsOptIn,
+      whatsappOptIn: customer.whatsappOptIn,
       createdAt: customer.createdAt,
     },
     stats,
@@ -260,6 +264,7 @@ export async function cancelOwnAppointment(
     },
   })
   await markPaymentCancelled(appointment.id)
+  await notifyBookingCancelled(appointment, reason ?? 'Cancelled by customer')
 
   const fresh = await prisma.appointment.findUnique({
     where: { id: appointment.id },

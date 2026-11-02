@@ -6,8 +6,14 @@ import {
   createProductReview,
   createShopOrder,
   getCart,
+  getCustomerOrder,
   getOrderByReference,
+  getOrderByTrackingToken,
+  getShopPickupInfo,
   getShopProductBySlug,
+  linkGuestOrders,
+  lookupOrderForTracking,
+  trackMyOrder,
   cancelShopOrder,
   listCustomerOrders,
   listProductReviews,
@@ -24,6 +30,7 @@ import {
   verifyShopOrderPaystack,
 } from '../services/shopPaymentService'
 import { getMarketplaceSettings } from '../services/marketplaceService'
+import { getShopPaymentOptions } from '../services/paymentSettingsService'
 import { uploadImageToCloudinary } from '../utils/upload'
 import { UnprocessableError } from '../utils/errors'
 import type {
@@ -77,6 +84,11 @@ export const getShopSettingsHandler = (_req: Request, res: Response, next: NextF
     })
   })
 
+export const getShopPickupInfoHandler = (_req: Request, res: Response, next: NextFunction) =>
+  handle(next, async () => {
+    successRes(res, 'Pickup information retrieved.', await getShopPickupInfo())
+  })
+
 // ─── Cart ────────────────────────────────────────────────────────────────────
 
 export const getCartHandler = (req: Request, res: Response, next: NextFunction) =>
@@ -120,7 +132,12 @@ export const createOrderHandler = (req: Request, res: Response, next: NextFuncti
   handle(next, async () => {
     const input = req.body as CheckoutInput
     const result = await createShopOrder(input, req.customer?.id ?? null)
-    successRes(res, 'Order placed successfully.', result.order, 201)
+    successRes(
+      res,
+      'Order placed successfully. Keep your tracking link safe — it shows your order details anytime.',
+      result,
+      201,
+    )
   })
 
 export const getOrderHandler = (req: Request, res: Response, next: NextFunction) =>
@@ -128,6 +145,46 @@ export const getOrderHandler = (req: Request, res: Response, next: NextFunction)
     const { reference, phone } = req.query as { reference: string; phone: string }
     const order = await getOrderByReference(reference, phone)
     successRes(res, 'Order retrieved.', order)
+  })
+
+/** Public: order number + phone/email → a fresh secure tracking link. */
+export const lookupTrackingHandler = (req: Request, res: Response, next: NextFunction) =>
+  handle(next, async () => {
+    const { reference, contact } = req.body as { reference: string; contact: string }
+    const result = await lookupOrderForTracking(reference, contact)
+    successRes(res, 'Order found.', result)
+  })
+
+/** Public: read-only order view from a signed tracking token. */
+export const getTrackingOrderHandler = (req: Request, res: Response, next: NextFunction) =>
+  handle(next, async () => {
+    const order = await getOrderByTrackingToken(String(req.params.token))
+    successRes(res, 'Order retrieved.', order)
+  })
+
+/** Authenticated: attach past guest orders matching the account's phone/email. */
+export const linkGuestOrdersHandler = (req: Request, res: Response, next: NextFunction) =>
+  handle(next, async () => {
+    const result = await linkGuestOrders(req.customer!.id)
+    successRes(
+      res,
+      result.linked > 0
+        ? `${result.linked} previous order${result.linked === 1 ? '' : 's'} linked to your account.`
+        : 'No previous guest orders matched your phone or email.',
+      result,
+    )
+  })
+
+/** Authenticated: track one order by number, claiming it if it is a matching guest order. */
+export const trackMyOrderHandler = (req: Request, res: Response, next: NextFunction) =>
+  handle(next, async () => {
+    const { reference } = req.body as { reference: string }
+    const result = await trackMyOrder(req.customer!.id, reference)
+    successRes(
+      res,
+      result.linked ? 'Order linked to your account.' : 'Order retrieved.',
+      result,
+    )
   })
 
 export const cancelOrderHandler = (req: Request, res: Response, next: NextFunction) =>
@@ -181,6 +238,19 @@ export const listMyOrdersHandler = (req: Request, res: Response, next: NextFunct
     const perPage = Math.min(50, Number(req.query.perPage ?? 15))
     const result = await listCustomerOrders(req.customer!.id, page, perPage)
     successRes(res, 'Orders retrieved.', result)
+  })
+
+export const getMyOrderHandler = (req: Request, res: Response, next: NextFunction) =>
+  handle(next, async () => {
+    const order = await getCustomerOrder(String(req.params.reference), req.customer!.id)
+    successRes(res, 'Order retrieved.', order)
+  })
+
+/** Public: which payment methods are actually usable, with account details. */
+export const getPaymentOptionsHandler = (_req: Request, res: Response, next: NextFunction) =>
+  handle(next, async () => {
+    const options = await getShopPaymentOptions()
+    successRes(res, 'Payment options retrieved.', options)
   })
 
 // ─── Reviews ─────────────────────────────────────────────────────────────────

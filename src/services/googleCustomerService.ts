@@ -5,6 +5,7 @@ import type { Customer } from '@prisma/client'
 import { ConflictError, ForbiddenError } from '../utils/errors'
 import { ensureCustomerCode } from './customerService'
 import { signCustomerToken } from './customerAuthService'
+import { notifyWelcome } from './notificationEvents'
 import type { GoogleIdentity } from './googleAuthService'
 
 export type GoogleAuthOutcome = 'logged_in' | 'linked' | 'created'
@@ -99,7 +100,14 @@ export async function loginOrRegisterWithGoogle(
         phoneVerified: false,
       },
     })
-    return await issueSession(customer, 'created')
+    const result = await issueSession(customer, 'created')
+    await notifyWelcome({
+      id: result.customer.id,
+      fullName: result.customer.fullName,
+      phone: result.customer.phone,
+      email: result.customer.email,
+    })
+    return result
   } catch (error) {
     if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2002') {
       const raced = await prisma.customer.findFirst({ where: { googleSub: identity.sub } })

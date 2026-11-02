@@ -26,6 +26,7 @@ import { adminQrRouter, barberQrRouter } from './qr'
 import { shopRouter } from './shop'
 import { vendorPortalRouter } from './vendorPortal'
 import { marketplaceAdminRouter } from './marketplaceAdmin'
+import { notificationAdminRouter } from './notificationAdmin'
 
 export const apiRouter = Router()
 
@@ -78,4 +79,5 @@ apiRouter.use('/barber/portal', barberPortalRouter)
 // route is never shadowed by its /:id patterns.
 apiRouter.use('/cron', cronRouter)
 apiRouter.use('/admin/appointments/reminders', adminRemindersRouter)
+apiRouter.use('/admin/notifications', notificationAdminRouter)
 apiRouter.use('/admin/appointments', assignmentRouter)

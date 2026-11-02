@@ -59,8 +59,10 @@ export const checkoutSchema = z
     customerName: z.string().trim().min(2).max(150),
     customerPhone: z.string().trim().min(7).max(30),
     customerEmail: z.string().trim().email('A valid email is required for order notifications.').max(255).optional().or(z.literal('')),
-    deliveryAddress: z.string().trim().min(5).max(400),
+    fulfillmentType: z.enum(['DELIVERY', 'PICKUP']).default('DELIVERY'),
+    deliveryAddress: z.string().trim().max(400).optional().or(z.literal('')),
     deliveryLocation: z.string().trim().max(150).optional().or(z.literal('')),
+    deliveryInstructions: z.string().trim().max(500).optional().or(z.literal('')),
     notes: z.string().trim().max(1000).optional().or(z.literal('')),
     paymentMethod: z.enum(['BANK_TRANSFER', 'OPAY', 'ONLINE', 'CASH']),
     /** Pay-on-delivery is only valid when the marketplace allows it. */
@@ -69,6 +71,10 @@ export const checkoutSchema = z
   .refine((value) => Boolean(value.token) || Boolean(value.items?.length), {
     message: 'Your cart is empty.',
   })
+  .refine((value) => value.fulfillmentType === 'PICKUP' || Boolean((value.deliveryAddress ?? '').trim()), {
+    path: ['deliveryAddress'],
+    message: 'A delivery address is required for home delivery.',
+  })
 
 export const orderLookupSchema = z.object({
   reference: z.string().trim().min(3).max(30),
@@ -76,6 +82,19 @@ export const orderLookupSchema = z.object({
 })
 
 export const orderRefParamsSchema = z.object({
+  reference: z.string().trim().min(3).max(30),
+})
+
+export const trackingLookupSchema = z.object({
+  reference: z.string().trim().min(3).max(30),
+  contact: z.string().trim().min(3).max(255),
+})
+
+export const trackingTokenParamsSchema = z.object({
+  token: z.string().trim().min(20).max(4096),
+})
+
+export const trackMyOrderSchema = z.object({
   reference: z.string().trim().min(3).max(30),
 })
 

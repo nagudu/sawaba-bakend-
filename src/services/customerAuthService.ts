@@ -15,6 +15,7 @@ import {
 import { ensureCustomerCode } from './customerService'
 import { sendEmail, isValidRecipient } from './mailer'
 import { isSmsConfigured, sendSms } from './smsService'
+import { notifyWelcome } from './notificationEvents'
 import {
   generateOtp,
   hashOtp,
@@ -266,6 +267,7 @@ export async function registerCustomer(input: {
       data,
     })
     await ensureCustomerCode(updated)
+    await notifyWelcome({ id: updated.id, fullName: updated.fullName, phone: updated.phone, email: updated.email })
     return { token: signCustomerToken(updated), customer: updated }
   }
 
@@ -279,7 +281,87 @@ export async function registerCustomer(input: {
     },
   })
   await ensureCustomerCode(customer)
+  await notifyWelcome({ id: customer.id, fullName: customer.fullName, phone: customer.phone, email: customer.email })
   return { token: signCustomerToken(customer), customer }
+}
+
+export interface CheckoutAccountResult {
+  customer: Customer
+  token: string | null
+  created: boolean
+  signedIn: boolean
+}
+
+/**
+ * Gives every guest order an account so the buyer can track it later.
+ *
+ * Safety rules mirror registration, because checkout details are unverified:
+ *   - An existing PASSWORD/GOOGLE account on that number owns the order, but is
+ *     never signed in from checkout details alone — the buyer must prove
+ *     ownership with a phone code or password.
+ *   - A credential-less guest record is adopted only when the name matches.
+ *   - Otherwise a passwordless account is created; it signs in with a phone
+ *     code, which is no weaker than what checkout already proves.
+ */
+export async function resolveCheckoutAccount(input: {
+  fullName: string
+  phone: string
+  email?: string | null
+}): Promise<CheckoutAccountResult | null> {
+  let phone: string
+  try {
+    phone = normalizeNigerianPhone(input.phone)
+  } catch {
+    return null
+  }
+  if (!isPlausiblePhone(phone)) return null
+
+  const email = input.email?.trim().toLowerCase() || null
+  const wantedName = normalizeName(input.fullName)
+  const records = await prisma.customer.findMany({ where: { phone } })
+  const existingAccount = records.find((record) => Boolean(record.passwordHash || record.googleSub))
+
+  if (existingAccount) {
+    // Same number, unproven buyer: attach the order, never hand out a session.
+    if (email && !existingAccount.email) {
+      const emailOwner = await prisma.customer.findFirst({ where: { email } })
+      if (!emailOwner) {
+        const updated = await prisma.customer.update({
+          where: { id: existingAccount.id },
+          data: { email },
+        })
+        return { customer: updated, token: null, created: false, signedIn: false }
+      }
+    }
+    return { customer: existingAccount, token: null, created: false, signedIn: false }
+  }
+
+  const adoptable = records.find((record) => normalizeName(record.fullName) === wantedName) ?? null
+  const emailOwner = email ? await prisma.customer.findFirst({ where: { email } }) : null
+  const safeEmail = email && (!emailOwner || emailOwner.id === adoptable?.id) ? email : null
+
+  if (adoptable) {
+    const updated = await prisma.customer.update({
+      where: { id: adoptable.id },
+      data: {
+        lastLoginAt: new Date(),
+        ...(safeEmail && !adoptable.email ? { email: safeEmail } : {}),
+      },
+    })
+    await ensureCustomerCode(updated)
+    return { customer: updated, token: signCustomerToken(updated), created: false, signedIn: true }
+  }
+
+  const created = await prisma.customer.create({
+    data: {
+      fullName: input.fullName.trim(),
+      phone,
+      email: safeEmail,
+      lastLoginAt: new Date(),
+    },
+  })
+  await ensureCustomerCode(created)
+  return { customer: created, token: signCustomerToken(created), created: true, signedIn: true }
 }
 
 export async function loginWithPassword(
@@ -370,6 +452,9 @@ export async function updateCustomerProfile(
     preferredBarberId?: number | null
     favoriteServiceId?: number | null
     reminderOptIn?: boolean
+    emailOptIn?: boolean
+    smsOptIn?: boolean
+    whatsappOptIn?: boolean
   },
 ): Promise<Customer> {
   const customer = await prisma.customer.findUnique({ where: { id: customerId } })
@@ -385,6 +470,9 @@ export async function updateCustomerProfile(
     preferredBarberId?: number | null
     favoriteServiceId?: number | null
     reminderOptIn?: boolean
+    emailOptIn?: boolean
+    smsOptIn?: boolean
+    whatsappOptIn?: boolean
   } = {}
 
   if (patch.fullName !== undefined && patch.fullName.trim()) {
@@ -419,6 +507,9 @@ export async function updateCustomerProfile(
   if (patch.preferredBarberId !== undefined) fields.preferredBarberId = patch.preferredBarberId
   if (patch.favoriteServiceId !== undefined) fields.favoriteServiceId = patch.favoriteServiceId
   if (patch.reminderOptIn !== undefined) fields.reminderOptIn = patch.reminderOptIn
+  if (patch.emailOptIn !== undefined) fields.emailOptIn = patch.emailOptIn
+  if (patch.smsOptIn !== undefined) fields.smsOptIn = patch.smsOptIn
+  if (patch.whatsappOptIn !== undefined) fields.whatsappOptIn = patch.whatsappOptIn
 
   return prisma.customer.update({
     where: { id: customerId },
@@ -437,6 +528,9 @@ export function serializeCustomer(customer: Customer): Record<string, unknown> {
     preferredBarberId: customer.preferredBarberId,
     favoriteServiceId: customer.favoriteServiceId,
     reminderOptIn: customer.reminderOptIn,
+    emailOptIn: customer.emailOptIn,
+    smsOptIn: customer.smsOptIn,
+    whatsappOptIn: customer.whatsappOptIn,
     isActive: customer.isActive,
     phoneVerified: customer.phoneVerified,
     hasGoogleAccount: Boolean(customer.googleSub),

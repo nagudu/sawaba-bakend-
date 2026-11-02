@@ -4,6 +4,7 @@ import type { Prisma } from '@prisma/client'
 import { naira } from './marketplaceService'
 import { recordPaymentEvent, serializeOrder, type OrderView } from './shopService'
 import { isPaystackConfigured } from './paystackService'
+import { notifyOrderPaymentSuccess, notifyOrderPaymentFailed } from './notificationEvents'
 
 /**
  * Marketplace order payments.
@@ -93,7 +94,7 @@ export async function markOrderPaid(
   const order = await loadOrder(orderId)
   if (order.paymentStatus === 'PAID') return order // idempotent
 
-  return prisma.$transaction(async (tx) => {
+  const result = await prisma.$transaction(async (tx) => {
     const updated = await tx.shopOrder.update({
       where: { id: order.id },
       data: {
@@ -149,6 +150,9 @@ export async function markOrderPaid(
 
     return updated
   })
+
+  await notifyOrderPaymentSuccess(result)
+  return result
 }
 
 /** Admin verifies a transfer/OPay receipt against the bank statement. */
@@ -223,6 +227,9 @@ export async function rejectOrderPayment(
     )
     return result
   })
+
+  await notifyOrderPaymentFailed(updated, reason)
+
   return serializeOrder(updated)
 }
 
@@ -289,6 +296,11 @@ export async function initializeShopOrderPaystack(reference: string): Promise<Sh
   if (order.status === 'CANCELLED') {
     throw new UnprocessableError('This order has been cancelled.')
   }
+  if (order.paymentStatus === 'PENDING_VERIFICATION') {
+    throw new UnprocessableError(
+      'A transfer for this order is already under review. Please wait for verification instead of paying again.',
+    )
+  }
 
   const amountKobo = Math.round(Number(order.totalAmount) * 100)
   const email =
@@ -315,11 +327,26 @@ export async function initializeShopOrderPaystack(reference: string): Promise<Sh
   await prisma.$transaction(async (tx) => {
     await tx.shopOrder.update({
       where: { id: order.id },
-      data: { transactionRef: init.reference, paymentMethod: 'ONLINE' },
+      data: {
+        transactionRef: init.reference,
+        paymentMethod: 'ONLINE',
+        paymentAttempts: { increment: 1 },
+        // A previously rejected attempt may be retried; the order itself is
+        // never recreated, so a retry can not produce a duplicate order.
+        ...(order.paymentStatus === 'REJECTED'
+          ? { paymentStatus: 'UNPAID', paymentNote: null }
+          : {}),
+      },
     })
     await tx.shopPayment.update({
       where: { orderId: order.id },
-      data: { transactionRef: init.reference, paymentMethod: 'ONLINE' },
+      data: {
+        transactionRef: init.reference,
+        paymentMethod: 'ONLINE',
+        ...(order.paymentStatus === 'REJECTED'
+          ? { status: 'UNPAID', rejectionReason: null }
+          : {}),
+      },
     })
     await recordPaymentEvent(
       order.id,
@@ -329,7 +356,7 @@ export async function initializeShopOrderPaystack(reference: string): Promise<Sh
         provider: 'paystack',
         providerRef: init.reference,
         amount: Number(order.totalAmount),
-        detail: 'Paystack transaction initialized',
+        detail: `Paystack transaction initialized (attempt ${order.paymentAttempts + 1})`,
       },
       tx,
     )
@@ -362,6 +389,17 @@ export async function verifyShopOrderPaystack(
   )
 
   if (txn.status !== 'success') {
+    // Record the failure so the customer sees exactly what happened and can retry.
+    await recordPaymentEvent(order.id, {
+      type: 'PAYMENT_FAILED',
+      status: 'FAILED',
+      provider: 'paystack',
+      providerRef: paystackReference,
+      amount: Number(order.totalAmount),
+      actorRole: 'CUSTOMER',
+      detail: `Paystack reported status "${txn.status}"`,
+    })
+    await notifyOrderPaymentFailed(order, `Paystack status "${txn.status}"`)
     throw new UnprocessableError(
       `Paystack reports this payment as "${txn.status}". No payment has been recorded — please try again or use bank transfer.`,
     )

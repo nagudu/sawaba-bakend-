@@ -6,6 +6,12 @@ import { uploadImageToCloudinary, deleteImageByUrl } from '../utils/upload'
 import { getPaymentSettingsRecord, serializePaymentSetting } from './paymentSettingsService'
 import { syncEarningForAppointment } from './commissionService'
 import { AppointmentStatusValue, canTransition } from '../config/appointmentStatuses'
+import {
+  notifyAppointmentPaymentSuccess,
+  notifyAppointmentPaymentFailed,
+  notifyAppointmentRefund,
+  notifyBookingStatus,
+} from './notificationEvents'
 import type { Paged } from '../types'
 import type { SubmitPaymentInput, TrackPaymentInput } from '../validators/payment'
 
@@ -118,6 +124,13 @@ export async function applyProviderVerification(
 
   if (justPaid) {
     await notifyBarberPaymentVerified(appointmentId)
+    if (appointment) {
+      await notifyAppointmentPaymentSuccess(appointment, {
+        amount: payment.amount,
+        paymentMethod: payment.paymentMethod,
+        status: 'PAID',
+      })
+    }
   }
 
   return getPublicPaymentByAppointmentId(appointmentId)
@@ -332,6 +345,8 @@ export async function submitPayment(
     where: { id: appointment.id },
     data: { status: AppointmentStatusValue.PAYMENT_SUBMITTED },
   })
+
+  await notifyBookingStatus(appointment, 'PAYMENT_SUBMITTED')
 
   const fresh = await getPaymentByAppointmentId(appointment.id)
   return { payment: serializePayment(fresh), settings: serializePaymentSetting(settings) }
@@ -637,6 +652,14 @@ export async function rejectPayment(
     })
   }
 
+  if (appointment) {
+    await notifyAppointmentPaymentFailed(appointment, reason, {
+      amount: payment.amount,
+      paymentMethod: payment.paymentMethod,
+      status: 'REJECTED',
+    })
+  }
+
   return getPaymentById(id)
 }
 
@@ -764,6 +787,8 @@ export async function markPaymentRefunded(
       data: { status: 'PENDING', earnedAt: null },
     })
   }
+
+  await notifyAppointmentRefund(payment.appointment, Number(payment.amount), reason)
 
   return getPaymentById(id)
 }

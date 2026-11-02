@@ -6,18 +6,25 @@ import {
   createOrderHandler,
   createReviewHandler,
   getCartHandler,
+  getMyOrderHandler,
   getOrderHandler,
+  getTrackingOrderHandler,
+  getPaymentOptionsHandler,
+  getShopPickupInfoHandler,
   getProductHandler,
   getShopSettingsHandler,
   initOrderPaystackHandler,
+  linkGuestOrdersHandler,
   listBrandsHandler,
   listCategoriesHandler,
   listMyOrdersHandler,
   listProductsHandler,
   listReviewsHandler,
+  lookupTrackingHandler,
   removeCartItemHandler,
   submitReceiptHandler,
   submitTransferReferenceHandler,
+  trackMyOrderHandler,
   updateCartItemHandler,
   verifyOrderPaystackHandler,
 } from '../controllers/shopController'
@@ -38,12 +45,17 @@ import {
   productReviewSchema,
   productSlugParamsSchema,
   submitOrderReceiptSchema,
+  trackingLookupSchema,
+  trackingTokenParamsSchema,
+  trackMyOrderSchema,
 } from '../validators/shop'
 
 export const shopRouter = Router()
 
 // ─── Catalog (public) ────────────────────────────────────────────────────────
 shopRouter.get('/settings', getShopSettingsHandler)
+shopRouter.get('/pickup-info', getShopPickupInfoHandler)
+shopRouter.get('/payment-options', getPaymentOptionsHandler)
 shopRouter.get('/categories', listCategoriesHandler)
 shopRouter.get('/brands', listBrandsHandler)
 shopRouter.get('/products', validate(productListQuerySchema, 'query'), listProductsHandler)
@@ -81,8 +93,17 @@ shopRouter.post(
   validate(checkoutSchema),
   createOrderHandler,
 )
-shopRouter.get('/orders', validate(orderLookupSchema, 'query'), getOrderHandler)
+shopRouter.get('/orders', submitLimiter, validate(orderLookupSchema, 'query'), getOrderHandler)
 shopRouter.post('/orders/cancel', submitLimiter, validate(orderLookupSchema), cancelOrderHandler)
+
+// ─── Guest order tracking (secure signed link; no login / no OTP) ────────────
+shopRouter.post('/track/lookup', submitLimiter, validate(trackingLookupSchema), lookupTrackingHandler)
+shopRouter.get(
+  '/track/:token',
+  submitLimiter,
+  validate(trackingTokenParamsSchema, 'params'),
+  getTrackingOrderHandler,
+)
 
 // Payment for an existing order
 shopRouter.post(
@@ -112,3 +133,6 @@ shopRouter.post(
 
 // ─── Customer order history (auth required) ──────────────────────────────────
 shopRouter.get('/my/orders', requireCustomer, listMyOrdersHandler)
+shopRouter.get('/my/orders/:reference', requireCustomer, getMyOrderHandler)
+shopRouter.post('/my/link-guest-orders', requireCustomer, linkGuestOrdersHandler)
+shopRouter.post('/my/track', requireCustomer, validate(trackMyOrderSchema), trackMyOrderHandler)

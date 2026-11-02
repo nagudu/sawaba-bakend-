@@ -15,6 +15,7 @@ import type { Paged } from '../types'
 import { getMarketplaceSettings, naira, requireVendorRegistrationOpen } from './marketplaceService'
 import { generateReference, recordPaymentEvent } from './shopService'
 import { markOrderPaid } from './shopPaymentService'
+import { notifyOrderStatus, notifyOrderCancelled } from './notificationEvents'
 import type {
   VendorLoginInput,
   VendorProductInput,
@@ -957,8 +958,13 @@ export async function updateVendorOrderItem(
       order: {
         select: {
           referenceCode: true,
+          customerId: true,
           customerName: true,
           customerPhone: true,
+          customerEmail: true,
+          totalAmount: true,
+          fulfillmentType: true,
+          pickupCode: true,
           deliveryAddress: true,
           deliveryLocation: true,
           status: true,
@@ -968,6 +974,26 @@ export async function updateVendorOrderItem(
       },
     },
   })
+
+  if (fresh.order.status !== item.order.status) {
+    const orderRef = {
+      id: item.order.id,
+      referenceCode: fresh.order.referenceCode,
+      customerId: fresh.order.customerId,
+      customerName: fresh.order.customerName,
+      customerPhone: fresh.order.customerPhone,
+      customerEmail: fresh.order.customerEmail,
+      totalAmount: Number(fresh.order.totalAmount),
+      fulfillmentType: fresh.order.fulfillmentType,
+      pickupCode: fresh.order.pickupCode,
+      status: fresh.order.status,
+    }
+    if (fresh.order.status === 'CANCELLED') {
+      await notifyOrderCancelled(orderRef, 'All items cancelled by vendors')
+    } else {
+      await notifyOrderStatus(orderRef, fresh.order.status, fresh.trackingInfo)
+    }
+  }
 
   return {
     id: fresh.id,
