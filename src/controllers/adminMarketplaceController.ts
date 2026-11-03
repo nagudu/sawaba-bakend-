@@ -1,6 +1,6 @@
 import type { NextFunction, Request, Response } from 'express'
 import { successRes } from '../utils/response'
-import { NotFoundError, UnprocessableError } from '../utils/errors'
+import { NotFoundError } from '../utils/errors'
 import {
   adminCreateCategory,
   adminCreateProduct,
@@ -13,6 +13,7 @@ import {
   adminGetOrder,
   adminGetOverview,
   adminGetVendor,
+  adminGetVendorWallet,
   adminListCategories,
   adminListLedger,
   adminListOrders,
@@ -30,10 +31,13 @@ import {
   adminUpdateMarketplaceSettings,
   adminUpdateOrderStatus,
   adminUpdateVendorStatus,
+  adminLookupOrderPickup,
+  adminCollectOrderPickup,
 } from '../services/adminMarketplaceService'
 import { verifyOrderPayment, rejectOrderPayment } from '../services/shopPaymentService'
 import { serializeOrder } from '../services/shopService'
-import { uploadImageToCloudinary } from '../utils/upload'
+import { createProductUploadSignature } from '../utils/upload'
+import { uploadProductFiles, parseDirectMedia, parsePrimaryUrl } from '../utils/productMediaInput'
 import type { AdminProductInput, AdminProductListQuery } from '../validators/marketplaceAdmin'
 import type {
   AdminLedgerQuery,
@@ -88,22 +92,24 @@ export const listProductsHandler = (req: Request, res: Response, next: NextFunct
     successRes(res, 'Products retrieved.', result)
   })
 
-async function uploadProductImages(req: Request): Promise<string[]> {
-  const files = (req.files as Express.Multer.File[] | undefined) ?? []
-  if (files.length > 8) throw new UnprocessableError('A maximum of 8 product images is allowed.')
-  const urls: string[] = []
-  for (const file of files) {
-    const uploaded = await uploadImageToCloudinary(file.buffer, 'sawaba-products', file.mimetype)
-    urls.push(uploaded.url)
-  }
-  return urls
-}
+export const uploadSignatureHandler = (req: Request, res: Response, next: NextFunction) =>
+  handle(next, async () => {
+    const resourceType = req.body?.resourceType === 'image' ? 'image' : 'video'
+    successRes(res, 'Upload signature issued.', createProductUploadSignature(resourceType))
+  })
 
 export const createProductHandler = (req: Request, res: Response, next: NextFunction) =>
   handle(next, async () => {
+    const uploaded = await uploadProductFiles(req)
+    const body = req.body as AdminProductInput
+    const direct = parseDirectMedia(body.mediaJson ?? body.videosJson)
+    const images = [...uploaded.images, ...direct.filter((media) => media.mediaType === 'IMAGE')]
+    const videos = [...uploaded.videos, ...direct.filter((media) => media.mediaType === 'VIDEO')]
     const product = await adminCreateProduct(
-      req.body as AdminProductInput,
-      await uploadProductImages(req),
+      body,
+      images,
+      videos,
+      parsePrimaryUrl(body.primaryUrl),
       adminActor(req),
     )
     successRes(res, 'Official-store product created.', product, 201)
@@ -111,10 +117,17 @@ export const createProductHandler = (req: Request, res: Response, next: NextFunc
 
 export const updateProductHandler = (req: Request, res: Response, next: NextFunction) =>
   handle(next, async () => {
+    const uploaded = await uploadProductFiles(req)
+    const body = req.body as AdminProductInput
+    const direct = parseDirectMedia(body.mediaJson ?? body.videosJson)
+    const images = [...uploaded.images, ...direct.filter((media) => media.mediaType === 'IMAGE')]
+    const videos = [...uploaded.videos, ...direct.filter((media) => media.mediaType === 'VIDEO')]
     const product = await adminUpdateProduct(
       Number(req.params.id),
-      req.body as AdminProductInput,
-      await uploadProductImages(req),
+      body,
+      images,
+      videos,
+      parsePrimaryUrl(body.primaryUrl),
       adminActor(req),
     )
     successRes(res, 'Product updated.', product)
@@ -227,6 +240,20 @@ export const rejectOrderPaymentHandler = (req: Request, res: Response, next: Nex
     successRes(res, 'Payment rejected.', order)
   })
 
+export const lookupOrderPickupHandler = (req: Request, res: Response, next: NextFunction) =>
+  handle(next, async () => {
+    const { code } = req.body as { code: string }
+    const result = await adminLookupOrderPickup(code)
+    successRes(res, result.eligible ? 'Pickup code verified.' : result.reason ?? 'Order is not collectible.', result)
+  })
+
+export const collectOrderPickupHandler = (req: Request, res: Response, next: NextFunction) =>
+  handle(next, async () => {
+    const { code } = req.body as { code: string }
+    const order = await adminCollectOrderPickup(code, adminActor(req))
+    successRes(res, 'Order collected — pickup confirmed.', order)
+  })
+
 export const createRefundHandler = (req: Request, res: Response, next: NextFunction) =>
   handle(next, async () => {
     const body = req.body as { reason: string; amount?: number; vendorId?: number }
@@ -277,9 +304,19 @@ export const listPayoutsHandler = (req: Request, res: Response, next: NextFuncti
 
 export const processPayoutHandler = (req: Request, res: Response, next: NextFunction) =>
   handle(next, async () => {
-    const body = req.body as { action: 'APPROVED' | 'REJECTED' | 'PAID'; transactionRef?: string; note?: string }
+    const body = req.body as {
+      action: 'APPROVED' | 'PROCESSING' | 'REJECTED' | 'PAID'
+      transactionRef?: string
+      note?: string
+    }
     await adminProcessPayout(Number(req.params.id), body, adminActor(req))
-    successRes(res, `Payout ${body.action.toLowerCase()}.`, {})
+    successRes(res, `Withdrawal ${body.action.toLowerCase()}.`, {})
+  })
+
+export const getVendorWalletHandler = (req: Request, res: Response, next: NextFunction) =>
+  handle(next, async () => {
+    const result = await adminGetVendorWallet(Number(req.params.id))
+    successRes(res, 'Vendor wallet retrieved.', result)
   })
 
 // ─── Reviews ─────────────────────────────────────────────────────────────────

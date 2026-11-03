@@ -1,6 +1,7 @@
 import type { NextFunction, Request, Response } from 'express'
 import { successRes } from '../utils/response'
-import { uploadImageToCloudinary } from '../utils/upload'
+import { uploadProductFiles, parseDirectMedia, parseExistingMedia, parsePrimaryUrl } from '../utils/productMediaInput'
+import { createProductUploadSignature } from '../utils/upload'
 import { UnprocessableError } from '../utils/errors'
 import {
   changeVendorPassword,
@@ -8,6 +9,7 @@ import {
   deleteVendorProduct,
   getVendorDashboard,
   getVendorEarnings,
+  getVendorPayouts,
   listVendorOrderItems,
   listVendorProducts,
   loginVendor,
@@ -102,24 +104,22 @@ export const vendorListProductsHandler = (req: Request, res: Response, next: Nex
  *   - product fields (JSON body or form fields)
  *   - `images` — up to 8 image files (first one is the cover)
  */
+export const vendorUploadSignatureHandler = (req: Request, res: Response, next: NextFunction) =>
+  handle(next, async () => {
+    const resourceType = req.body?.resourceType === 'image' ? 'image' : 'video'
+    successRes(res, 'Upload signature issued.', createProductUploadSignature(resourceType))
+  })
+
 export const vendorCreateProductHandler = (req: Request, res: Response, next: NextFunction) =>
   handle(next, async () => {
-    const files = (req.files as Express.Multer.File[] | undefined) ?? []
-    if (files.length === 0) {
-      throw new UnprocessableError('At least one product image is required.')
-    }
-    if (files.length > 8) {
-      throw new UnprocessableError('A maximum of 8 product images is allowed.')
-    }
-
-    const uploaded: string[] = []
-    for (const file of files) {
-      const result = await uploadImageToCloudinary(file.buffer, 'sawaba-products', file.mimetype)
-      uploaded.push(result.url)
-    }
+    const uploaded = await uploadProductFiles(req)
+    const body = req.body as Record<string, string>
+    const direct = parseDirectMedia(body.mediaJson ?? body.videosJson)
+    const images = [...uploaded.images, ...direct.filter((media) => media.mediaType === 'IMAGE')]
+    const videos = [...uploaded.videos, ...direct.filter((media) => media.mediaType === 'VIDEO')]
+    const primaryUrl = parsePrimaryUrl(body.primaryUrl)
 
     // Form fields arrive as strings — parse the ones that are structured.
-    const body = req.body as Record<string, string>
     const input: VendorProductInput = {
       name: String(body.name ?? ''),
       description: String(body.description ?? ''),
@@ -148,20 +148,27 @@ export const vendorCreateProductHandler = (req: Request, res: Response, next: Ne
       throw new UnprocessableError('A valid stock quantity is required.')
     }
 
-    const product = await createVendorProduct(req.vendor!.id, req.vendor!, input, uploaded)
+    const product = await createVendorProduct(
+      req.vendor!.id,
+      req.vendor!,
+      input,
+      images,
+      videos,
+      primaryUrl,
+    )
     successRes(res, 'Product created.', product, 201)
   })
 
 export const vendorUpdateProductHandler = (req: Request, res: Response, next: NextFunction) =>
   handle(next, async () => {
-    const files = (req.files as Express.Multer.File[] | undefined) ?? []
-    const uploaded: string[] = []
-    for (const file of files.slice(0, 8)) {
-      const result = await uploadImageToCloudinary(file.buffer, 'sawaba-products', file.mimetype)
-      uploaded.push(result.url)
-    }
-
+    const uploaded = await uploadProductFiles(req)
     const body = req.body as Record<string, string>
+    const direct = parseDirectMedia(body.mediaJson ?? body.videosJson)
+    const images = [...uploaded.images, ...direct.filter((media) => media.mediaType === 'IMAGE')]
+    const videos = [...uploaded.videos, ...direct.filter((media) => media.mediaType === 'VIDEO')]
+    const existingMedia = parseExistingMedia(body.existingMedia)
+    const primaryUrl = parsePrimaryUrl(body.primaryUrl)
+
     const patch: Partial<VendorProductInput> = {}
     if (body.name !== undefined) patch.name = String(body.name)
     if (body.description !== undefined) patch.description = String(body.description)
@@ -184,7 +191,10 @@ export const vendorUpdateProductHandler = (req: Request, res: Response, next: Ne
       req.vendor!,
       Number(req.params.id),
       patch,
-      uploaded,
+      images,
+      videos,
+      existingMedia,
+      primaryUrl,
     )
     successRes(res, 'Product updated.', product)
   })
@@ -236,9 +246,19 @@ export const vendorEarningsHandler = (req: Request, res: Response, next: NextFun
     successRes(res, 'Earnings retrieved.', result)
   })
 
+export const vendorPayoutsHandler = (req: Request, res: Response, next: NextFunction) =>
+  handle(next, async () => {
+    const query = req.query as { page?: string; perPage?: string }
+    const result = await getVendorPayouts(req.vendor!.id, {
+      page: Number(query.page ?? 1),
+      perPage: Math.min(50, Number(query.perPage ?? 15)),
+    })
+    successRes(res, 'Withdrawal history retrieved.', result)
+  })
+
 export const vendorRequestPayoutHandler = (req: Request, res: Response, next: NextFunction) =>
   handle(next, async () => {
     const input = req.body as VendorPayoutRequestInput
     const result = await requestVendorPayout(req.vendor!.id, input)
-    successRes(res, result.message, {})
+    successRes(res, result.message, result)
   })

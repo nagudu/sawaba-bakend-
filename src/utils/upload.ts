@@ -64,6 +64,78 @@ export interface UploadedVideo {
   url: string
   publicId: string
   thumbnailUrl: string | null
+  /** Duration in seconds (Cloudinary only; null for local uploads). */
+  duration: number | null
+}
+
+/** Product videos: MP4/WebM only, 60 seconds maximum. */
+const PRODUCT_VIDEO_MIME_TYPES = new Set(['video/mp4', 'video/webm'])
+export const MAX_PRODUCT_VIDEO_DURATION_SECONDS = 60
+
+/**
+ * Multer for product media: up to 8 images and 4 videos in one multipart
+ * request. The byte ceiling is the video cap; controllers enforce the tighter
+ * image cap. The `images` field is fully backward compatible.
+ */
+export const productMediaUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: MAX_VIDEO_SIZE_MB * 1024 * 1024, files: 12 },
+  fileFilter: (_req, file, cb) => {
+    if (file.fieldname === 'videos') {
+      if (!PRODUCT_VIDEO_MIME_TYPES.has(file.mimetype)) {
+        return cb(new AppError('Product videos must be MP4 or WebM.', 400))
+      }
+      return cb(null, true)
+    }
+    if (file.fieldname === 'images') {
+      if (!ALLOWED_MIME_TYPES.has(file.mimetype)) {
+        return cb(new AppError('Only JPEG, PNG, WEBP, GIF and AVIF images are allowed.', 400))
+      }
+      return cb(null, true)
+    }
+    return cb(new AppError('Unexpected upload field.', 400))
+  },
+})
+
+export interface ProductUploadSignature {
+  direct: boolean
+  cloudName?: string
+  apiKey?: string
+  timestamp?: number
+  signature?: string
+  folder?: string
+  uploadUrl?: string
+  transformation?: string
+}
+
+/**
+ * Signs a direct Cloudinary upload for product media. The signature covers
+ * exactly `timestamp`, `folder` and `transformation`; the fixed folder prevents
+ * arbitrary upload destinations. Returns `direct: false` when Cloudinary is not
+ * configured so the client can fall back to server-side multipart.
+ */
+export function createProductUploadSignature(resourceType: 'image' | 'video'): ProductUploadSignature {
+  if (getUploadDriver() !== 'cloudinary' || !credentialsConfigured()) {
+    return { direct: false }
+  }
+  const folder = 'sawaba-products'
+  const timestamp = Math.floor(Date.now() / 1000)
+  const transformation =
+    resourceType === 'image' ? 'w_1200,c_limit,q_auto,f_auto' : 'w_1280,c_limit,q_auto'
+  const signature = cloudinary.utils.api_sign_request(
+    { timestamp, folder, transformation },
+    env.cloudinary.apiSecret,
+  )
+  return {
+    direct: true,
+    cloudName: env.cloudinary.cloudName,
+    apiKey: env.cloudinary.apiKey,
+    timestamp,
+    signature,
+    folder,
+    transformation,
+    uploadUrl: `https://api.cloudinary.com/v1_1/${env.cloudinary.cloudName}/${resourceType}/upload`,
+  }
 }
 
 const PLACEHOLDER_VALUES = new Set([
@@ -313,7 +385,7 @@ function saveLocalVideo(buffer: Buffer, folder: string, mimetype: string): Uploa
   fs.mkdirSync(dir, { recursive: true })
   const name = `${Date.now()}-${crypto.randomBytes(8).toString('hex')}.${ext}`
   fs.writeFileSync(path.join(dir, name), buffer)
-  return { url: `/uploads/${folder}/${name}`, publicId: `local:${folder}/${name}`, thumbnailUrl: null }
+  return { url: `/uploads/${folder}/${name}`, publicId: `local:${folder}/${name}`, thumbnailUrl: null, duration: null }
 }
 
 /** Deletes a stored video given only its stored URL — works for /uploads paths and Cloudinary URLs. */
@@ -370,7 +442,12 @@ export async function uploadVideoToCloudinary(
     })
     // Cloudinary renders a JPG from the first frame when the video URL extension is swapped.
     const poster = result.secure_url.replace(/\.[a-z0-9]+$/i, '.jpg')
-    return { url: result.secure_url, publicId: result.public_id, thumbnailUrl: poster }
+    return {
+      url: result.secure_url,
+      publicId: result.public_id,
+      thumbnailUrl: poster,
+      duration: typeof result.duration === 'number' ? Math.round(result.duration) : null,
+    }
   }
 
   // Default: local disk — works fully offline.

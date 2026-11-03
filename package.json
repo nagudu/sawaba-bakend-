@@ -20,7 +20,13 @@
     "postinstall": "node scripts/prepare-prisma.js && node scripts/safe-sync.js",
     "db:field-types": "tsx src/scripts/genPrismaFieldTypes.ts",
     "notifications:test": "tsx src/scripts/notificationHarness.ts",
-    "tracking:test": "tsx src/scripts/orderTrackingHarness.ts"
+    "tracking:test": "tsx src/scripts/orderTrackingHarness.ts",
+    "wallet:test": "tsx src/scripts/vendorWalletHarness.ts",
+    "media:backfill": "tsx src/scripts/backfillProductMedia.ts",
+    "auth:test": "tsx src/scripts/authSessionHarness.ts",
+    "media:test": "tsx src/scripts/productMediaHarness.ts",
+    "pickup:test": "tsx src/scripts/orderPickupHarness.ts",
+    "flows:test": "tsx src/scripts/orderFlowsHarness.ts"
   },
   "prisma": {
     "schema": "prisma/schema.prisma"

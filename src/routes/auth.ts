@@ -9,6 +9,7 @@ import {
   resetPasswordHandler,
 } from '../controllers/authController'
 import { requireAdmin } from '../middleware/auth'
+import { sessionHandler } from '../controllers/sessionController'
 import { validate } from '../middleware/validate'
 import {
   loginSchema,
@@ -31,6 +32,9 @@ export const authRouter = Router()
  *     summary: Admin login
  */
 authRouter.post('/login', authLimiter, validate(loginSchema), loginHandler)
+
+/** Identifies the role behind any namespace's Bearer token (admin/vendor/customer/barber). */
+authRouter.get('/session', sessionHandler)
 
 /**
  * @swagger

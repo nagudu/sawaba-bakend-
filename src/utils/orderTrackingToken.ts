@@ -54,6 +54,6 @@ export function verifyOrderTrackingToken(token: string): OrderTrackingClaims {
 /** Full frontend URL a customer can open to view the order (no login, no OTP). */
 export function buildOrderTrackingUrl(claims: OrderTrackingClaims): string {
   const token = signOrderTrackingToken(claims)
-  const base = env.clientUrl.replace(/\/+$/, '')
+  const base = env.publicAppUrl.replace(/\/+$/, '')
   return `${base}/track?token=${encodeURIComponent(token)}`
 }

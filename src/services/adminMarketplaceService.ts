@@ -7,7 +7,8 @@ import { getPagination } from '../utils/response'
 import type { Paged } from '../types'
 import { getMarketplaceSettings, naira } from './marketplaceService'
 import { recordPaymentEvent, serializeOrder, type OrderView } from './shopService'
-import { releaseMaturedEarnings } from './vendorService'
+import { computeVendorWallet, releaseMaturedEarnings } from './vendorService'
+import { reconcileProductMedia, deleteRemovedMedia, type NewMedia } from './productMediaService'
 import { notifyOrderStatus, notifyOrderCancelled, notifyRefundUpdate } from './notificationEvents'
 import type { VendorPublic } from './vendorService'
 import type {
@@ -230,13 +231,22 @@ export interface AdminProductView {
   createdAt: string
   vendor: { id: number; businessName: string; status: string; isOfficial: boolean }
   category: { id: number; name: string } | null
-  images: Array<{ id: number; url: string }>
+  images: Array<{
+    id: number
+    url: string
+    alt: string | null
+    mediaType: string
+    thumbnailUrl: string | null
+    duration: number | null
+    isPrimary: boolean
+    sortOrder: number
+  }>
 }
 
 const adminProductInclude = {
   vendor: { select: { id: true, businessName: true, status: true, isOfficial: true } },
   category: { select: { id: true, name: true } },
-  images: { orderBy: { sortOrder: 'asc' as const }, select: { id: true, url: true } },
+  images: { orderBy: { sortOrder: 'asc' as const } },
 } as const
 
 type AdminProductWithRelations = Prisma.ProductGetPayload<{ include: typeof adminProductInclude }>
@@ -356,13 +366,11 @@ async function uniqueAdminProductSlug(name: string): Promise<string> {
 
 export async function adminCreateProduct(
   input: AdminProductInput,
-  uploadedImageUrls: string[],
+  uploadedImages: NewMedia[],
+  uploadedVideos: NewMedia[],
+  primaryUrl: string | null,
   admin: { id: number; name: string },
 ): Promise<AdminProductView> {
-  const images = [...(input.existingImages ?? []), ...uploadedImageUrls]
-  if (images.length === 0) throw new UnprocessableError('Upload at least one product image.')
-  if (images.length > 8) throw new UnprocessableError('A maximum of 8 product images is allowed.')
-
   if (input.categoryId) {
     const category = await prisma.productCategory.findFirst({
       where: { id: input.categoryId, isActive: true },
@@ -373,29 +381,35 @@ export async function adminCreateProduct(
 
   const vendor = await getOfficialStore()
   const status = input.status
-  const created = await prisma.product.create({
-    data: {
-      vendorId: vendor.id,
-      categoryId: input.categoryId ?? null,
-      name: input.name,
-      slug: await uniqueAdminProductSlug(input.name),
-      sku: input.sku?.trim() || null,
-      description: input.description,
-      brand: input.brand?.trim() || null,
-      price: input.price,
-      compareAtPrice: input.compareAtPrice ?? null,
-      stock: input.stock,
-      status,
-      isActive: status === 'ACTIVE' && input.isActive,
-      approvedAt: status === 'ACTIVE' ? new Date() : null,
-      images: {
-        create: images.map((url, sortOrder) => ({
-          url,
-          sortOrder,
-          alt: `${input.name} image ${sortOrder + 1}`,
-        })),
+  const legacyImages = (input.existingImages ?? []).map((url) => ({ url, mediaType: 'IMAGE' as const }))
+
+  const created = await prisma.$transaction(async (tx) => {
+    const product = await tx.product.create({
+      data: {
+        vendorId: vendor.id,
+        categoryId: input.categoryId ?? null,
+        name: input.name,
+        slug: await uniqueAdminProductSlug(input.name),
+        sku: input.sku?.trim() || null,
+        description: input.description,
+        brand: input.brand?.trim() || null,
+        price: input.price,
+        compareAtPrice: input.compareAtPrice ?? null,
+        stock: input.stock,
+        status,
+        isActive: status === 'ACTIVE' && input.isActive,
+        approvedAt: status === 'ACTIVE' ? new Date() : null,
       },
-    },
+    })
+
+    await reconcileProductMedia(tx, product.id, {
+      productName: input.name,
+      uploadedImages: [...legacyImages, ...uploadedImages],
+      uploadedVideos,
+      primaryUrl,
+    })
+
+    return tx.product.findUniqueOrThrow({ where: { id: product.id }, include: adminProductInclude })
   })
 
   if (input.stock > 0) {
@@ -420,20 +434,19 @@ export async function adminCreateProduct(
     detail: created.name,
   })
 
-  return getAdminProductView(created.id)
+  return serializeAdminProduct(created)
 }
 
 export async function adminUpdateProduct(
   productId: number,
   input: AdminProductInput,
-  uploadedImageUrls: string[],
+  newImages: NewMedia[],
+  newVideos: NewMedia[],
+  primaryUrl: string | null,
   admin: { id: number; name: string },
 ): Promise<AdminProductView> {
   const product = await prisma.product.findUnique({ where: { id: productId } })
   if (!product) throw new NotFoundError('Product not found.')
-  const images = [...(input.existingImages ?? []), ...uploadedImageUrls]
-  if (images.length === 0) throw new UnprocessableError('A product must have at least one image.')
-  if (images.length > 8) throw new UnprocessableError('A maximum of 8 product images is allowed.')
 
   if (input.categoryId) {
     const category = await prisma.productCategory.findFirst({
@@ -444,7 +457,9 @@ export async function adminUpdateProduct(
   }
 
   const status = input.status
-  await prisma.$transaction(async (tx) => {
+  const legacyImages = (input.existingImages ?? []).map((url) => ({ url, mediaType: 'IMAGE' as const }))
+
+  const { removed } = await prisma.$transaction(async (tx) => {
     await tx.product.update({
       where: { id: productId },
       data: {
@@ -461,15 +476,15 @@ export async function adminUpdateProduct(
         approvedAt: status === 'ACTIVE' ? product.approvedAt ?? new Date() : null,
       },
     })
-    await tx.productImage.deleteMany({ where: { productId } })
-    await tx.productImage.createMany({
-      data: images.map((url, sortOrder) => ({
-        productId,
-        url,
-        sortOrder,
-        alt: `${input.name} image ${sortOrder + 1}`,
-      })),
+
+    const outcome = await reconcileProductMedia(tx, productId, {
+      productName: input.name,
+      existingMedia: input.existingMedia,
+      uploadedImages: [...legacyImages, ...newImages],
+      uploadedVideos: newVideos,
+      primaryUrl,
     })
+
     if (input.stock !== product.stock) {
       await tx.stockMovement.create({
         data: {
@@ -483,7 +498,11 @@ export async function adminUpdateProduct(
         },
       })
     }
+
+    return outcome
   })
+
+  await deleteRemovedMedia(removed)
   await audit({
     actorId: admin.id,
     actorName: admin.name,
@@ -584,7 +603,12 @@ export async function adminDeleteProduct(
 ): Promise<void> {
   const product = await prisma.product.findUnique({
     where: { id: productId },
-    select: { id: true, name: true, orderItems: { select: { id: true }, take: 1 } },
+    select: {
+      id: true,
+      name: true,
+      orderItems: { select: { id: true }, take: 1 },
+      images: { select: { url: true, mediaType: true } },
+    },
   })
   if (!product) throw new NotFoundError('Product not found.')
 
@@ -595,6 +619,12 @@ export async function adminDeleteProduct(
     })
   } else {
     await prisma.product.delete({ where: { id: productId } })
+    await deleteRemovedMedia(
+      product.images.map((image) => ({
+        url: image.url,
+        mediaType: image.mediaType === 'VIDEO' ? 'VIDEO' : 'IMAGE',
+      })),
+    )
   }
 
   await audit({
@@ -861,6 +891,76 @@ export async function adminGetOrder(reference: string): Promise<AdminOrderRow & 
   }
 }
 
+/** Order statuses from which a pickup order may be marked COLLECTED. */
+const PICKUP_COLLECTIBLE_STATUSES = new Set([
+  'PAYMENT_CONFIRMED',
+  'PROCESSING',
+  'READY_FOR_DISPATCH',
+  'READY_FOR_PICKUP',
+])
+
+interface PickupEligibilityOrder {
+  fulfillmentType: string
+  status: string
+  collectedAt: Date | null
+  paymentStatus: string
+}
+
+function pickupBlockReason(order: PickupEligibilityOrder): string | null {
+  if (order.fulfillmentType !== 'PICKUP') return 'This order is not a store-pickup order.'
+  if (order.collectedAt || order.status === 'COLLECTED') return 'This order has already been collected.'
+  if (['CANCELLED', 'REFUNDED', 'RETURNED'].includes(order.status)) {
+    return `This order is ${order.status.toLowerCase()}.`
+  }
+  if (order.paymentStatus !== 'PAID') return 'Payment has not been verified for this order yet.'
+  if (!PICKUP_COLLECTIBLE_STATUSES.has(order.status)) {
+    return `This order is not ready for collection (status: ${order.status.replace(/_/g, ' ').toLowerCase()}).`
+  }
+  return null
+}
+
+async function findOrderByPickupCode(code: string) {
+  const normalized = code.trim().toUpperCase()
+  if (!normalized) throw new UnprocessableError('Enter the customer pickup code.')
+  const order = await prisma.shopOrder.findUnique({
+    where: { pickupCode: normalized },
+    select: {
+      referenceCode: true,
+      fulfillmentType: true,
+      status: true,
+      collectedAt: true,
+      paymentStatus: true,
+    },
+  })
+  if (!order) throw new NotFoundError('No order matches that pickup code.')
+  return order
+}
+
+export interface OrderPickupLookup {
+  order: Awaited<ReturnType<typeof adminGetOrder>>
+  eligible: boolean
+  reason: string | null
+}
+
+/** Staff preview: resolve an order by its pickup code without collecting it. */
+export async function adminLookupOrderPickup(code: string): Promise<OrderPickupLookup> {
+  const order = await findOrderByPickupCode(code)
+  const reason = pickupBlockReason(order)
+  const detail = await adminGetOrder(order.referenceCode)
+  return { order: detail, eligible: reason === null, reason }
+}
+
+/** Staff action: verify order + payment and mark it collected (guards duplicates). */
+export async function adminCollectOrderPickup(
+  code: string,
+  admin: { id: number; name: string },
+): Promise<AdminOrderRow> {
+  const order = await findOrderByPickupCode(code)
+  const reason = pickupBlockReason(order)
+  if (reason) throw new UnprocessableError(reason)
+  return adminUpdateOrderStatus(order.referenceCode, { status: 'COLLECTED' }, admin)
+}
+
 export async function adminUpdateOrderStatus(
   reference: string,
   input: { status: string; reason?: string },
@@ -874,21 +974,31 @@ export async function adminUpdateOrderStatus(
   if (order.paymentStatus !== 'PAID' && !['CANCELLED'].includes(input.status)) {
     throw new UnprocessableError('Only paid orders can move through fulfillment.')
   }
-  const allowedTransitions: Record<string, string[]> = {
-    PAYMENT_CONFIRMED: [
-      'PROCESSING',
-      'READY_FOR_DISPATCH',
-      'READY_FOR_PICKUP',
-      'SHIPPED',
-      'DELIVERED',
-      'COLLECTED',
-      'CANCELLED',
-    ],
-    PROCESSING: ['READY_FOR_DISPATCH', 'READY_FOR_PICKUP', 'SHIPPED', 'DELIVERED', 'COLLECTED', 'CANCELLED'],
-    READY_FOR_DISPATCH: ['READY_FOR_PICKUP', 'SHIPPED', 'DELIVERED', 'CANCELLED'],
-    READY_FOR_PICKUP: ['COLLECTED', 'CANCELLED'],
-    SHIPPED: ['DELIVERED', 'CANCELLED'],
+  // Delivery and pickup have SEPARATE fulfilment flows — an order may only move
+  // through statuses that belong to its own fulfilment type.
+  const isPickup = order.fulfillmentType === 'PICKUP'
+  const DELIVERY_ONLY = ['READY_FOR_DISPATCH', 'OUT_FOR_DELIVERY', 'SHIPPED', 'DELIVERED']
+  const PICKUP_ONLY = ['READY_FOR_PICKUP', 'COLLECTED']
+  if (isPickup && DELIVERY_ONLY.includes(input.status)) {
+    throw new UnprocessableError('This is a shop-pickup order — delivery statuses do not apply.')
   }
+  if (!isPickup && PICKUP_ONLY.includes(input.status)) {
+    throw new UnprocessableError('This is a home-delivery order — pickup statuses do not apply.')
+  }
+
+  const allowedTransitions: Record<string, string[]> = isPickup
+    ? {
+        PAYMENT_CONFIRMED: ['PROCESSING', 'READY_FOR_PICKUP', 'CANCELLED'],
+        PROCESSING: ['READY_FOR_PICKUP', 'CANCELLED'],
+        READY_FOR_PICKUP: ['COLLECTED', 'CANCELLED'],
+      }
+    : {
+        PAYMENT_CONFIRMED: ['PROCESSING', 'READY_FOR_DISPATCH', 'OUT_FOR_DELIVERY', 'SHIPPED', 'CANCELLED'],
+        PROCESSING: ['READY_FOR_DISPATCH', 'OUT_FOR_DELIVERY', 'SHIPPED', 'CANCELLED'],
+        READY_FOR_DISPATCH: ['OUT_FOR_DELIVERY', 'SHIPPED', 'CANCELLED'],
+        OUT_FOR_DELIVERY: ['DELIVERED', 'CANCELLED'],
+        SHIPPED: ['OUT_FOR_DELIVERY', 'DELIVERED', 'CANCELLED'],
+      }
   if (input.status !== 'CANCELLED' && !allowedTransitions[order.status]?.includes(input.status)) {
     throw new UnprocessableError(`Cannot move this order from ${order.status} to ${input.status}.`)
   }
@@ -898,6 +1008,7 @@ export async function adminUpdateOrderStatus(
 
   const updated = await prisma.$transaction(async (tx) => {
     const data: Prisma.ShopOrderUpdateInput = { status: input.status as never }
+    if (input.status === 'OUT_FOR_DELIVERY') data.outForDeliveryAt = new Date()
     if (input.status === 'DELIVERED') data.deliveredAt = new Date()
     if (input.status === 'READY_FOR_PICKUP') data.pickupReadyAt = new Date()
     if (input.status === 'COLLECTED') {
@@ -990,7 +1101,7 @@ export async function adminUpdateOrderStatus(
       })
     }
 
-    if (input.status === 'DELIVERED') {
+    if (input.status === 'DELIVERED' || input.status === 'COLLECTED') {
       for (const item of result.items) {
         await tx.shopOrderItem.update({
           where: { id: item.id },
@@ -1008,7 +1119,7 @@ export async function adminUpdateOrderStatus(
         }
       }
     }
-    if (input.status === 'SHIPPED') {
+    if (input.status === 'SHIPPED' || input.status === 'OUT_FOR_DELIVERY') {
       await tx.shopOrderItem.updateMany({
         where: { orderId: order.id, status: { notIn: ['CANCELLED', 'RETURNED', 'DELIVERED'] } },
         data: { status: 'SHIPPED', shippedAt: new Date() },
@@ -1338,7 +1449,20 @@ export async function adminListPayouts(query: {
   const [rows, total] = await Promise.all([
     prisma.vendorPayout.findMany({
       where,
-      include: { vendor: { select: { id: true, businessName: true, bankName: true, bankAccountName: true, bankAccountNumber: true } } },
+      include: {
+        vendor: {
+          select: {
+            id: true,
+            businessName: true,
+            contactName: true,
+            email: true,
+            phone: true,
+            bankName: true,
+            bankAccountName: true,
+            bankAccountNumber: true,
+          },
+        },
+      },
       orderBy: { requestedAt: 'desc' },
       skip: offset,
       take: limit,
@@ -1352,12 +1476,16 @@ export async function adminListPayouts(query: {
       referenceCode: row.referenceCode,
       vendorId: row.vendorId,
       vendorName: row.vendor.businessName,
+      vendorContactName: row.vendor.contactName,
+      vendorEmail: row.vendor.email,
+      vendorPhone: row.vendor.phone,
       bankName: row.vendor.bankName,
       accountName: row.vendor.bankAccountName,
       accountNumber: row.vendor.bankAccountNumber,
       amount: Number(row.amount),
       status: row.status,
       note: row.note,
+      adminNote: row.adminNote,
       transactionRef: row.transactionRef,
       requestedAt: row.requestedAt.toISOString(),
       processedAt: row.processedAt?.toISOString() ?? null,
@@ -1369,15 +1497,15 @@ export async function adminListPayouts(query: {
 }
 
 /**
- * Processes a payout request:
- *   APPROVED → the claimed ledger entries stay reserved (not yet paid).
- *   PAID     → entries become PAID (settled); must follow APPROVED.
- *   REJECTED → claimed entries are released back to the available balance.
- * Claimed-entry uniqueness prevents any earning funding two payouts.
+ * Processes a withdrawal request:
+ *   APPROVED / PROCESSING → the claimed ledger entries stay reserved.
+ *   PAID                  → entries become PAID; requires a transfer reference.
+ *   REJECTED              → claimed entries are released back to available.
+ * The claimed-entry link makes it impossible for one earning to fund two payouts.
  */
 export async function adminProcessPayout(
   payoutId: number,
-  input: { action: 'APPROVED' | 'REJECTED' | 'PAID'; transactionRef?: string; note?: string },
+  input: { action: 'APPROVED' | 'PROCESSING' | 'REJECTED' | 'PAID'; transactionRef?: string; note?: string },
   admin: { id: number; name: string },
 ): Promise<void> {
   const payout = await prisma.vendorPayout.findUnique({
@@ -1386,19 +1514,28 @@ export async function adminProcessPayout(
   })
   if (!payout) throw new NotFoundError('Payout not found.')
 
+  const adminNote = input.note?.trim() || null
+  const transactionRef = input.transactionRef?.trim() ?? ''
+
   const transitions: Record<string, string[]> = {
     REQUESTED: ['APPROVED', 'REJECTED'],
-    APPROVED: ['PAID', 'REJECTED'],
+    APPROVED: ['PROCESSING', 'PAID', 'REJECTED'],
+    PROCESSING: ['PAID', 'REJECTED'],
     PAID: [],
     REJECTED: [],
   }
   if (!transitions[payout.status]?.includes(input.action)) {
-    throw new UnprocessableError(`A ${payout.status.toLowerCase()} payout cannot become ${input.action.toLowerCase()}.`)
+    throw new UnprocessableError(
+      `A ${payout.status.toLowerCase()} withdrawal cannot become ${input.action.toLowerCase()}.`,
+    )
+  }
+  if (input.action === 'PAID' && !transactionRef) {
+    throw new UnprocessableError('A bank transfer reference is required to mark a withdrawal as paid.')
   }
 
   await prisma.$transaction(async (tx) => {
     if (input.action === 'REJECTED') {
-      // Release the claim so the balance returns to the vendor.
+      // Release the claim so the funds return to the vendor's available balance.
       await tx.commissionLedger.updateMany({
         where: { payoutId: payout.id, settlementStatus: 'RELEASED' },
         data: { payoutId: null },
@@ -1407,24 +1544,27 @@ export async function adminProcessPayout(
         where: { id: payout.id },
         data: {
           status: 'REJECTED',
-          note: input.note?.trim() || payout.note,
+          adminNote,
           processedAt: new Date(),
           processedByAdminId: admin.id,
         },
       })
-    } else if (input.action === 'APPROVED') {
+    } else if (input.action === 'APPROVED' || input.action === 'PROCESSING') {
       await tx.vendorPayout.update({
         where: { id: payout.id },
-        data: { status: 'APPROVED', processedByAdminId: admin.id, processedAt: new Date() },
+        data: {
+          status: input.action,
+          adminNote: adminNote ?? payout.adminNote,
+          processedByAdminId: admin.id,
+          processedAt: new Date(),
+        },
       })
     } else {
-      const claimed = await tx.commissionLedger.findMany({
-        where: { payoutId: payout.id },
-      })
+      const claimed = await tx.commissionLedger.findMany({ where: { payoutId: payout.id } })
       const claimedTotal = claimed.reduce((sum, row) => sum + Number(row.vendorNet), 0)
-      if (Math.abs(claimedTotal - Number(payout.amount)) > 1) {
+      if (Math.abs(claimedTotal - Number(payout.amount)) > 0.01) {
         throw new UnprocessableError(
-          `Payout total mismatch (entries sum ${naira(claimedTotal)} vs requested ${naira(Number(payout.amount))}). Please reject and ask the vendor to re-request.`,
+          `Withdrawal total mismatch (entries sum ${naira(claimedTotal)} vs payout ${naira(Number(payout.amount))}). Reject it and ask the vendor to re-request.`,
         )
       }
       await tx.commissionLedger.updateMany({
@@ -1435,7 +1575,8 @@ export async function adminProcessPayout(
         where: { id: payout.id },
         data: {
           status: 'PAID',
-          transactionRef: input.transactionRef?.trim() || payout.transactionRef,
+          transactionRef,
+          adminNote: adminNote ?? payout.adminNote,
           processedAt: new Date(),
           processedByAdminId: admin.id,
         },
@@ -1446,13 +1587,15 @@ export async function adminProcessPayout(
       data: {
         vendorId: payout.vendorId,
         type: 'PAYOUT',
-        title: `Payout ${input.action.toLowerCase()}`,
+        title: `Withdrawal ${input.action.toLowerCase()}`,
         message:
           input.action === 'PAID'
-            ? `Your payout of ${naira(Number(payout.amount))} (${payout.referenceCode}) has been paid.`
+            ? `Your withdrawal of ${naira(Number(payout.amount))} (${payout.referenceCode}) has been paid. Transfer reference: ${transactionRef}.`
             : input.action === 'APPROVED'
-              ? `Your payout of ${naira(Number(payout.amount))} (${payout.referenceCode}) has been approved and is being processed.`
-              : `Your payout request ${payout.referenceCode} was rejected.${input.note ? ` Note: ${input.note}` : ''} The funds are back in your available balance.`,
+              ? `Your withdrawal of ${naira(Number(payout.amount))} (${payout.referenceCode}) has been approved.`
+              : input.action === 'PROCESSING'
+                ? `Your withdrawal of ${naira(Number(payout.amount))} (${payout.referenceCode}) is being processed.`
+                : `Your withdrawal request ${payout.referenceCode} was rejected.${adminNote ? ` Note: ${adminNote}` : ''} The funds are back in your available balance.`,
       },
     })
   })
@@ -1463,8 +1606,64 @@ export async function adminProcessPayout(
     action: `PAYOUT_${input.action}`,
     entityType: 'VendorPayout',
     entityId: payout.id,
-    detail: `${payout.vendor.businessName}: ${naira(Number(payout.amount))}`,
+    detail: `${payout.vendor.businessName}: ${naira(Number(payout.amount))}${transactionRef ? ` · ${transactionRef}` : ''}`,
   })
+}
+
+/** Admin view of one vendor's wallet balances, ledger and withdrawals. */
+export async function adminGetVendorWallet(vendorId: number) {
+  const vendor = await prisma.vendor.findUnique({ where: { id: vendorId } })
+  if (!vendor) throw new NotFoundError('Vendor not found.')
+  await releaseMaturedEarnings()
+
+  const [balances, ledger, payouts] = await Promise.all([
+    computeVendorWallet(vendorId),
+    prisma.commissionLedger.findMany({
+      where: { vendorId },
+      include: {
+        order: { select: { referenceCode: true } },
+        product: { select: { name: true } },
+      },
+      orderBy: { createdAt: 'desc' },
+      take: 100,
+    }),
+    prisma.vendorPayout.findMany({
+      where: { vendorId },
+      orderBy: { requestedAt: 'desc' },
+      take: 100,
+    }),
+  ])
+
+  return {
+    vendor: serializeVendorForAdmin(vendor),
+    balances,
+    ledger: ledger.map((row) => ({
+      id: row.id,
+      orderReference: row.order.referenceCode,
+      productName: row.product.name,
+      quantity: row.quantity,
+      salePrice: Number(row.salePrice),
+      commissionRate: Number(row.commissionRate),
+      commissionAmount: Number(row.commissionAmount),
+      vendorNet: Number(row.vendorNet),
+      reversedAmount: Number(row.reversedAmount),
+      settlementStatus: row.settlementStatus,
+      releasedAt: row.releasedAt?.toISOString() ?? null,
+      paidAt: row.paidAt?.toISOString() ?? null,
+      createdAt: row.createdAt.toISOString(),
+    })),
+    payouts: payouts.map((row) => ({
+      id: row.id,
+      referenceCode: row.referenceCode,
+      amount: Number(row.amount),
+      status: row.status,
+      note: row.note,
+      adminNote: row.adminNote,
+      transactionRef: row.transactionRef,
+      requestedAt: row.requestedAt.toISOString(),
+      processedAt: row.processedAt?.toISOString() ?? null,
+    })),
+  }
 }
 
 // ─── Reviews moderation ──────────────────────────────────────────────────────

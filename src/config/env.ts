@@ -24,6 +24,16 @@ function parseCloudinaryUrl(urlStr?: string): { cloudName?: string; apiKey?: str
 
 const parsedCloudinary = parseCloudinaryUrl(process.env.CLOUDINARY_URL)
 
+const rawClientUrl = process.env.CLIENT_URL ?? 'http://localhost:5173'
+const clientUrlIsLocal = /localhost|127\.0\.0\.1/i.test(rawClientUrl)
+// Public URL used in customer-facing links (order tracking links, emails). A
+// localhost CLIENT_URL is never emitted to customers (those links would be
+// unusable outside the developer machine), so fall back to the canonical
+// production domain unless PUBLIC_APP_URL explicitly overrides it.
+const publicAppUrl =
+  process.env.PUBLIC_APP_URL?.trim() ||
+  (clientUrlIsLocal ? 'https://sawabagroomingstudio.com.ng' : rawClientUrl)
+
 export const env = {
   nodeEnv: process.env.NODE_ENV ?? 'development',
   // `Number(x) || 5001` guards against inherited junk like PORT='' or PORT=0
@@ -33,6 +43,8 @@ export const env = {
   jwtSecret: required('JWT_SECRET'),
   jwtExpiresIn: process.env.JWT_EXPIRES_IN ?? '1d',
   clientUrl: process.env.CLIENT_URL ?? 'http://localhost:5173',
+  /** Canonical public frontend origin for customer-facing links (never localhost in prod). */
+  publicAppUrl,
   // Extra allowed browser origins (comma-separated) — e.g. the deployed
   // frontend plus preview domains. Keep it minimal in production.
   extraClientOrigins: (process.env.EXTRA_CLIENT_ORIGINS ?? '')

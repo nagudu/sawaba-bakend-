@@ -872,11 +872,20 @@ model ProductImage {
   productId Int      @map("product_id")
   url       String   @db.VarChar(500)
   alt       String?  @db.VarChar(200)
+  /// IMAGE | VIDEO — existing rows are images.
+  mediaType String   @default("IMAGE") @map("media_type") @db.VarChar(10)
+  /// Cloudinary public id (or local:<path>) for cleanup on delete/replace.
+  publicId  String?  @map("public_id") @db.VarChar(300)
+  /// Poster image for videos (first frame).
+  thumbnailUrl String? @map("thumbnail_url") @db.VarChar(500)
+  /// Video duration in seconds.
+  duration  Int?
+  isPrimary Boolean  @default(false) @map("is_primary")
   sortOrder Int      @default(0) @map("sort_order")
 
   product   Product  @relation(fields: [productId], references: [id], onDelete: Cascade)
-
   @@index([productId])
+  @@index([productId, sortOrder])
   @@map("product_images")
 }
 
@@ -959,6 +968,8 @@ model ShopOrder {
   fulfillmentType    String              @default("DELIVERY") @map("fulfillment_type") @db.VarChar(20)
   deliveryInstructions String?           @map("delivery_instructions") @db.VarChar(500)
   estimatedDeliveryAt DateTime?          @map("estimated_delivery_at")
+  /// Set when a delivery order goes out for delivery (delivery flow only).
+  outForDeliveryAt   DateTime?           @map("out_for_delivery_at")
   /// Store-pickup snapshot + collection code, captured at order time so later
   /// settings edits never rewrite an existing order's instructions.
   pickupCode         String?             @unique @map("pickup_code") @db.VarChar(12)
@@ -1142,7 +1153,8 @@ model VendorPayout {
   amount             Decimal           @db.Decimal(12, 2)
   status             String            @default("REQUESTED") @db.VarChar(20)
   note               String?           @db.VarChar(500)
-  transactionRef     String?            @map("transaction_ref")
+  adminNote          String?           @map("admin_note") @db.VarChar(500)
+  transactionRef     String?           @map("transaction_ref")
   processedByAdminId Int?               @map("processed_by_admin_id")
   requestedAt        DateTime           @default(now()) @map("requested_at")
   processedAt        DateTime?          @map("processed_at")

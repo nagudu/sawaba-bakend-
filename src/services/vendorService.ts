@@ -1,6 +1,6 @@
 import bcrypt from 'bcryptjs'
 import jwt from 'jsonwebtoken'
-import type { Prisma, Vendor } from '@prisma/client'
+import type { Prisma, Vendor, VendorPayout } from '@prisma/client'
 import { env } from '../config/env'
 import { prisma } from '../config/database'
 import {
@@ -16,6 +16,12 @@ import { getMarketplaceSettings, naira, requireVendorRegistrationOpen } from './
 import { generateReference, recordPaymentEvent } from './shopService'
 import { markOrderPaid } from './shopPaymentService'
 import { notifyOrderStatus, notifyOrderCancelled } from './notificationEvents'
+import {
+  reconcileProductMedia,
+  deleteRemovedMedia,
+  type NewMedia,
+  type ExistingMediaSelection,
+} from './productMediaService'
 import type {
   VendorLoginInput,
   VendorProductInput,
@@ -103,9 +109,9 @@ export function serializeVendor(vendor: Vendor, includePrivate = false): VendorP
     logoUrl: vendor.logoUrl,
     address: vendor.address,
     location: vendor.location,
-    bankName: vendor.bankName,
-    bankAccountName: vendor.bankAccountName,
-    bankAccountNumber: vendor.bankAccountNumber,
+    bankName: includePrivate ? vendor.bankName : null,
+    bankAccountName: includePrivate ? vendor.bankAccountName : null,
+    bankAccountNumber: includePrivate ? vendor.bankAccountNumber : null,
     businessInfo: vendor.businessInfo,
     status: vendor.status,
     statusReason: vendor.statusReason,
@@ -113,7 +119,6 @@ export function serializeVendor(vendor: Vendor, includePrivate = false): VendorP
     rating: Number(vendor.rating),
     approvedAt: vendor.approvedAt?.toISOString() ?? null,
     createdAt: vendor.createdAt.toISOString(),
-    ...(includePrivate ? {} : {}),
   }
 }
 
@@ -257,9 +262,12 @@ export interface VendorDashboard {
   earnings: {
     totalSales: number
     totalCommission: number
+    totalEarnings: number
     pending: number
     available: number
+    locked: number
     paid: number
+    totalWithdrawn: number
   }
   recentOrders: Array<{
     itemId: number
@@ -282,7 +290,8 @@ export interface VendorDashboard {
 }
 
 export async function getVendorDashboard(vendorId: number): Promise<VendorDashboard> {
-  const [productCounts, itemGroups, ledgerAgg, recentItems, notifications] = await Promise.all([
+  await releaseMaturedEarnings()
+  const [productCounts, itemGroups, recentItems, notifications, wallet] = await Promise.all([
     prisma.product.groupBy({
       by: ['status'],
       where: { vendorId },
@@ -292,11 +301,6 @@ export async function getVendorDashboard(vendorId: number): Promise<VendorDashbo
       by: ['status'],
       where: { vendorId },
       _count: { _all: true },
-    }),
-    prisma.commissionLedger.groupBy({
-      by: ['settlementStatus'],
-      where: { vendorId },
-      _sum: { vendorNet: true, commissionAmount: true },
     }),
     prisma.shopOrderItem.findMany({
       where: { vendorId },
@@ -309,6 +313,7 @@ export async function getVendorDashboard(vendorId: number): Promise<VendorDashbo
       orderBy: { createdAt: 'desc' },
       take: 8,
     }),
+    computeVendorWallet(vendorId),
   ])
 
   const totalProducts = productCounts.reduce((sum, row) => sum + row._count._all, 0)
@@ -316,9 +321,6 @@ export async function getVendorDashboard(vendorId: number): Promise<VendorDashbo
 
   const statusCount = (rows: Array<{ status: string; _count: { _all: number } }>, status: string) =>
     rows.find((row) => row.status === status)?._count._all ?? 0
-
-  const sumFor = (status: string) =>
-    Number(ledgerAgg.find((row) => row.settlementStatus === status)?._sum.vendorNet ?? 0)
 
   return {
     products: {
@@ -335,23 +337,14 @@ export async function getVendorDashboard(vendorId: number): Promise<VendorDashbo
       returned: statusCount(itemGroups as never, 'RETURNED'),
     },
     earnings: {
-      totalSales: round2(
-        ledgerAgg.reduce(
-          (sum, row) =>
-            sum +
-            (row.settlementStatus === 'REVERSED' ? 0 : Number(row._sum.vendorNet ?? 0) + Number(row._sum.commissionAmount ?? 0)),
-          0,
-        ),
-      ),
-      totalCommission: round2(
-        ledgerAgg.reduce(
-          (sum, row) => sum + (row.settlementStatus === 'REVERSED' ? 0 : Number(row._sum.commissionAmount ?? 0)),
-          0,
-        ),
-      ),
-      pending: round2(sumFor('PENDING')),
-      available: round2(sumFor('RELEASED')),
-      paid: round2(sumFor('PAID')),
+      totalSales: wallet.totalSales,
+      totalCommission: wallet.totalCommission,
+      totalEarnings: wallet.totalEarnings,
+      pending: wallet.pending,
+      available: wallet.available,
+      locked: wallet.locked,
+      paid: wallet.paid,
+      totalWithdrawn: wallet.totalWithdrawn,
     },
     recentOrders: recentItems.map((item) => ({
       itemId: item.id,
@@ -412,7 +405,16 @@ export interface VendorProductView {
   salesCount: number
   rejectionReason: string | null
   category: { id: number; name: string } | null
-  images: Array<{ id: number; url: string; alt: string | null }>
+  images: Array<{
+    id: number
+    url: string
+    alt: string | null
+    mediaType: string
+    thumbnailUrl: string | null
+    duration: number | null
+    isPrimary: boolean
+    sortOrder: number
+  }>
   variations: Array<{ id: number; name: string; value: string; priceDelta: number; stock: number | null }>
   createdAt: string
   updatedAt: string
@@ -444,7 +446,16 @@ export function serializeVendorProduct(product: VendorProductWithRelations): Ven
     salesCount: product.salesCount,
     rejectionReason: product.rejectionReason,
     category: product.category,
-    images: product.images.map((image) => ({ id: image.id, url: image.url, alt: image.alt })),
+    images: product.images.map((image) => ({
+      id: image.id,
+      url: image.url,
+      alt: image.alt,
+      mediaType: image.mediaType,
+      thumbnailUrl: image.thumbnailUrl,
+      duration: image.duration,
+      isPrimary: image.isPrimary,
+      sortOrder: image.sortOrder,
+    })),
     variations: product.variations.map((variation) => ({
       id: variation.id,
       name: variation.name,
@@ -486,7 +497,9 @@ export async function createVendorProduct(
   vendorId: number,
   vendor: Vendor,
   input: VendorProductInput,
-  imageUrls: string[] = [],
+  uploadedImages: NewMedia[] = [],
+  videoMedia: NewMedia[] = [],
+  primaryUrl: string | null = null,
 ): Promise<VendorProductView> {
   assertVendorSellable(vendor)
   const settings = await getMarketplaceSettings()
@@ -498,57 +511,60 @@ export async function createVendorProduct(
     if (!category) throw new UnprocessableError('Selected category is unavailable.')
   }
 
-  // Parse the optional JSON image list (URLs already uploaded by the frontend).
-  let images = imageUrls.filter(Boolean)
+  // Legacy: an optional JSON image list of URLs already uploaded.
+  let images: NewMedia[] = uploadedImages.filter((media) => Boolean(media.url))
   if (!images.length && input.imagesJson) {
     try {
       const parsed = JSON.parse(input.imagesJson) as unknown
       if (Array.isArray(parsed)) {
-        images = parsed.filter((url): url is string => typeof url === 'string' && url.length <= 500)
+        images = parsed
+          .filter((url): url is string => typeof url === 'string' && url.length <= 500)
+          .map((url) => ({ url, mediaType: 'IMAGE' as const }))
       }
     } catch {
       throw new UnprocessableError('Invalid image list.')
     }
-  }
-  if (images.length === 0) {
-    throw new UnprocessableError('At least one product image is required.')
-  }
-  if (images.length > 8) {
-    throw new UnprocessableError('A maximum of 8 product images is allowed.')
   }
 
   const status: Prisma.EnumProductStatusFilter['equals'] = settings.requireProductApproval
     ? ((input.status === 'DRAFT' ? 'DRAFT' : 'PENDING_REVIEW') as never)
     : ('ACTIVE' as never)
 
-  const product = await prisma.product.create({
-    data: {
-      vendorId,
-      categoryId: input.categoryId ?? null,
-      name: input.name,
-      slug: await uniqueProductSlug(input.name),
-      description: input.description,
-      brand: input.brand?.trim() || null,
-      price: input.price,
-      compareAtPrice: input.compareAtPrice ? Number(input.compareAtPrice) : null,
-      stock: input.stock,
-      lowStockThreshold: input.lowStockThreshold ?? 5,
-      status,
-      approvedAt: status === 'ACTIVE' ? new Date() : null,
-      images: {
-        create: images.map((url, index) => ({ url, sortOrder: index, alt: `${input.name} image ${index + 1}` })),
+  const product = await prisma.$transaction(async (tx) => {
+    const created = await tx.product.create({
+      data: {
+        vendorId,
+        categoryId: input.categoryId ?? null,
+        name: input.name,
+        slug: await uniqueProductSlug(input.name),
+        description: input.description,
+        brand: input.brand?.trim() || null,
+        price: input.price,
+        compareAtPrice: input.compareAtPrice ? Number(input.compareAtPrice) : null,
+        stock: input.stock,
+        lowStockThreshold: input.lowStockThreshold ?? 5,
+        status,
+        approvedAt: status === 'ACTIVE' ? new Date() : null,
+        variations: input.variations?.length
+          ? {
+              create: input.variations.map((variation) => ({
+                name: variation.name,
+                value: variation.value,
+                priceDelta: variation.priceDelta ?? 0,
+              })),
+            }
+          : undefined,
       },
-      variations: input.variations?.length
-        ? {
-            create: input.variations.map((variation) => ({
-              name: variation.name,
-              value: variation.value,
-              priceDelta: variation.priceDelta ?? 0,
-            })),
-          }
-        : undefined,
-    },
-    include: vendorProductInclude,
+    })
+
+    await reconcileProductMedia(tx, created.id, {
+      productName: input.name,
+      uploadedImages: images,
+      uploadedVideos: videoMedia,
+      primaryUrl,
+    })
+
+    return tx.product.findUniqueOrThrow({ where: { id: created.id }, include: vendorProductInclude })
   })
 
   if (input.stock > 0) {
@@ -573,7 +589,10 @@ export async function updateVendorProduct(
   vendor: Vendor,
   productId: number,
   input: Partial<VendorProductInput>,
-  newImageUrls: string[] = [],
+  newImages: NewMedia[] = [],
+  newVideos: NewMedia[] = [],
+  existingMedia?: ExistingMediaSelection[],
+  primaryUrl?: string | null,
 ): Promise<VendorProductView> {
   assertVendorSellable(vendor)
 
@@ -623,23 +642,25 @@ export async function updateVendorProduct(
     updates.approvedAt = null
   }
 
-  const product2 = await prisma.$transaction(async (tx) => {
+  const { product: product2, removed } = await prisma.$transaction(async (tx) => {
     const result = await tx.product.update({
       where: { id: product.id },
       data: updates,
       include: vendorProductInclude,
     })
 
-    if (newImageUrls.length > 0) {
-      await tx.productImage.deleteMany({ where: { productId: product.id } })
-      await tx.productImage.createMany({
-        data: newImageUrls.map((url, index) => ({
-          productId: product.id,
-          url,
-          sortOrder: index,
-          alt: `${result.name} image ${index + 1}`,
-        })),
+    let mediaRemoved: Awaited<ReturnType<typeof reconcileProductMedia>>['removed'] = []
+    const shouldReconcile =
+      existingMedia !== undefined || newImages.length > 0 || newVideos.length > 0 || Boolean(primaryUrl)
+    if (shouldReconcile) {
+      const outcome = await reconcileProductMedia(tx, product.id, {
+        productName: result.name,
+        existingMedia,
+        uploadedImages: newImages,
+        uploadedVideos: newVideos,
+        primaryUrl,
       })
+      mediaRemoved = outcome.removed
     }
 
     if (input.variations !== undefined) {
@@ -670,12 +691,14 @@ export async function updateVendorProduct(
       })
     }
 
-    return tx.product.findUniqueOrThrow({
+    const fresh = await tx.product.findUniqueOrThrow({
       where: { id: product.id },
       include: vendorProductInclude,
     })
+    return { product: fresh, removed: mediaRemoved }
   })
 
+  await deleteRemovedMedia(removed)
   return serializeVendorProduct(product2)
 }
 
@@ -709,7 +732,11 @@ export async function setVendorProductActive(
 export async function deleteVendorProduct(vendorId: number, productId: number): Promise<void> {
   const product = await prisma.product.findFirst({
     where: { id: productId, vendorId },
-    select: { id: true, orderItems: { select: { id: true }, take: 1 } },
+    select: {
+      id: true,
+      orderItems: { select: { id: true }, take: 1 },
+      images: { select: { url: true, mediaType: true } },
+    },
   })
   if (!product) throw new NotFoundError('Product not found.')
   if (product.orderItems.length > 0) {
@@ -721,6 +748,12 @@ export async function deleteVendorProduct(vendorId: number, productId: number): 
     return
   }
   await prisma.product.delete({ where: { id: productId } })
+  await deleteRemovedMedia(
+    product.images.map((image) => ({
+      url: image.url,
+      mediaType: image.mediaType === 'VIDEO' ? 'VIDEO' : 'IMAGE',
+    })),
+  )
 }
 
 // ─── Orders (vendor's slice) ────────────────────────────────────────────────
@@ -741,6 +774,8 @@ export interface VendorOrderItemView {
   customerPhone: string
   deliveryAddress: string
   deliveryLocation: string | null
+  /** DELIVERY (courier) or PICKUP (collect at the studio). */
+  fulfillmentType: string
   orderStatus: string
   paymentStatus: string
   createdAt: string
@@ -777,6 +812,7 @@ export async function listVendorOrderItems(
             customerPhone: true,
             deliveryAddress: true,
             deliveryLocation: true,
+            fulfillmentType: true,
             status: true,
             paymentStatus: true,
             createdAt: true,
@@ -807,6 +843,7 @@ export async function listVendorOrderItems(
       customerPhone: row.order.customerPhone,
       deliveryAddress: row.order.deliveryAddress,
       deliveryLocation: row.order.deliveryLocation,
+      fulfillmentType: row.order.fulfillmentType,
       orderStatus: row.order.status,
       paymentStatus: row.order.paymentStatus,
       createdAt: row.order.createdAt.toISOString(),
@@ -838,6 +875,7 @@ export async function updateVendorOrderItem(
           referenceCode: true,
           paymentStatus: true,
           status: true,
+          fulfillmentType: true,
           items: { select: { vendorId: true } },
         },
       },
@@ -853,6 +891,11 @@ export async function updateVendorOrderItem(
   const allowed = ITEM_STATUS_FLOW[item.status] ?? []
   if (!allowed.includes(input.status)) {
     throw new UnprocessableError(`Cannot move this item from ${item.status} to ${input.status}.`)
+  }
+  if (item.order.fulfillmentType === 'PICKUP' && input.status === 'SHIPPED') {
+    throw new UnprocessableError(
+      'This is a shop-pickup order — items are not shipped. Prepare them and let the studio mark them ready for pickup.',
+    )
   }
 
   const updated = await prisma.$transaction(async (tx) => {
@@ -1011,6 +1054,7 @@ export async function updateVendorOrderItem(
     customerPhone: fresh.order.customerPhone,
     deliveryAddress: fresh.order.deliveryAddress,
     deliveryLocation: fresh.order.deliveryLocation,
+    fulfillmentType: fresh.order.fulfillmentType,
     orderStatus: fresh.order.status,
     paymentStatus: fresh.order.paymentStatus,
     createdAt: fresh.order.createdAt.toISOString(),
@@ -1138,8 +1182,101 @@ export interface VendorLedgerEntry {
   createdAt: string
 }
 
+export interface VendorWalletBalances {
+  pending: number
+  available: number
+  locked: number
+  paid: number
+  reversed: number
+  totalSales: number
+  totalEarnings: number
+  totalCommission: number
+  totalWithdrawn: number
+}
+
+export interface VendorPayoutView {
+  id: number
+  referenceCode: string
+  amount: number
+  status: string
+  note: string | null
+  transactionRef: string | null
+  requestedAt: string
+  processedAt: string | null
+}
+
+export function serializeVendorPayout(payout: VendorPayout): VendorPayoutView {
+  return {
+    id: payout.id,
+    referenceCode: payout.referenceCode,
+    amount: Number(payout.amount),
+    status: payout.status,
+    note: payout.note,
+    transactionRef: payout.transactionRef,
+    requestedAt: payout.requestedAt.toISOString(),
+    processedAt: payout.processedAt?.toISOString() ?? null,
+  }
+}
+
+/**
+ * Single source of truth for a vendor's wallet — derived entirely from the
+ * commission ledger and paid withdrawals. Never cached and never writable by a
+ * vendor. `available` excludes funds already reserved by an open withdrawal.
+ */
+export async function computeVendorWallet(
+  vendorId: number,
+  tx: Prisma.TransactionClient = prisma,
+): Promise<VendorWalletBalances> {
+  const [aggregates, claimedReleased, payouts] = await Promise.all([
+    tx.commissionLedger.groupBy({
+      by: ['settlementStatus'],
+      where: { vendorId },
+      _sum: { vendorNet: true, commissionAmount: true, salePrice: true, reversedAmount: true },
+    }),
+    tx.commissionLedger.aggregate({
+      where: { vendorId, settlementStatus: 'RELEASED', payoutId: { not: null } },
+      _sum: { vendorNet: true },
+    }),
+    tx.vendorPayout.aggregate({
+      where: { vendorId, status: 'PAID' },
+      _sum: { amount: true },
+    }),
+  ])
+
+  const sumFor = (status: string) =>
+    Number(aggregates.find((row) => row.settlementStatus === status)?._sum.vendorNet ?? 0)
+
+  const settled = aggregates.reduce(
+    (totals, row) => {
+      totals.reversed += Number(row._sum.reversedAmount ?? 0)
+      if (row.settlementStatus !== 'REVERSED') {
+        totals.vendorNet += Number(row._sum.vendorNet ?? 0)
+        totals.commission += Number(row._sum.commissionAmount ?? 0)
+        totals.sales += Number(row._sum.salePrice ?? 0)
+      }
+      return totals
+    },
+    { vendorNet: 0, commission: 0, sales: 0, reversed: 0 },
+  )
+
+  const released = sumFor('RELEASED')
+  const locked = Number(claimedReleased._sum.vendorNet ?? 0)
+
+  return {
+    pending: round2(sumFor('PENDING')),
+    available: round2(Math.max(0, released - locked)),
+    locked: round2(locked),
+    paid: round2(sumFor('PAID')),
+    reversed: round2(settled.reversed),
+    totalSales: round2(settled.sales),
+    totalEarnings: round2(settled.vendorNet),
+    totalCommission: round2(settled.commission),
+    totalWithdrawn: round2(Number(payouts._sum.amount ?? 0)),
+  }
+}
+
 export interface VendorEarningsView {
-  balances: { pending: number; available: number; paid: number; reversed: number }
+  balances: VendorWalletBalances
   bankDetails: { bankName: string | null; accountName: string | null; accountNumber: string | null }
   releaseDelayDays: number
   entries: Paged<VendorLedgerEntry>
@@ -1167,7 +1304,14 @@ export async function releaseMaturedEarnings(tx: Prisma.TransactionClient = pris
   const matured = await tx.commissionLedger.findMany({
     where: {
       settlementStatus: 'PENDING',
-      orderItem: { status: 'DELIVERED', deliveredAt: { not: null, lte: cutoff } },
+      orderItem: {
+        status: 'DELIVERED',
+        deliveredAt: { not: null, lte: cutoff },
+        order: {
+          paymentStatus: 'PAID',
+          status: { notIn: ['CANCELLED', 'REFUNDED', 'RETURNED'] },
+        },
+      },
     },
     select: { id: true },
   })
@@ -1193,7 +1337,7 @@ export async function getVendorEarnings(
     ...(query.settlementStatus ? { settlementStatus: query.settlementStatus as never } : {}),
   }
 
-  const [rows, total, aggregates, payouts] = await Promise.all([
+  const [rows, total, payouts, balances] = await Promise.all([
     prisma.commissionLedger.findMany({
       where,
       include: {
@@ -1205,30 +1349,16 @@ export async function getVendorEarnings(
       take: query.perPage,
     }),
     prisma.commissionLedger.count({ where }),
-    prisma.commissionLedger.groupBy({
-      by: ['settlementStatus'],
-      where: { vendorId },
-      _sum: { vendorNet: true, reversedAmount: true },
-    }),
     prisma.vendorPayout.findMany({
       where: { vendorId },
       orderBy: { requestedAt: 'desc' },
       take: 20,
     }),
+    computeVendorWallet(vendorId),
   ])
 
-  const sumFor = (status: string) =>
-    Number(aggregates.find((row) => row.settlementStatus === status)?._sum.vendorNet ?? 0)
-
   return {
-    balances: {
-      pending: round2(sumFor('PENDING')),
-      available: round2(sumFor('RELEASED')),
-      paid: round2(sumFor('PAID')),
-      reversed: round2(
-        aggregates.reduce((totalSum, row) => totalSum + Number(row._sum.reversedAmount ?? 0), 0),
-      ),
-    },
+    balances,
     bankDetails: {
       bankName: vendor.bankName,
       accountName: vendor.bankAccountName,
@@ -1276,27 +1406,39 @@ export async function getVendorEarnings(
 export async function requestVendorPayout(
   vendorId: number,
   input: { amount: number; note?: string },
-): Promise<{ message: string }> {
+): Promise<{ message: string; payout: VendorPayoutView }> {
   await releaseMaturedEarnings()
 
   const vendor = await prisma.vendor.findUnique({ where: { id: vendorId } })
   if (!vendor) throw new NotFoundError('Vendor not found.')
   if (!vendor.bankName || !vendor.bankAccountNumber || !vendor.bankAccountName) {
     throw new UnprocessableError(
-      'Add your bank account details in Vendor Settings before requesting a payout.',
+      'Add your bank account details in Vendor Settings before requesting a withdrawal.',
+    )
+  }
+  if (!/^\d{10}$/.test(vendor.bankAccountNumber.trim())) {
+    throw new UnprocessableError(
+      'Your bank account number must be 10 digits. Update it in Vendor Settings before withdrawing.',
     )
   }
 
-  const openPayout = await prisma.vendorPayout.findFirst({
-    where: { vendorId, status: { in: ['REQUESTED', 'APPROVED'] } },
-  })
-  if (openPayout) {
-    throw new UnprocessableError('You already have a payout request awaiting processing.')
+  const requested = round2(input.amount)
+  if (!Number.isFinite(requested) || requested <= 0) {
+    throw new UnprocessableError('Enter a valid withdrawal amount.')
   }
 
-  const requested = round2(input.amount)
+  const payout = await prisma.$transaction(async (tx) => {
+    // Serialize concurrent requests for this vendor (row lock) so two open
+    // withdrawals can never be created at once.
+    await tx.$queryRaw`SELECT id FROM vendors WHERE id = ${vendorId} FOR UPDATE`
 
-  await prisma.$transaction(async (tx) => {
+    const openPayout = await tx.vendorPayout.findFirst({
+      where: { vendorId, status: { in: ['REQUESTED', 'APPROVED', 'PROCESSING'] } },
+    })
+    if (openPayout) {
+      throw new UnprocessableError('You already have a withdrawal awaiting processing.')
+    }
+
     const available = await tx.commissionLedger.findMany({
       where: { vendorId, settlementStatus: 'RELEASED', payoutId: null },
       orderBy: { releasedAt: 'asc' },
@@ -1308,20 +1450,33 @@ export async function requestVendorPayout(
       )
     }
 
-    // Claim entries oldest-first until the requested amount is covered.
-    let remaining = requested
+    // Pay whole released lines that fit within the requested amount, so the
+    // payout total always equals the sum of the claimed ledger lines exactly.
+    let claimedTotal = 0
     const claimed: number[] = []
     for (const entry of available) {
-      if (remaining <= 0.01) break
+      const net = Number(entry.vendorNet)
+      if (round2(claimedTotal + net) > requested + 0.01) continue
       claimed.push(entry.id)
-      remaining = round2(remaining - Number(entry.vendorNet))
+      claimedTotal = round2(claimedTotal + net)
     }
 
-    const payout = await tx.vendorPayout.create({
+    if (claimed.length === 0 || claimedTotal < 100) {
+      const smallest = available.length
+        ? Math.min(...available.map((entry) => Number(entry.vendorNet)))
+        : 0
+      throw new UnprocessableError(
+        `Withdrawals are paid in whole earning amounts. Request at least ${naira(
+          Math.max(100, smallest),
+        )} (your available balance is ${naira(availableTotal)}).`,
+      )
+    }
+
+    const created = await tx.vendorPayout.create({
       data: {
         referenceCode: generateReference('PAY'),
         vendorId,
-        amount: requested,
+        amount: claimedTotal,
         status: 'REQUESTED',
         note: input.note?.trim() || null,
       },
@@ -1329,7 +1484,7 @@ export async function requestVendorPayout(
 
     await tx.commissionLedger.updateMany({
       where: { id: { in: claimed } },
-      data: { payoutId: payout.id },
+      data: { payoutId: created.id },
     })
 
     await tx.marketplaceAuditLog.create({
@@ -1339,13 +1494,40 @@ export async function requestVendorPayout(
         actorName: vendor.businessName,
         action: 'PAYOUT_REQUESTED',
         entityType: 'VendorPayout',
-        entityId: payout.id,
-        detail: `${vendor.businessName} requested ${naira(requested)}`,
+        entityId: created.id,
+        detail: `${vendor.businessName} requested ${naira(claimedTotal)}`,
       },
     })
+
+    return created
   })
 
-  return { message: `Payout request for ${naira(requested)} submitted. It will be processed by the administrator.` }
+  return {
+    message: `Withdrawal request for ${naira(Number(payout.amount))} submitted. It will be processed by the administrator.`,
+    payout: serializeVendorPayout(payout),
+  }
+}
+
+/** Paged withdrawal history for the vendor (newest first). */
+export async function getVendorPayouts(
+  vendorId: number,
+  query: { page: number; perPage: number },
+): Promise<Paged<VendorPayoutView>> {
+  const [rows, total] = await Promise.all([
+    prisma.vendorPayout.findMany({
+      where: { vendorId },
+      orderBy: { requestedAt: 'desc' },
+      skip: (query.page - 1) * query.perPage,
+      take: query.perPage,
+    }),
+    prisma.vendorPayout.count({ where: { vendorId } }),
+  ])
+  return {
+    items: rows.map(serializeVendorPayout),
+    total,
+    page: query.page,
+    perPage: query.perPage,
+  }
 }
 
 export { markOrderPaid }

@@ -10,6 +10,7 @@ import {
   vendorLoginHandler,
   vendorMeHandler,
   vendorNotificationsHandler,
+  vendorPayoutsHandler,
   vendorReadNotificationHandler,
   vendorRegisterHandler,
   vendorRequestPayoutHandler,
@@ -17,16 +18,18 @@ import {
   vendorUpdateOrderItemHandler,
   vendorUpdateProductHandler,
   vendorUpdateProfileHandler,
+  vendorUploadSignatureHandler,
 } from '../controllers/vendorController'
 import { requireVendor } from '../middleware/vendorAuth'
 import { validate } from '../middleware/validate'
 import { customerAuthLimiter, submitLimiter } from '../middleware/rateLimiter'
-import { upload } from '../utils/upload'
+import { productMediaUpload } from '../utils/upload'
 import {
   vendorChangePasswordSchema,
   vendorItemParamsSchema,
   vendorItemUpdateSchema,
   vendorLoginSchema,
+  vendorPayoutListQuerySchema,
   vendorPayoutRequestSchema,
   vendorProductIdParamsSchema,
   vendorProfileUpdateSchema,
@@ -53,8 +56,25 @@ vendorPortalRouter.post('/notifications/:id/read', vendorReadNotificationHandler
 
 // Products
 vendorPortalRouter.get('/products', vendorListProductsHandler)
-vendorPortalRouter.post('/products', submitLimiter, upload.array('images', 8), vendorCreateProductHandler)
-vendorPortalRouter.put('/products/:id', upload.array('images', 8), validate(vendorProductIdParamsSchema, 'params'), vendorUpdateProductHandler)
+vendorPortalRouter.post('/uploads/signature', vendorUploadSignatureHandler)
+vendorPortalRouter.post(
+  '/products',
+  submitLimiter,
+  productMediaUpload.fields([
+    { name: 'images', maxCount: 8 },
+    { name: 'videos', maxCount: 4 },
+  ]),
+  vendorCreateProductHandler,
+)
+vendorPortalRouter.put(
+  '/products/:id',
+  productMediaUpload.fields([
+    { name: 'images', maxCount: 8 },
+    { name: 'videos', maxCount: 4 },
+  ]),
+  validate(vendorProductIdParamsSchema, 'params'),
+  vendorUpdateProductHandler,
+)
 vendorPortalRouter.patch('/products/:id/active', validate(vendorProductIdParamsSchema, 'params'), vendorToggleProductHandler)
 vendorPortalRouter.delete('/products/:id', validate(vendorProductIdParamsSchema, 'params'), vendorDeleteProductHandler)
 
@@ -69,4 +89,5 @@ vendorPortalRouter.patch(
 
 // Earnings + payouts
 vendorPortalRouter.get('/earnings', vendorEarningsHandler)
+vendorPortalRouter.get('/payouts', validate(vendorPayoutListQuerySchema, 'query'), vendorPayoutsHandler)
 vendorPortalRouter.post('/payouts', validate(vendorPayoutRequestSchema), vendorRequestPayoutHandler)

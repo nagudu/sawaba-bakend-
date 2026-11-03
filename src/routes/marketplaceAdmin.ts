@@ -10,6 +10,7 @@ import {
   getOrderHandler,
   getSettingsHandler,
   getVendorHandler,
+  getVendorWalletHandler,
   listCategoriesHandler,
   listLedgerHandler,
   listOrdersHandler,
@@ -30,10 +31,14 @@ import {
   updateVendorStatusHandler,
   verifyOrderPaymentHandler,
   setProductAvailabilityHandler,
+  uploadSignatureHandler,
+  lookupOrderPickupHandler,
+  collectOrderPickupHandler,
 } from '../controllers/adminMarketplaceController'
 import { requireAdmin } from '../middleware/auth'
 import { validate } from '../middleware/validate'
-import { upload } from '../utils/upload'
+import { qrScanLimiter } from '../middleware/rateLimiter'
+import { productMediaUpload } from '../utils/upload'
 import {
   adminCategoryIdParamsSchema,
   adminCategorySchema,
@@ -57,6 +62,7 @@ import {
   adminVendorParamsSchema,
   adminVendorStatusSchema,
   adminVerifyOrderPaymentSchema,
+  orderPickupCodeSchema,
   payoutIdParamsSchema,
   refundIdParamsSchema,
 } from '../validators/marketplaceAdmin'
@@ -71,6 +77,11 @@ marketplaceAdminRouter.get('/overview', overviewHandler)
 // Vendors
 marketplaceAdminRouter.get('/vendors', validate(adminVendorListQuerySchema, 'query'), listVendorsHandler)
 marketplaceAdminRouter.get('/vendors/:id', validate(adminVendorParamsSchema, 'params'), getVendorHandler)
+marketplaceAdminRouter.get(
+  '/vendors/:id/wallet',
+  validate(adminVendorParamsSchema, 'params'),
+  getVendorWalletHandler,
+)
 marketplaceAdminRouter.patch(
   '/vendors/:id/status',
   validate(adminVendorParamsSchema, 'params'),
@@ -80,16 +91,23 @@ marketplaceAdminRouter.patch(
 
 // Products
 marketplaceAdminRouter.get('/products', validate(adminProductListQuerySchema, 'query'), listProductsHandler)
+marketplaceAdminRouter.post('/uploads/signature', uploadSignatureHandler)
 marketplaceAdminRouter.post(
   '/products',
-  upload.array('images', 8),
+  productMediaUpload.fields([
+    { name: 'images', maxCount: 8 },
+    { name: 'videos', maxCount: 4 },
+  ]),
   validate(adminProductSchema),
   createProductHandler,
 )
 marketplaceAdminRouter.put(
   '/products/:id',
   validate(adminVendorParamsSchema, 'params'),
-  upload.array('images', 8),
+  productMediaUpload.fields([
+    { name: 'images', maxCount: 8 },
+    { name: 'videos', maxCount: 4 },
+  ]),
   validate(adminProductSchema),
   updateProductHandler,
 )
@@ -138,6 +156,20 @@ marketplaceAdminRouter.post(
   validate(adminOrderParamsSchema, 'params'),
   validate(adminRejectOrderPaymentSchema),
   rejectOrderPaymentHandler,
+)
+
+// Pickup verification (enter or scan a customer pickup code)
+marketplaceAdminRouter.post(
+  '/orders/pickup/lookup',
+  qrScanLimiter,
+  validate(orderPickupCodeSchema),
+  lookupOrderPickupHandler,
+)
+marketplaceAdminRouter.post(
+  '/orders/pickup/collect',
+  qrScanLimiter,
+  validate(orderPickupCodeSchema),
+  collectOrderPickupHandler,
 )
 
 // Refunds

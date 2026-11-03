@@ -128,9 +128,14 @@ export const vendorRegisterSchema = z.object({
   password: z.string().min(8, 'Password must be at least 8 characters.').max(72),
   address: z.string().trim().max(300).optional().or(z.literal('')),
   location: z.string().trim().max(150).optional().or(z.literal('')),
-  bankName: z.string().trim().max(100).optional().or(z.literal('')),
-  bankAccountName: z.string().trim().max(150).optional().or(z.literal('')),
-  bankAccountNumber: z.string().trim().max(30).optional().or(z.literal('')),
+  bankName: z.string().trim().min(2, 'Enter your bank name.').max(100).optional().or(z.literal('')),
+  bankAccountName: z.string().trim().min(2, 'Enter the account name.').max(150).optional().or(z.literal('')),
+  bankAccountNumber: z
+    .string()
+    .trim()
+    .regex(/^\d{10}$/, 'Account number must be exactly 10 digits.')
+    .optional()
+    .or(z.literal('')),
   businessInfo: z.string().trim().max(3000).optional().or(z.literal('')),
 })
 
@@ -144,9 +149,14 @@ export const vendorProfileUpdateSchema = z.object({
   phone: z.string().trim().min(7).max(30).optional(),
   address: z.string().trim().max(300).optional().or(z.literal('')),
   location: z.string().trim().max(150).optional().or(z.literal('')),
-  bankName: z.string().trim().max(100).optional().or(z.literal('')),
-  bankAccountName: z.string().trim().max(150).optional().or(z.literal('')),
-  bankAccountNumber: z.string().trim().max(30).optional().or(z.literal('')),
+  bankName: z.string().trim().min(2, 'Enter your bank name.').max(100).optional().or(z.literal('')),
+  bankAccountName: z.string().trim().min(2, 'Enter the account name.').max(150).optional().or(z.literal('')),
+  bankAccountNumber: z
+    .string()
+    .trim()
+    .regex(/^\d{10}$/, 'Account number must be exactly 10 digits.')
+    .optional()
+    .or(z.literal('')),
   businessInfo: z.string().trim().max(3000).optional().or(z.literal('')),
 })
 
@@ -216,6 +226,11 @@ export const vendorItemParamsSchema = z.object({
 export const vendorPayoutRequestSchema = z.object({
   amount: z.coerce.number().min(100, 'Minimum payout is ₦100.'),
   note: z.string().trim().max(500).optional().or(z.literal('')),
+})
+
+export const vendorPayoutListQuerySchema = z.object({
+  page: z.coerce.number().int().min(1).default(1),
+  perPage: z.coerce.number().int().min(1).max(50).default(15),
 })
 
 export type ProductListQuery = z.infer<typeof productListQuerySchema>

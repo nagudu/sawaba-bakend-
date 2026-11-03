@@ -74,6 +74,16 @@ const publicProductInclude = {
 
 type ProductWithRelations = Prisma.ProductGetPayload<{ include: typeof publicProductInclude }>
 
+function primaryMedia(images: ProductWithRelations['images']) {
+  return images.find((image) => image.isPrimary) ?? images[0] ?? null
+}
+
+/** Card/list image: the image URL, or a video's poster frame. */
+function mediaDisplayUrl(image: { url: string; mediaType: string; thumbnailUrl: string | null } | null): string | null {
+  if (!image) return null
+  return image.mediaType === 'VIDEO' ? image.thumbnailUrl ?? image.url : image.url
+}
+
 export function serializeProductListItem(product: ProductWithRelations): ProductListItem {
   return {
     id: product.id,
@@ -86,7 +96,7 @@ export function serializeProductListItem(product: ProductWithRelations): Product
     lowStockThreshold: product.lowStockThreshold,
     rating: Number(product.rating),
     reviewCount: product.reviewCount,
-    image: product.images[0]?.url ?? null,
+    image: mediaDisplayUrl(primaryMedia(product.images)),
     vendor: { id: product.vendor.id, businessName: product.vendor.businessName },
     category: product.category,
     createdAt: product.createdAt.toISOString(),
@@ -104,7 +114,16 @@ export interface ProductDetail extends ProductListItem {
     priceDelta: number
     stock: number
   }>
-  images: Array<{ id: number; url: string; alt: string | null }>
+  images: Array<{
+    id: number
+    url: string
+    alt: string | null
+    mediaType: string
+    thumbnailUrl: string | null
+    duration: number | null
+    isPrimary: boolean
+    sortOrder: number
+  }>
 }
 
 export function serializeProductDetail(product: ProductWithRelations): ProductDetail {
@@ -124,6 +143,11 @@ export function serializeProductDetail(product: ProductWithRelations): ProductDe
       id: image.id,
       url: image.url,
       alt: image.alt,
+      mediaType: image.mediaType,
+      thumbnailUrl: image.thumbnailUrl,
+      duration: image.duration,
+      isPrimary: image.isPrimary,
+      sortOrder: image.sortOrder,
     })),
   }
 }
@@ -234,7 +258,7 @@ const cartInclude = {
     include: {
       product: {
         include: {
-          images: { orderBy: { sortOrder: 'asc' as const }, take: 1 },
+          images: { orderBy: { isPrimary: 'desc' as const }, take: 1 },
           vendor: { select: { id: true, businessName: true } },
         },
       },
@@ -283,7 +307,7 @@ function serializeCart(cart: CartWithItems): CartView {
           slug: item.product.slug,
           price: Number(item.product.price),
           stock: item.product.stock,
-          image: item.product.images[0]?.url ?? null,
+          image: mediaDisplayUrl(item.product.images[0] ?? null),
           vendor: item.product.vendor,
           status: item.product.status,
         },
@@ -459,6 +483,8 @@ export interface OrderItemView {
 export interface OrderView {
   id: number
   referenceCode: string
+  /** Secure, expiring, login-free tracking link for this order. */
+  trackingUrl: string
   customerName: string
   customerPhone: string
   customerEmail: string | null
@@ -483,6 +509,8 @@ export interface OrderView {
   fulfillmentType: string
   deliveryInstructions: string | null
   estimatedDeliveryAt: string | null
+  /** Delivery flow: set when the order goes out for delivery. */
+  outForDeliveryAt: string | null
   paymentAttempts: number
   /** Pickup snapshot — null for delivery orders. */
   pickup: {
@@ -535,6 +563,7 @@ export function serializeOrder(
   return {
     id: order.id,
     referenceCode: order.referenceCode,
+    trackingUrl: buildOrderTrackingUrl({ orderId: order.id, referenceCode: order.referenceCode }),
     customerName: order.customerName,
     customerPhone: order.customerPhone,
     customerEmail: order.customerEmail,
@@ -557,6 +586,7 @@ export function serializeOrder(
     fulfillmentType: order.fulfillmentType,
     deliveryInstructions: order.deliveryInstructions,
     estimatedDeliveryAt: order.estimatedDeliveryAt?.toISOString() ?? null,
+    outForDeliveryAt: order.outForDeliveryAt?.toISOString() ?? null,
     paymentAttempts: order.paymentAttempts,
     pickup:
       order.fulfillmentType === 'PICKUP' || order.pickupCode
@@ -728,7 +758,7 @@ export async function createShopOrder(input: CheckoutInput, customerId?: number 
     const products = await tx.product.findMany({
       where: { id: { in: productIds } },
       include: {
-        images: { orderBy: { sortOrder: 'asc' }, take: 1 },
+        images: { orderBy: { isPrimary: 'desc' as const }, take: 1 },
         variations: true,
         vendor: { select: { id: true, businessName: true, status: true, isActive: true, commissionRate: true } },
         category: { select: { commissionRate: true } },
@@ -809,7 +839,7 @@ export async function createShopOrder(input: CheckoutInput, customerId?: number 
         productId: product.id,
         variationId: line.variationId,
         productName: product.name,
-        productImage: product.images[0]?.url ?? null,
+        productImage: mediaDisplayUrl(product.images[0] ?? null),
         variationLabel,
         unitPrice,
         quantity: line.quantity,

@@ -45,6 +45,15 @@ const existingProductImages = z.preprocess((value) => {
   }
 }, z.array(z.string().trim().min(1).max(1000)).max(8))
 
+const existingProductMedia = z.preprocess((value) => {
+  if (typeof value !== 'string') return value
+  try {
+    return JSON.parse(value)
+  } catch {
+    return value
+  }
+}, z.array(z.object({ id: z.coerce.number().int().positive(), isPrimary: z.boolean().optional() })).max(12))
+
 export const adminProductSchema = z.object({
   name: z.string().trim().min(3).max(200),
   description: z.string().trim().min(10).max(5000),
@@ -59,6 +68,10 @@ export const adminProductSchema = z.object({
   status: z.enum(['DRAFT', 'ACTIVE']),
   isActive: formBoolean,
   existingImages: existingProductImages.optional().default([]),
+  existingMedia: existingProductMedia.optional(),
+  videosJson: z.string().max(4000).optional().or(z.literal('')),
+  mediaJson: z.string().max(8000).optional().or(z.literal('')),
+  primaryUrl: z.string().trim().max(500).optional().nullable().or(z.literal('')),
 })
 
 export const adminProductAvailabilitySchema = z.object({
@@ -97,6 +110,7 @@ export const adminOrderListQuerySchema = z.object({
       'PAYMENT_CONFIRMED',
       'PROCESSING',
       'READY_FOR_DISPATCH',
+      'OUT_FOR_DELIVERY',
       'READY_FOR_PICKUP',
       'SHIPPED',
       'DELIVERED',
@@ -122,10 +136,16 @@ export const adminOrderParamsSchema = z.object({
   reference: z.string().trim().min(3).max(30),
 })
 
+/** Pickup code entered or scanned by staff (e.g. PK-7F3KQ9ZM). */
+export const orderPickupCodeSchema = z.object({
+  code: z.string().trim().min(3, 'Enter the pickup code.').max(16),
+})
+
 export const adminOrderStatusSchema = z.object({
   status: z.enum([
     'PROCESSING',
     'READY_FOR_DISPATCH',
+    'OUT_FOR_DELIVERY',
     'READY_FOR_PICKUP',
     'SHIPPED',
     'DELIVERED',
@@ -182,17 +202,27 @@ export const adminMarketplaceSettingsSchema = z.object({
 })
 
 export const adminPayoutListQuerySchema = z.object({
-  status: z.enum(['REQUESTED', 'APPROVED', 'REJECTED', 'PAID']).optional(),
+  status: z.enum(['REQUESTED', 'APPROVED', 'PROCESSING', 'REJECTED', 'PAID']).optional(),
   vendorId: z.coerce.number().int().positive().optional(),
   page: z.coerce.number().int().min(1).default(1),
   perPage: z.coerce.number().int().min(1).max(50).default(15),
 })
 
-export const adminPayoutActionSchema = z.object({
-  action: z.enum(['APPROVED', 'REJECTED', 'PAID']),
-  transactionRef: z.string().trim().max(191).optional().or(z.literal('')),
-  note: z.string().trim().max(500).optional().or(z.literal('')),
-})
+export const adminPayoutActionSchema = z
+  .object({
+    action: z.enum(['APPROVED', 'PROCESSING', 'REJECTED', 'PAID']),
+    transactionRef: z.string().trim().max(191).optional().or(z.literal('')),
+    note: z.string().trim().max(500).optional().or(z.literal('')),
+  })
+  .superRefine((value, ctx) => {
+    if (value.action === 'PAID' && !value.transactionRef?.trim()) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['transactionRef'],
+        message: 'A bank transfer reference is required to mark a withdrawal as paid.',
+      })
+    }
+  })
 
 export const payoutIdParamsSchema = z.object({
   id: z.coerce.number().int().positive(),
