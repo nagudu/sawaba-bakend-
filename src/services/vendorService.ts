@@ -1018,23 +1018,24 @@ export async function updateVendorOrderItem(
     },
   })
 
-  if (fresh.order.status !== item.order.status) {
-    const orderRef = {
-      id: item.order.id,
-      referenceCode: fresh.order.referenceCode,
-      customerId: fresh.order.customerId,
-      customerName: fresh.order.customerName,
-      customerPhone: fresh.order.customerPhone,
-      customerEmail: fresh.order.customerEmail,
-      totalAmount: Number(fresh.order.totalAmount),
-      fulfillmentType: fresh.order.fulfillmentType,
-      pickupCode: fresh.order.pickupCode,
-      status: fresh.order.status,
-    }
-    if (fresh.order.status === 'CANCELLED') {
-      await notifyOrderCancelled(orderRef, 'All items cancelled by vendors')
-    } else {
-      await notifyOrderStatus(orderRef, fresh.order.status, fresh.trackingInfo)
+  // Customer notifications: the parent order changed (processing/delivered/
+  // cancelled) or the vendor shipped an item. Fetch the full order so the
+  // notification includes items, delivery/pickup details and the tracking link.
+  if (fresh.order.status !== item.order.status || input.status === 'SHIPPED') {
+    const notifyOrder = await prisma.shopOrder.findUnique({
+      where: { id: item.order.id },
+      include: { items: true },
+    })
+    if (notifyOrder) {
+      if (notifyOrder.status === 'CANCELLED') {
+        await notifyOrderCancelled(notifyOrder, 'All items cancelled by vendors')
+      } else if (fresh.order.status !== item.order.status) {
+        await notifyOrderStatus(notifyOrder, notifyOrder.status, fresh.trackingInfo)
+      } else if (input.status === 'SHIPPED') {
+        // Deduped per order, so multiple vendors shipping the same order only
+        // send one "out for delivery" update.
+        await notifyOrderStatus(notifyOrder, 'SHIPPED', fresh.trackingInfo)
+      }
     }
   }
 

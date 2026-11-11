@@ -4,7 +4,7 @@ import type { Prisma } from '@prisma/client'
 import { naira } from './marketplaceService'
 import { recordPaymentEvent, serializeOrder, type OrderView } from './shopService'
 import { isPaystackConfigured } from './paystackService'
-import { notifyOrderPaymentSuccess, notifyOrderPaymentFailed } from './notificationEvents'
+import { notifyOrderConfirmation, notifyOrderPaymentSuccess, notifyOrderPaymentFailed } from './notificationEvents'
 
 /**
  * Marketplace order payments.
@@ -152,6 +152,8 @@ export async function markOrderPaid(
   })
 
   await notifyOrderPaymentSuccess(result)
+  // Order confirmation is only sent after the payment has been verified.
+  await notifyOrderConfirmation(result)
   return result
 }
 

@@ -26,7 +26,9 @@
     "auth:test": "tsx src/scripts/authSessionHarness.ts",
     "media:test": "tsx src/scripts/productMediaHarness.ts",
     "pickup:test": "tsx src/scripts/orderPickupHarness.ts",
-    "flows:test": "tsx src/scripts/orderFlowsHarness.ts"
+    "flows:test": "tsx src/scripts/orderFlowsHarness.ts",
+    "promo:seed": "tsx src/scripts/promoSeed.ts",
+    "promo:cleanup": "tsx src/scripts/promoSeed.ts --cleanup"
   },
   "prisma": {
     "schema": "prisma/schema.prisma"

@@ -29,6 +29,16 @@ function eventChannelsInput(
   return value as Prisma.InputJsonValue
 }
 
+/** Masks an email/phone for admin history views (never exposes the full value). */
+function maskRecipient(value: string | null | undefined): string | null {
+  if (!value) return null
+  if (value.includes('@')) {
+    const [local, domain] = value.split('@')
+    return `${local.slice(0, 2)}***@${domain}`
+  }
+  return value.length > 4 ? `${value.slice(0, 3)}***${value.slice(-2)}` : '***'
+}
+
 /** Admin-safe view of the notification settings (secret VALUES are never returned). */
 export async function getNotificationSettingsAdmin(): Promise<Record<string, unknown>> {
   // Refresh so the "configured" flags reflect what is actually saved.
@@ -249,6 +259,7 @@ export async function listCustomerNotifications(query: {
       channel: row.channel,
       title: row.title,
       message: row.message,
+      recipient: maskRecipient(row.recipient),
       status: row.status,
       provider: row.provider,
       providerMessageId: row.providerMessageId,

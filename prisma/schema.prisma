@@ -105,6 +105,8 @@ enum NotificationChannel {
   EMAIL
   SMS
   WHATSAPP
+  /// In-app inbox row (not an external delivery channel).
+  IN_APP
 }
 
 enum NotificationStatus {
@@ -599,18 +601,23 @@ model CustomerNotification {
   channel         NotificationChannel
   title           String              @db.VarChar(160)
   message         String              @db.Text
+  /// Recipient for external channels (email/phone) — used for history/audit.
+  recipient       String?             @db.VarChar(255)
   status          NotificationStatus @default(PENDING)
   provider        String?             @db.VarChar(40)
-  providerMessageId String?          @map("provider_message_id") @db.VarChar(120)
+  providerMessageId String?           @map("provider_message_id") @db.VarChar(120)
   error           String?             @db.VarChar(500)
   dedupeKey       String              @unique @db.VarChar(220)
   sentAt          DateTime?           @map("sent_at")
+  /// Read timestamp for the in-app inbox. Null = unread.
+  readAt          DateTime?           @map("read_at")
   createdAt       DateTime            @default(now()) @map("created_at")
   updatedAt       DateTime            @updatedAt @map("updated_at")
 
   customer        Customer?           @relation(fields: [customerId], references: [id], onDelete: SetNull)
 
   @@index([customerId, createdAt])
+  @@index([customerId, channel, readAt])
   @@index([orderId])
   @@index([appointmentId])
   @@index([status, createdAt])

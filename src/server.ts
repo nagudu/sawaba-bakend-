@@ -1,12 +1,17 @@
 import { app } from './app'
 import { env } from './config/env'
 import { connectDatabase } from './config/database'
+import { primeNotificationConfig } from './services/notificationConfigService'
 import { startReminderScheduler } from './services/reminderService'
 
 async function startServer(): Promise<void> {
   try {
     await connectDatabase()
     console.log('[server] database connection established')
+
+    // Warm the notification config cache so the first order/payment uses the
+    // DB-configured SMTP/Resend settings immediately (not env-only defaults).
+    void primeNotificationConfig()
 
     // First-boot demo seeding (deployment bootstrap): idempotent, only runs
     // when SEED_ON_BOOT=true. Keeps the live DB private — no external seeding.

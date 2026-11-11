@@ -69,7 +69,7 @@ function envSmtp(): SmtpConfig | null {
 /** Config derived purely from environment variables (no DB). */
 export function envFallbackConfig(): ResolvedNotificationConfig {
   return {
-    channels: { EMAIL: true, SMS: false, WHATSAPP: false },
+    channels: { EMAIL: true, SMS: false, WHATSAPP: false, IN_APP: true },
     eventChannels: null,
     email: {
       provider: process.env.EMAIL_PROVIDER === 'smtp' ? 'smtp' : 'resend',
@@ -127,6 +127,8 @@ function resolveFrom(row: NotificationSetting | null): ResolvedNotificationConfi
       EMAIL: row.emailEnabled,
       SMS: row.smsEnabled,
       WHATSAPP: row.whatsappEnabled,
+      // The in-app inbox is always available and is not provider-gated.
+      IN_APP: true,
     },
     eventChannels: normalizeEventChannels(row.eventChannels),
     email: {

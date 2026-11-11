@@ -72,6 +72,12 @@ export interface NotificationDispatchContext {
   trackingInfo?: string | null
   /** Secure, signed link the customer can open to view the order (no login). */
   trackingUrl?: string | null
+  /** Order line items for the confirmation copy. */
+  items?: Array<{ name: string; quantity: number; lineTotal?: number | null }> | null
+  deliveryAddress?: string | null
+  pickupShopName?: string | null
+  pickupAddress?: string | null
+  estimatedDeliveryAt?: string | null
 }
 
 export interface NotificationDeliveryResult {
@@ -108,6 +114,39 @@ function formatMoney(amount: number | null | undefined): string {
 function formatDateTime(date?: string | null, time?: string | null): string {
   if (date && time) return `${date} at ${time}`
   return date ?? time ?? ''
+}
+
+/** One "Items:" block for order confirmations. */
+function orderItemsLine(ctx: NotificationDispatchContext): string {
+  const items = ctx.items ?? []
+  if (items.length === 0) return ''
+  return `Items:\n${items
+    .map(
+      (item) =>
+        `${item.quantity}× ${item.name}${item.lineTotal != null ? ` — ${formatMoney(item.lineTotal)}` : ''}`,
+    )
+    .join('\n')}`
+}
+
+/** Delivery address or pickup shop/hours, with the pickup code when relevant. */
+function orderFulfilmentLines(ctx: NotificationDispatchContext, includePickupCode = true): string[] {
+  if (ctx.deliveryMethod === 'PICKUP') {
+    const shop = [ctx.pickupShopName, ctx.pickupAddress].filter(Boolean).join(', ')
+    return [
+      `Fulfilment: Store pickup${shop ? ` — ${shop}` : ''}`,
+      includePickupCode && ctx.collectionCode ? `Pickup code: ${ctx.collectionCode}` : '',
+    ].filter((line) => line.trim() !== '')
+  }
+  return [
+    ctx.deliveryAddress ? `Delivery to: ${ctx.deliveryAddress}` : '',
+    ctx.estimatedDeliveryAt
+      ? `Estimated delivery: ${new Date(ctx.estimatedDeliveryAt).toLocaleDateString('en-GB', {
+          day: 'numeric',
+          month: 'short',
+          year: 'numeric',
+        })}`
+      : '',
+  ].filter((line) => line.trim() !== '')
 }
 
 function defaultContent(event: NotificationType, ctx: NotificationDispatchContext, customerName?: string | null): NotificationContent {
@@ -237,23 +276,24 @@ function defaultContent(event: NotificationType, ctx: NotificationDispatchContex
       }
     }
     case 'ORDER_CONFIRMATION': {
-      const amount = ctx.amount ? `Amount: ${formatMoney(ctx.amount)}` : ''
+      const amount = ctx.amount ? `Total: ${formatMoney(ctx.amount)}` : ''
       const method = ctx.paymentMethod ? `Payment method: ${ctx.paymentMethod}` : ''
-      const delivery = ctx.deliveryMethod === 'PICKUP' ? 'This is a store pickup order.' : 'This is a home delivery order.'
+      const payment = `Payment status: ${ctx.paymentStatus === 'PAID' ? 'PAID — verified' : ctx.paymentStatus ?? 'PENDING'}`
       return {
         title: 'Order confirmed',
-        subject: `Order confirmed — ${BRAND} (${ctx.orderRef ?? ref})`,
+        subject: `Order ${ctx.orderRef ?? ref} confirmed — ${BRAND}`,
         text: [
           `Hello ${first},`,
           '',
-          `Thank you — your order at ${BRAND} has been received.`,
-          `Order: ${ctx.orderRef ?? ref}`,
+          'Thank you — your order is confirmed and your payment has been verified.',
+          `Order number: ${ctx.orderRef ?? ref}`,
+          orderItemsLine(ctx),
           amount,
+          payment,
           method,
+          ...orderFulfilmentLines(ctx),
           '',
-          delivery,
-          '',
-          'The studio team is preparing your order. We will keep you posted.',
+          'We will send you updates as your order is processed, ready, and completed.',
           trackLine,
           '',
           '— SAWABA Grooming Studio',
@@ -265,6 +305,7 @@ function defaultContent(event: NotificationType, ctx: NotificationDispatchContex
     case 'ORDER_STATUS': {
       const statusLabels: Record<string, string> = {
         PROCESSING: 'is now being processed',
+        READY_FOR_DISPATCH: 'is ready for dispatch',
         READY_FOR_PICKUP: 'is ready for store pickup',
         SHIPPED: 'has been shipped out for delivery',
         OUT_FOR_DELIVERY: 'is out for delivery',
@@ -272,15 +313,27 @@ function defaultContent(event: NotificationType, ctx: NotificationDispatchContex
         COLLECTED: 'has been collected',
         READY_FOR_SERVICE: 'is cleared for service',
       }
-      const statusText = ctx.status ? statusLabels[ctx.status] ?? `status updated to ${ctx.status}` : ''
-      const tracking = ctx.trackingInfo ? `Tracking: ${ctx.trackingInfo}` : ''
+      const statusText = ctx.status
+        ? statusLabels[ctx.status] ?? `status updated to ${ctx.status.replace(/_/g, ' ').toLowerCase()}`
+        : 'has been updated'
+      const tracking = ctx.trackingInfo ? `Courier tracking: ${ctx.trackingInfo}` : ''
+      const includePickupCode = ctx.status === 'READY_FOR_PICKUP' || ctx.status === 'COLLECTED'
+      const title =
+        ctx.status === 'READY_FOR_PICKUP'
+          ? 'Ready for pickup'
+          : ctx.status === 'OUT_FOR_DELIVERY' || ctx.status === 'SHIPPED'
+            ? 'Out for delivery'
+            : ctx.status === 'DELIVERED' || ctx.status === 'COLLECTED'
+              ? 'Order completed'
+              : 'Order update'
       return {
-        title: 'Order update',
-        subject: `Order update — ${BRAND} (${ctx.orderRef ?? ref})`,
+        title,
+        subject: `Order ${ctx.orderRef ?? ref}: ${statusText.replace(/^is /, '')} — ${BRAND}`,
         text: [
           `Hello ${first},`,
           '',
           `An update on your order ${ctx.orderRef ?? ref}: ${statusText}.`,
+          ...orderFulfilmentLines(ctx, includePickupCode),
           tracking,
           trackLine,
           '',
@@ -293,19 +346,40 @@ function defaultContent(event: NotificationType, ctx: NotificationDispatchContex
     case 'PAYMENT_SUCCESS': {
       const amount = ctx.amount ? `Amount: ${formatMoney(ctx.amount)}` : ''
       const method = ctx.paymentMethod ? `Method: ${ctx.paymentMethod}` : ''
+      if (ctx.orderRef) {
+        return {
+          title: 'Payment confirmed',
+          subject: `Payment confirmed for order ${ctx.orderRef} — ${BRAND}`,
+          text: [
+            `Hello ${first},`,
+            '',
+            `Your payment for order ${ctx.orderRef} has been verified successfully.`,
+            amount,
+            method,
+            'Payment status: PAID',
+            ...orderFulfilmentLines(ctx),
+            '',
+            'We are preparing your order and will send updates at every step.',
+            trackLine,
+            '',
+            '— SAWABA Grooming Studio',
+          ]
+            .filter((line) => line.trim() !== '')
+            .join('\n'),
+        }
+      }
       return {
         title: 'Payment confirmed',
-        subject: `Payment confirmed — ${BRAND} (${ctx.appointmentRef ?? ctx.orderRef ?? ref})`,
+        subject: `Payment confirmed — ${BRAND} (${ctx.appointmentRef ?? ref})`,
         text: [
           `Hello ${first},`,
           '',
           `Great news — your payment at ${BRAND} has been verified.`,
-          `Reference: ${ctx.appointmentRef ?? ctx.orderRef ?? ref}`,
+          `Reference: ${ctx.appointmentRef ?? ref}`,
           amount,
           method,
           '',
-          'Your booking is cleared for service / your order is being processed.',
-          trackLine,
+          'Your booking is cleared for service.',
           '',
           '— SAWABA Grooming Studio',
         ]
@@ -462,6 +536,36 @@ export async function sendCustomerNotification(input: {
   let sent = 0
   let failed = 0
 
+  // In-app inbox row for registered customers. This is independent of external
+  // channel configuration and opt-ins, so the account always has a history.
+  if (customer.id && event !== 'TEST') {
+    try {
+      const inAppKey = `${baseKey}:IN_APP`
+      const existing = await prisma.customerNotification.findUnique({ where: { dedupeKey: inAppKey } })
+      if (!existing) {
+        const content = await resolveContent(event, ctx, 'EMAIL', fullName)
+        await prisma.customerNotification.create({
+          data: {
+            customerId: customer.id,
+            appointmentId: ctx.appointmentId ?? null,
+            orderId: ctx.orderId ?? null,
+            type: event,
+            channel: 'IN_APP',
+            title: content.title,
+            message: content.text,
+            recipient: null,
+            status: 'SENT',
+            provider: 'in_app',
+            dedupeKey: inAppKey,
+            sentAt: new Date(),
+          },
+        })
+      }
+    } catch (error) {
+      console.error('[notification] in-app record failed:', (error as Error).message)
+    }
+  }
+
   for (const channel of channels) {
     const optedIn =
       channel === 'EMAIL' ? (emailOptIn ?? true) : channel === 'SMS' ? (smsOptIn ?? true) : (whatsappOptIn ?? true)
@@ -532,6 +636,7 @@ export async function sendCustomerNotification(input: {
           channel,
           title: content.title,
           message: content.text,
+          recipient: channel === 'EMAIL' ? email : phone,
           status: outcome.status,
           provider:
             outcome.status === 'SENT'
@@ -565,6 +670,7 @@ export async function sendCustomerNotification(input: {
             channel,
             title: content.title,
             message: content.text,
+            recipient: channel === 'EMAIL' ? email : phone,
             status: 'FAILED',
             provider: null,
             error: message.slice(0, 400),

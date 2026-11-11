@@ -16,7 +16,7 @@ import type {
   ProductListQuery,
 } from '../validators/shop'
 import { assertShopPaymentMethodAllowed } from './paymentSettingsService'
-import { notifyOrderConfirmation, notifyOrderCancelled } from './notificationEvents'
+import { notifyOrderCancelled } from './notificationEvents'
 import {
   buildOrderTrackingUrl,
   signOrderTrackingToken,
@@ -725,9 +725,21 @@ export async function createShopOrder(input: CheckoutInput, customerId?: number 
     throw new UnprocessableError('Your cart is empty.')
   }
 
-  const email = input.customerEmail?.trim() || null
-  if (input.paymentMethod === 'ONLINE' && !email) {
-    throw new UnprocessableError('An email address is required for online card payments.')
+  // Email is required so every buyer (guest or registered) can receive the
+  // confirmation and delivery updates. Signed-in customers fall back to the
+  // email on their account.
+  let email = input.customerEmail?.trim() || null
+  if (!email && customerId) {
+    const account = await prisma.customer.findUnique({
+      where: { id: customerId },
+      select: { email: true },
+    })
+    email = account?.email?.trim() || null
+  }
+  if (!email) {
+    throw new UnprocessableError(
+      'An email address is required so we can send your order confirmation and delivery updates.',
+    )
   }
 
   // ── Fulfillment: home delivery or studio pickup ────────────────────────
@@ -979,7 +991,9 @@ export async function createShopOrder(input: CheckoutInput, customerId?: number 
   // true guest order (customerId = null unless the buyer is signed in) and is
   // tracked with a signed, expiring link. This keeps "never force an account"
   // true and prevents duplicate customer records.
-  await notifyOrderConfirmation(order, customerId ?? null)
+  //
+  // The order confirmation is sent from markOrderPaid (after the payment is
+  // verified) — never before payment.
 
   const trackingClaims = { orderId: order.id, referenceCode: order.referenceCode }
   return {

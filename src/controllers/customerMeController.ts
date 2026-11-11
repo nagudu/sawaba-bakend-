@@ -6,6 +6,12 @@ import {
   getCustomerPayments,
   getCustomerSummary,
 } from '../services/customerMeService'
+import {
+  getCustomerUnreadCount,
+  listCustomerNotifications,
+  markAllCustomerNotificationsRead,
+  markCustomerNotificationRead,
+} from '../services/customerNotificationService'
 import { successRes } from '../utils/response'
 
 export async function summaryHandler(req: Request, res: Response, next: NextFunction): Promise<void> {
@@ -36,6 +42,47 @@ export async function paymentsHandler(req: Request, res: Response, next: NextFun
       perPage: Number(req.query.perPage) || undefined,
     })
     successRes(res, 'Payment history retrieved.', result, 200)
+  } catch (error) {
+    next(error)
+  }
+}
+
+export async function notificationsHandler(req: Request, res: Response, next: NextFunction): Promise<void> {
+  try {
+    const result = await listCustomerNotifications(req.customer!.id, {
+      page: Number(req.query.page) || undefined,
+      perPage: Number(req.query.perPage) || undefined,
+      unreadOnly: req.query.unread === 'true',
+    })
+    successRes(res, 'Notifications retrieved.', result, 200)
+  } catch (error) {
+    next(error)
+  }
+}
+
+export async function unreadNotificationCountHandler(req: Request, res: Response, next: NextFunction): Promise<void> {
+  try {
+    const count = await getCustomerUnreadCount(req.customer!.id)
+    successRes(res, 'Unread notification count retrieved.', { count }, 200)
+  } catch (error) {
+    next(error)
+  }
+}
+
+export async function markNotificationReadHandler(req: Request, res: Response, next: NextFunction): Promise<void> {
+  try {
+    const id = Number(req.params.id)
+    await markCustomerNotificationRead(req.customer!.id, id)
+    successRes(res, 'Notification marked as read.', { id }, 200)
+  } catch (error) {
+    next(error)
+  }
+}
+
+export async function markAllNotificationsReadHandler(req: Request, res: Response, next: NextFunction): Promise<void> {
+  try {
+    const count = await markAllCustomerNotificationsRead(req.customer!.id)
+    successRes(res, 'All notifications marked as read.', { count }, 200)
   } catch (error) {
     next(error)
   }

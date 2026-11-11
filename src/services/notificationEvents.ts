@@ -47,9 +47,14 @@ interface OrderRef {
   totalAmount?: unknown
   fulfillmentType?: string | null
   pickupCode?: string | null
+  pickupShopName?: string | null
+  pickupAddress?: string | null
+  deliveryAddress?: string | null
+  estimatedDeliveryAt?: Date | string | null
   paymentMethod?: string | null
   paymentStatus?: string | null
   status?: string | null
+  items?: Array<{ productName?: string | null; quantity?: number | null; lineTotal?: unknown }> | null
 }
 
 function appointmentCustomer(appointment: AppointmentRef): NotificationCustomer {
@@ -106,6 +111,18 @@ function orderContext(order: OrderRef, extra: Partial<NotificationDispatchContex
     paymentMethod: order.paymentMethod ?? null,
     paymentStatus: order.paymentStatus ?? null,
     status: order.status ?? null,
+    items: (order.items ?? []).map((item) => ({
+      name: item.productName ?? 'Item',
+      quantity: Number(item.quantity ?? 1),
+      lineTotal: num(item.lineTotal),
+    })),
+    deliveryAddress: order.deliveryAddress ?? null,
+    pickupShopName: order.pickupShopName ?? null,
+    pickupAddress: order.pickupAddress ?? null,
+    estimatedDeliveryAt:
+      order.estimatedDeliveryAt instanceof Date
+        ? order.estimatedDeliveryAt.toISOString()
+        : order.estimatedDeliveryAt ?? null,
     ...extra,
   }
 }
